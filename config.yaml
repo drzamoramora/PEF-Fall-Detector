@@ -1,0 +1,65 @@
+# =============================================================================
+# PEF-Fall-Detector — central configuration
+#
+# Every tunable parameter of the pipeline lives in this file, so that the
+# calibration protocol reported in Section 4 of the paper maps 1:1 to a
+# concrete, versionable artifact. Parameters marked [Phase N] are read only
+# once that phase of the implementation plan is built; they are declared here
+# from day one so the full calibration surface is visible.
+# =============================================================================
+
+pose:                          # [Phase 1] MediaPipe Pose front-end (§3.2)
+  model_complexity: 1          # 0=lite, 1=full (§3.2 default), 2=heavy (low-light)
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+  smooth_landmarks: true       # MediaPipe's internal temporal smoothing
+  visibility_threshold: 0.5    # below this, a landmark is treated as unreliable
+
+logging:                       # [Phase 1] per-frame audit CSV (§3.5 auditability)
+  output_dir: "logs"           # created next to the working directory if missing
+
+stage1:                        # [Phase 2-3] kinematic trigger (T + V), §3.4/§3.5
+  threshold_T_deg: 45.0        # trunk inclination angle to arouse suspicion
+  threshold_V: -1.5            # vertical centroid velocity, torso-lengths/second
+  # Window and smoothing are expressed in SECONDS, never in frames: the same
+  # "5 frames" spanned 0.08 s in one of this project's clips and 0.40 s in
+  # another, and a longer window flattens the peak, so a threshold tuned on
+  # 30 fps footage would miss falls on a slower device.
+  velocity_window_s: 0.167     # time span of the discrete derivative
+  ema_time_constant_s: 0.1     # centroid smoothing before differentiation;
+                               # 0 disables it (honest way to run without)
+  history_max_gap_s: 0.5       # a larger gap between samples clears velocity
+                               # history (differentiating across a detection
+                               # loss or a seek would produce a fake spike)
+  min_consecutive_frames: 3    # frames the trigger must hold (hysteresis)
+
+state_display:                 # [Phase 2] person-state labels — DISPLAY/LOG ONLY.
+                               # No §3.5 stage consumes these; they exist so a
+                               # human can verify the quantities and so alerts
+                               # can say what the subject was doing before the
+                               # event. Provisional values; tuned in 2.6.
+  transition_v_tps: 0.7        # |V| above this (torso/s) -> TRANSITION
+  lying_T_deg: 60.0            # trunk at/above this -> LYING
+  leaning_T_deg: 15.0          # trunk at/above this (legs extended) -> LEANING
+  standing_extension: 1.1      # hip-to-ankle extent / torso at/above -> legs extended
+  crouch_extension: 0.6        # below this -> legs collapsed (CROUCHING)
+  walking_vh_tps: 0.25         # |V horizontal| above this while upright -> WALKING
+  ratio_time_constant_s: 0.1   # smoothing applied to the FINISHED extension
+                               # ratio, never to its inputs. Ankles
+                               # are among the noisiest landmarks; without
+                               # this, a perfectly still subject sitting near
+                               # the standing/sitting boundary changes label
+                               # 7x more often. 0 disables it.
+
+stage2:                        # [Phase 4] geometric verification (P), §3.4/§3.5
+  com_eval_window_frames: 10   # frames around the trigger over which P is judged
+  com_votes_required: 5        # k-of-n frames with COM outside support polygon
+  min_foot_visibility: 0.5     # below this, feet are occluded -> P inconclusive
+
+stage3:                        # [Phase 5] immobility confirmation (I), §3.4/§3.5
+  epsilon: 0.05                # stillness radius, torso-lengths
+  movement_ref_seconds: 0.5    # compare current position vs. this far back
+  threshold_W_seconds: 5.0     # sustained immobility that confirms severity
+  observation_window_seconds: 30.0  # max post-trigger observation before verdict
+  upright_T_deg: 30.0          # trunk angle below which posture counts as upright
+  cooldown_seconds: 3.0        # refractory period after an event resolves

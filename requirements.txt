@@ -1,0 +1,9 @@
+# MediaPipe pinned: last release with the classic mp.solutions.pose API used
+# by the implementation guide; bundles pose models inside the wheel (fully
+# offline, reproducible — see pose_frontend.py docstring for the rationale).
+mediapipe==0.10.14
+opencv-python>=4.9
+numpy>=1.26
+PySide6>=6.6
+pyqtgraph>=0.13
+PyYAML>=6.0

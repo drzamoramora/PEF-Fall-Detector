@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PEF-Fall-Detector: per-frame audit CSVs generated at runtime
+logs/
+
+# notas/ IS tracked on purpose (it used to be ignored).
+# It holds the development logbook, the code-review record and the test
+# catalogue. They are versioned because they are the evidence behind the
+# paper's method claims: which findings were raised, what was measured, and
+# which script reproduces each figure. A reviewer asking "where does this
+# number come from" is answered by the repository, not by an email.
