@@ -28,7 +28,8 @@ import statistics
 import sys
 from pathlib import Path
 
-from pef_fall_detector.audit_log import AuditLogger
+from pef_fall_detector.alerts import console_sink
+from pef_fall_detector.audit_log import EVENT_FIELDS, AuditLogger
 from pef_fall_detector.config import load_config
 from pef_fall_detector.pipeline import FramePipeline
 from pef_fall_detector.quantities import trunk_band
@@ -40,6 +41,9 @@ def run_headless(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     source = VideoFileSource(args.video)
     pipeline = FramePipeline(cfg)
+    # The §3.5 alert, on the only transport that exists before Phase 7.
+    pipeline.source_name = Path(args.video).name
+    pipeline.alerts.add_sink(console_sink)
     # The record travels with the facts needed to interpret it later: which
     # source, at what frame rate, and the exact thresholds in force. This is
     # what lets a calibration cite the configuration that produced it.
@@ -65,6 +69,15 @@ def run_headless(args: argparse.Namespace) -> int:
     trunk_angles: list[float] = []
     velocities: list[float] = []
     state_counts: dict[str, int] = {}
+    # Stage-1 events go to their own record: an alarm is reconstructed from a
+    # handful of events, not by scanning thousands of per-frame rows.
+    events = AuditLogger(
+        cfg.logging.output_dir, Path(args.video).stem + "-events",
+        fields=EVENT_FIELDS,
+        metadata={"source": str(Path(args.video).resolve()),
+                  "record_kind": "stage1_events",
+                  "config": cfg.as_dict()},
+    )
     detected_frames = 0
     reliable_frames = 0
     index = 0
@@ -96,6 +109,26 @@ def run_headless(args: argparse.Namespace) -> int:
     pipeline.close()
     source.release()
     logger.close()
+    # Written only now, not as each event fired: Stage 2's verdict lands
+    # several frames after the event is raised, so a row streamed at firing
+    # time would record 'stage1_only' for every event regardless of outcome.
+    for i, ev in enumerate(pipeline.machine.events):
+        events.log({
+            "event_index": i,
+            "frame_index": ev.frame_index,
+            "timestamp_s": f"{ev.timestamp:.3f}",
+            "T_deg": f"{ev.t_deg:.2f}",
+            "V_tps": f"{ev.v_tps:.3f}",
+            "formulation": ev.formulation,
+            "verdict": ev.verdict,
+            "severity": ev.severity,
+            "max_immobility_s": ("" if math.isnan(ev.max_immobility_s)
+                                 else f"{ev.max_immobility_s:.2f}"),
+            "p_outside_fraction": ("" if math.isnan(ev.p_outside_fraction)
+                                   else f"{ev.p_outside_fraction:.3f}"),
+            "p_samples": ev.p_samples,
+        })
+    events.close()
 
     # ---- summary ------------------------------------------------------------
     # All statistics below cover reliable frames only.
@@ -151,7 +184,24 @@ def run_headless(args: argparse.Namespace) -> int:
               f"{'OK' if 0.9 <= report['fps_mismatch_ratio'] <= 1.1 else 'MISMATCH: use corrected dt'})")
     else:
         print()
+    n_alerts = len(pipeline.alerts.dispatched)
+    n_events = len(pipeline.machine.events)
+    print(f"Stage 1   : {n_events} event(s) "
+          f"[{cfg.stage1.trigger_formulation}, hold {cfg.stage1.trigger_hold_s}s] "
+          f"— judged by Stages 2 (geometry) and 3 (immobility/recovery)")
+    for ev in pipeline.machine.events[:10]:
+        print(f"  t={ev.timestamp:6.2f}s frame {ev.frame_index:5d}  "
+              f"T={ev.t_deg:6.1f} deg  V={ev.v_tps:+6.2f} torso/s  "
+              f"-> {ev.verdict}"
+              + (f" [{ev.severity}]" if ev.severity else "")
+              + ("" if math.isnan(ev.p_outside_fraction)
+                 else f" (COM outside {100*ev.p_outside_fraction:.0f}% "
+                      f"of {ev.p_samples} frames)"))
+    print(f"Alerts    : {n_alerts} dispatched "
+          f"(verdicts that alert: {', '.join(cfg.alerts.dispatch_verdicts)})")
     print(f"Audit CSV : {logger.path}")
+    if n_events:
+        print(f"Events    : {events.path}")
     print(f"Run meta  : {logger.path.with_suffix('.meta.json').name} "
           f"(source, fps and the full configuration that produced this record)")
     return 0

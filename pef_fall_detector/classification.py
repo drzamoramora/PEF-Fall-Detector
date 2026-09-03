@@ -1,0 +1,128 @@
+"""Clip-level classification: the four labels of the PEF-FallDB protocol.
+
+WHY THIS IS A SEPARATE LAYER, AND NOT A RENAME
+----------------------------------------------
+The paper's §3.3 vocabulary — mild / moderate / severe — describes ONE EVENT.
+The four labels here describe ONE CLIP. They are not the same statement, and
+collapsing them would cost something real:
+
+* ``NoFall`` has no severity at all. A clip with no event is not a "mild"
+  anything; it is the absence of the thing severity describes.
+* A clip may contain more than one event. Severity cannot answer "what is
+  this clip", only "what was that event".
+* §3.3 is what a reader of the paper can check the code against. Renaming
+  ``severe`` to ``NotRecovered`` inside the state machine would leave the
+  events record unreadable next to the section that defines it.
+
+So the paper's names stay where the paper can see them — in the per-event
+record — and these four are the clip label, derived from them by the single
+mapping in :func:`class_for_event`. One place to change, and the §3.3
+correspondence is written down rather than remembered.
+
+THE END-OF-CLIP RULE, AND WHY IT DIFFERS FROM THE LIVE ONE
+----------------------------------------------------------
+§3.3 defines severity by RECOVERY: recovered alone, partially recovered,
+remained down. Those are statements about how the episode ENDED.
+
+The live state machine resolves greedily — the first branch to fire wins —
+because on the §3.6 device an alert that arrives late is worthless. That is
+correct there and wrong here. Measured on clip A13, where the subject lies
+still for about six seconds and then stands up unaided: with the immobility
+radius calibrated to the real noise floor, the immobility branch reaches its
+threshold BEFORE the subject rises, the event closes as ``severe``, and the
+recovery three seconds later is never seen. Truth: Recovered. Verdict with a
+greedy resolver: NotRecovered. The two most distant labels in the set.
+
+For labelling, therefore, the clip is watched to the end and the label comes
+from how the subject ENDED — which is what §3.3 asked for in the first place.
+Immobility becomes evidence supporting ``NotRecovered``, not the trigger that
+closes the case.
+"""
+
+from __future__ import annotations
+
+from .state_machine import (
+    CONFIRMED_FALL,
+    MILD,
+    MODERATE,
+    NULLIFIED,
+    SEVERE,
+)
+
+#: No fall occurred in this clip.
+NO_FALL = "NoFall"
+#: A fall occurred and the subject got up unaided (§3.3 "mild").
+RECOVERED = "Recovered"
+#: A fall occurred; the subject is not incapacitated but did not fully get
+#: up — sat up, knelt, propped themselves against furniture (§3.3 "moderate").
+PARTIALLY_RECOVERED = "PartiallyRecovered"
+#: A fall occurred and the subject remained on the floor (§3.3 "severe").
+NOT_RECOVERED = "NotRecovered"
+#: Something happened that no stage could judge — the trigger fired but the
+#: feet were never visible, or the clip ended mid-verdict.
+#:
+#: This label is NOT one of the four, on purpose. Folding it into ``NoFall``
+#: would count a failure as a correct negative on the NoFall clips and as a
+#: plain miss everywhere else, and the confusion matrix would then hide the
+#: difference between "never fired" and "fired but could not judge". Those
+#: are two defects with different causes and different fixes. §3.7 asks for
+#: an evaluation that can tell them apart.
+UNDETERMINED = "Undetermined"
+
+CLASSES = (NO_FALL, RECOVERED, PARTIALLY_RECOVERED, NOT_RECOVERED, UNDETERMINED)
+
+#: Severity ranking used when a clip contains several events: the worst one
+#: names the clip. A clip where someone recovered from one fall and stayed
+#: down after a second is a NotRecovered clip.
+_RANK = {
+    NO_FALL: 0,
+    RECOVERED: 1,
+    PARTIALLY_RECOVERED: 2,
+    NOT_RECOVERED: 3,
+    # Ranked above NoFall so it can never be silently outvoted by "nothing
+    # happened", and below the real outcomes so a decided event always wins
+    # over an undecided one.
+    UNDETERMINED: 1,
+}
+
+#: The §3.3 correspondence, written down once.
+_FROM_SEVERITY = {
+    (NULLIFIED, MILD): RECOVERED,
+    (NULLIFIED, MODERATE): RECOVERED,
+    (CONFIRMED_FALL, MODERATE): PARTIALLY_RECOVERED,
+    (CONFIRMED_FALL, SEVERE): NOT_RECOVERED,
+    (CONFIRMED_FALL, MILD): RECOVERED,
+}
+
+
+def class_for_event(verdict: str, severity: str) -> str:
+    """Map one resolved event to one of the labels.
+
+    A verdict that never reached Stage 3 — ``stage1_only``,
+    ``stage2_inconclusive``, ``stage3_unresolved`` — is UNDETERMINED, never
+    NoFall: the trigger did fire, so "no fall" is a claim the funnel did not
+    make. ``stage2_rejected`` IS NoFall, because there a stage actively
+    judged the geometry and found no topple.
+    """
+    if verdict == "stage2_rejected":
+        return NO_FALL
+    return _FROM_SEVERITY.get((verdict, severity), UNDETERMINED)
+
+
+def classify_clip(events) -> tuple[str, str]:
+    """Label a whole clip from its resolved events.
+
+    Returns ``(label, reason)`` — the reason is the short evidence string that
+    goes into the record beside the label, so a disagreement between the
+    machine and a human annotator can be examined without re-running the clip.
+    """
+    if not events:
+        return NO_FALL, "sin eventos"
+
+    labelled = [(class_for_event(e.verdict, e.severity), e) for e in events]
+    label, event = max(labelled, key=lambda pair: _RANK[pair[0]])
+    reason = (f"evento t={event.timestamp:.2f}s "
+              f"{event.verdict}/{event.severity or '-'}")
+    if len(events) > 1:
+        reason += f" (el peor de {len(events)})"
+    return label, reason

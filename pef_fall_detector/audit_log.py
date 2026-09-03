@@ -80,6 +80,10 @@ EXPERIMENTAL_QUANTITIES = frozenset({
     "world_torso_len_m",  # metric torso from pose_world_landmarks (3D diagnostic)
     "extension_ratio",    # hip-to-ankle extent / torso (posture feature, 2.4)
     "state",              # person-state display label (person_state.py)
+    "I_displacement",     # how far the subject has drifted from the stillness
+                          # anchor. Not a §3.4 quantity: it is the internal
+                          # term I is thresholded on, recorded because ε
+                          # cannot be calibrated without seeing it.
 })
 
 
@@ -110,8 +114,39 @@ PHASE2_FIELDS = PHASE1_FIELDS + [
     csv_column("Vh_tps"),
     csv_column("extension_ratio"),
     csv_column("state"),
+    "P_offset",           # Quantity P: signed COM-to-support offset, torso
+                          # lengths (negative = inside, positive = outside)
+    "P_support_width",    # width of the support polygon, torso lengths —
+                          # §3.4's "sudden contraction" signature
+    "I_still_s",          # Quantity I: seconds the subject has been still
+    csv_column("I_displacement"),
+    "stage",              # §3.5 funnel position: MONITORING/CONFIRMING/COOLDOWN
+    "stage1_fired",       # 1 on the exact frame the kinematic trigger fired
     "reliable",           # 1 = detection + core visibility above threshold;
                           # statistics/calibration must filter on this
+]
+
+
+#: Event-record schema (§3.5). One row per Stage-1 firing, as opposed to the
+#: per-frame CSV: an alarm is reconstructed from a handful of events, not by
+#: scanning thousands of frames. It carries the quantity values that caused
+#: the firing and the formulation that was in force, so a record stays
+#: interpretable after the configuration changes.
+EVENT_FIELDS = [
+    "event_index",
+    "frame_index",
+    "timestamp_s",
+    "T_deg",
+    "V_tps",
+    "formulation",
+    "verdict",
+    "severity",             # §3.3 tag: mild / moderate / severe. Defined by
+                            # RECOVERY, not by impact. Empty if Stage 3 never ran.
+    "max_immobility_s",     # Stage-3 evidence: the longest stillness reached
+    "p_outside_fraction",   # Stage-2 evidence: share of measurable frames in
+    "p_samples",            # the window with the COM outside, and how many
+                            # frames that share was computed from. A verdict
+                            # without its evidence can only be believed.
 ]
 
 
@@ -127,6 +162,17 @@ class AuditLogger:
             ideally a snapshot of the configuration — written to
             ``<record>.meta.json`` when the first row is recorded. The
             schema, the code version and a timestamp are added automatically.
+        flush_each_row: push every row to the operating system as it is
+            written, instead of letting Python's buffer fill first. Off by
+            default because a per-frame record writes tens of rows a second
+            and the buffer is exactly the right tool for that. **On for the
+            event record**, where the argument reverses: events are rare, so
+            the buffer may hold the only copy of a detection for minutes, and
+            §3.6 deploys this on a device that can lose power without
+            warning. Measured on this project's own material: a session that
+            ended without a clean close left a 0-byte event file that had, in
+            fact, recorded a confirmed fall. A flush is one ``write`` syscall
+            — not an ``fsync`` — so the cost on a handful of rows is nil.
     """
 
     def __init__(
@@ -135,9 +181,11 @@ class AuditLogger:
         source_name: str,
         fields: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        flush_each_row: bool = False,
     ) -> None:
         self.fields = fields or PHASE2_FIELDS
         self._metadata = dict(metadata or {})
+        self._flush_each_row = bool(flush_each_row)
         out = Path(output_dir).expanduser()
         if not out.is_absolute():
             out = REPO_ROOT / out
@@ -147,6 +195,7 @@ class AuditLogger:
         self.path = out / f"{safe}-{stamp}.csv"
         self._fh = None
         self._writer: csv.DictWriter | None = None
+        self._closed = False
         self.rows_written = 0
 
     # ------------------------------------------------------------------ core
@@ -163,10 +212,18 @@ class AuditLogger:
 
     def log(self, row: dict[str, Any]) -> None:
         """Append one frame's data. Unknown keys raise; missing ones are blank."""
+        if self._closed:
+            # Not a defensive nicety: ``_open`` opens in "w" mode, so a write
+            # after close would silently TRUNCATE a finished record and start
+            # it over — losing a completed session to what looks like a
+            # harmless late call. Failing loudly is the only safe answer.
+            raise RuntimeError(f"record already closed: {self.path}")
         if self._writer is None:
             self._open()
         self._writer.writerow(row)
         self.rows_written += 1
+        if self._flush_each_row:
+            self._fh.flush()
 
     def log_pose_frame(self, pf, extra: dict[str, Any] | None = None) -> None:
         """Build and append the row for a PoseFrame.
@@ -210,6 +267,7 @@ class AuditLogger:
 
     def close(self) -> None:
         """Flush the record and write its metadata. A no-op if nothing was logged."""
+        self._closed = True
         if self._fh is None:
             return
         self._fh.close()

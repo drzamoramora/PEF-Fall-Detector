@@ -261,10 +261,90 @@ lo que la persona hace en el video.
 4. **Revisar el V de −12.76 torso/s de `video__8`**, muy fuera del rango −2.8
    a −5.2 de las caídas reales. Con el CV de torso del 9.7 % en el mismo clip,
    el sospechoso es el artefacto de salto de esqueleto ya documentado.
-5. Afinar los umbrales de `state_display` (en 2.4 quedaron provisionales) y
+5. **Alinear el EMA con el draft.** El §3.4 de draft4 dice que se suaviza
+   *"the vertical component of C"*; nuestro código suaviza el vector completo
+   (x e y). Hay que alinear uno de los dos — el código es lo barato, y la
+   componente x solo alimenta `Vh_tps_EXP`, que no está en el paper.
+6. **Pasar a segundos los parámetros que quedaron en frames**:
+   `stage1.min_consecutive_frames` y `stage2.com_eval_window_frames`. Es
+   exactamente el hallazgo C5 sin aplicar, y estorba más si se arrastra a las
+   Fases 3 y 4 en vez de arreglarse aquí.
+7. **Reencuadrar el CSV** en el docstring de `audit_log.py` y en el README:
+   draft4 funda la explicabilidad en leer las cantidades de los frames
+   (§3.5), no en un registro persistido, y el §3.6 exige que el detector
+   desplegado no escriba nada. El CSV es instrumento de investigación y
+   calibración; el perfil de despliegue lo apaga. Son dos párrafos, no código.
+8. Afinar los umbrales de `state_display` (en 2.4 quedaron provisionales) y
    comprobar clip por clip que la etiqueta coincide con lo que se ve.
-6. Commit de `config.yaml` + tag `calib-v1` + bitácora de qué clips lo
-   produjeron.
+9. Commit de `config.yaml` + tag `calib-v1` + bitácora de qué clips lo
+   produjeron. **Ese tag es el ✅ de la sub-parte 2.6.**
+
+---
+
+## Sub-parte 2.7 — Especificación de la Etapa 1 y de la guarda de sujeto
+
+**Depende de 2.6** (necesita las curvas y los umbrales calibrados).
+**No escribe código del sistema.** Produce un documento de especificación y
+los análisis que lo respaldan. Existe porque el §3.5 de draft4, tal como está
+redactado, **no es implementable sin inventar el criterio** — y eso es
+exactamente lo que un paper de método no debe permitir.
+
+**El problema, textual.** §3.5 dice: *"an **instantaneous** combination of the
+two quantities exceeds a configurable trigger threshold while V remains
+negative (downward)"*. Dos huecos:
+
+1. *"Instantaneous"* significa mismo frame. En las 6 caídas reales medidas, los
+   picos de T y de V están desfasados entre 0.03 s y 5 s, y una regla de mismo
+   frame perdía **3 de 6**. La redacción actual describe un sistema que
+   nuestros propios datos muestran que falla.
+2. *"A combination... exceeds a threshold"* no dice **cuál** combinación. Una
+   conjunción, una suma, un score normalizado y una secuencia son cuatro
+   sistemas distintos, todos compatibles con esa frase.
+
+**Entregable A — definición del disparador.** Evaluar sobre los datos de 2.6
+más las 6 caídas del dataset público, y elegir con evidencia entre:
+
+- conjunción simultánea (la del draft y la guía) — línea base, ya sabemos que
+  pierde 3 de 6, pero hay que reportar el número;
+- disparo por V con confirmación de T en una ventana posterior (secuencial);
+- score combinado normalizado de T y V que cruce un umbral único.
+
+El criterio de elección se fija **antes** de mirar: sensibilidad sobre las
+caídas con cero disparos en los clips de caminata, y a igualdad de eso, la
+formulación más simple de explicar en el paper.
+
+**Entregable B — guarda de plausibilidad de sujeto.** Es la respuesta a los
+transeúntes del §3.3 sin agregar detección multi-persona, que contradiría el
+compromiso con MediaPipe Pose del §3.2. Consiste en un umbral de
+desplazamiento del esqueleto entre frames, en torsos/segundo, por encima del
+cual se declara cambio de sujeto y se marca discontinuidad en vez de emitir V.
+
+Se calibra con dos referencias que ya tenemos: el clip de dos personas, donde
+el salto de esqueleto produjo **+26.6 torso/s** tras un micro-hueco de 0.02 s,
+y las caídas reales, cuyo máximo legítimo observado es **−5.2 torso/s**. Entre
+ambos hay un orden de magnitud, así que el umbral no es delicado. Señal
+secundaria: la longitud del torso cambia suave con la distancia y salta cuando
+el tracker cambia de cuerpo.
+
+**Anclaje en el paper:** no hay que inventar nada. El §3.2 ya dice que la
+ambigüedad de profundidad *"is mitigated by tracking within-frame and
+**across-frame landmark displacement ratios**"*. Esta guarda es esa frase hecha
+concreta.
+
+**Entregable C — histéresis y enfriamiento en segundos**, no en frames
+(hallazgo C5), con el valor justificado por la duración real de las caídas
+medidas.
+
+**Entregable D — redacción propuesta para el draft**: el párrafo de §3.5 con
+el disparador definido, la guarda nombrada como parte de la Etapa 1, y la
+concreción de la frase del §3.2. Con las cifras que respaldan cada número.
+Cierra la divergencia P5.
+
+**Criterio de salida:** una especificación que dos personas distintas
+implementarían igual; cada umbral acompañado de la curva o la tabla que lo
+justifica; y el texto listo para pegar en el draft. Solo entonces empieza la
+Fase 3 — que pasa a ser transcripción de una decisión ya tomada, no diseño
+sobre la marcha.
 
 ---
 
@@ -392,8 +472,25 @@ registradas.
 |---|------|--------|
 | 0 | Fundaciones | ✅ Completada |
 | 1 | Front-end de pose + PEF-Lab | ✅ Código completo — **nunca se ha corrido en el Mac**: la fase está marcada completa por código, no por observación |
-| 2 | T y V + calibración | 🔶 Código completo (2.1–2.5 ✅), revisión cerrada (lotes A–D ✅), convención `_EXP` ✅, columnas documentadas ✅, **73 tests** — falta 2.6 |
+| 2 | T y V + calibración | 🔶 Código completo (2.1–2.5 ✅), revisión cerrada (lotes A–D ✅), convención `_EXP` ✅, columnas documentadas ✅, **73 tests** — faltan **2.6** (calibración) y **2.7** (especificación de la Etapa 1) |
 | 3–7 | — | No iniciadas |
+
+**Adherencia a draft4 (revisado el 15 de agosto de 2026).** Draft4 cerró cuatro
+de las cinco divergencias que este proyecto había catalogado: el centroide ya
+está definido como punto medio 0.5/0.5 (P1), el conteo de landmarks es correcto
+(P2), el EMA quedó **dentro de la definición de la cantidad V** (P3), y la
+geometría en píxeles 2D con vertical (0,−1) es ahora la del paper (P4). Además
+cerró el hueco de 35–60° en las bandas de T, que ahora son 15 / 15–60 / ≥60 —
+justo lo que `trunk_band()` ya implementaba. Tres argumentos de este proyecto
+llegaron al texto: el del aspecto (45° reales leídos como 29° en 16:9), el del
+recorte del coseno, y el umbral de tronco degenerado de 0.001 px.
+
+**Queda abierta P5**, la formulación de la Etapa 1, y es el objeto de 2.7.
+
+**Consecuencia sobre el EMA:** ya no se puede quitar por configuración sin
+contradecir el §3.4, que lo declara parte de la definición de V. `tau = 0`
+sigue siendo necesario, pero como **ablación** del §3.7, no como opción de
+despliegue.
 
 *Actualizado 2026-08-15. La suite pasó de 67 a 73 tests con las pruebas de la
 convención `_EXP`, que además cerraron un hueco anterior: nada cruzaba las
@@ -416,7 +513,10 @@ desalineada solo reventaba al correr un video real, nunca en la suite.*
    Lote C (sin `.meta.json`, así que no se sabe con qué configuración
    salieron). Los del dataset se reprocesan en minutos.
 
-**Mío, una vez existan los clips:** los 6 puntos de 2.6 listados arriba.
+**Mío, una vez existan los clips:** los 9 puntos de 2.6 listados arriba, y
+después **2.7** — la especificación de la Etapa 1 y de la guarda de sujeto.
+La Fase 3 no empieza hasta que 2.7 esté cerrada, porque el §3.5 de draft4 no
+se puede implementar sin decidir antes qué significa su "combination".
 
 **Mío, sin esperar clips:**
 

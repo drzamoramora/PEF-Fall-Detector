@@ -138,6 +138,178 @@ def centroid(mid_hip: np.ndarray, mid_shoulder: np.ndarray, hip_weight: float = 
     )[:2]
 
 
+def feet_in_contact(
+    foot_points: np.ndarray,
+    frame_size: tuple[int, int],
+    torso_length: float,
+    contact_band_torso: float = 0.15,
+) -> np.ndarray:
+    """The foot landmarks actually **in bipedal contact** (§3.4).
+
+    §3.4 builds the support polygon from the ankles "plus their subsequent
+    foot landmarks **in bipedal contact**" — not from every foot landmark
+    that happens to be reported. Ignoring that clause is what let a lifted
+    foot produce a support polygon 165 torso-lengths wide in this project's
+    own live footage: MediaPipe keeps emitting a position for a foot it can
+    no longer see, with a visibility score above threshold, and the geometry
+    is built on a guess.
+
+    Two filters, in order, and neither is a new invention:
+
+    **Outside the frame is not an observation.** A landmark placed beyond
+    the image border is the model extrapolating anatomy it cannot see. This
+    project established that in Phase 2, when hips were being reported at
+    y = 1958 in a 960-pixel-tall frame; the reliability policy already
+    refuses to trust those for the core landmarks. Applying the same rule to
+    the feet is consistency, not a new rule.
+
+    **Contact means near the ground.** With no calibrated ground plane, the
+    floor in image space is the horizontal line through the lowest foot
+    landmark still standing after the first filter. A landmark more than
+    ``contact_band_torso`` above that line has left the floor. The band is
+    in torso lengths so it means the same thing at any camera distance.
+
+    Args:
+        foot_points: (N, 2) foot landmark positions in pixels.
+        frame_size: (width, height) of the source frame.
+        torso_length: Step-0 scale.
+        contact_band_torso: how far above the lowest point still counts as
+            touching the ground.
+
+    Returns:
+        (M, 2) subset in contact, possibly empty. An empty result is the
+        honest answer when no foot can be located on the floor, and
+        downstream it becomes an undefined P rather than an invented one.
+
+    Note:
+        Losing points here is **information**, not failure: §3.4 names "a
+        sudden contraction of the support polygon from a full two-foot
+        footprint to a heel-only contact pair" as a fall signature in its own
+        right. Before this filter existed that contraction could not be seen,
+        because lifted feet stayed in the polygon and widened it instead.
+    """
+    pts = np.asarray(foot_points, dtype=float)[:, :2]
+    if pts.size == 0 or not torso_length or torso_length <= 0.0:
+        return np.empty((0, 2))
+
+    width, height = frame_size
+    inside = (
+        (pts[:, 0] >= 0.0) & (pts[:, 0] <= float(width))
+        & (pts[:, 1] >= 0.0) & (pts[:, 1] <= float(height))
+    )
+    pts = pts[inside]
+    if len(pts) == 0:
+        return np.empty((0, 2))
+
+    # y grows downward, so the largest y is the point nearest the floor.
+    ground_y = float(pts[:, 1].max())
+    band_px = contact_band_torso * torso_length
+    return pts[pts[:, 1] >= ground_y - band_px]
+
+
+def support_polygon(foot_points: np.ndarray) -> np.ndarray:
+    """Convex hull of the foot landmarks — the support polygon of §3.4.
+
+    §3.4 defines the support polygon as "the convex hull of the ankle
+    landmark positions (left ankle landmark 27 and right ankle landmark 28)
+    plus their subsequent foot landmarks in bipedal contact" — that is, the
+    six points 27-32 (ankles, heels, foot indices).
+
+    Args:
+        foot_points: (N, 2) array of foot landmark positions in pixels.
+
+    Returns:
+        (M, 2) array with the hull vertices in counter-clockwise order, or
+        the input points themselves when there are fewer than three (a hull
+        is not defined for a point or a segment; both are still legitimate
+        supports — a single visible foot, or two feet seen edge-on).
+
+    Implemented as a monotone chain rather than pulled from scipy: the whole
+    inference path must stay within the dependency budget of the §3.6 edge
+    device, and six points do not justify a linear-algebra dependency.
+    """
+    pts = np.asarray(foot_points, dtype=float)[:, :2]
+    if len(pts) < 3:
+        return pts
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+    pts = pts[order]
+
+    def half(points: np.ndarray) -> list[np.ndarray]:
+        chain: list[np.ndarray] = []
+        for p in points:
+            # Drop the previous vertex while it makes a non-left turn: it lies
+            # inside the hull being built.
+            while len(chain) >= 2:
+                a, b = chain[-2], chain[-1]
+                cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+                if cross > 0:
+                    break
+                chain.pop()
+            chain.append(p)
+        return chain
+
+    lower = half(pts)
+    upper = half(pts[::-1])
+    # First point of each half repeats the last of the other.
+    return np.array(lower[:-1] + upper[:-1])
+
+
+def com_support_offset(com_xy: np.ndarray, hull: np.ndarray, torso_length: float) -> float:
+    """Quantity P — signed COM-to-support offset, in torso lengths (§3.4).
+
+    §3.4 characterises a fall geometrically by "projection of COM outside the
+    support polygon". The projection direction matters and is worth stating:
+    a monocular frame carries no calibrated ground plane, so the only
+    projection available is the **vertical one in image space** — the COM's
+    x-coordinate against the horizontal extent of the feet. This is precisely
+    why §3.4 notes that, of the four quantities, P "depends most directly on
+    camera height and angle": the approximation degrades as the camera looks
+    more steeply down. It is stated here rather than hidden so that the
+    §3.7 camera-height sensitivity results have something concrete to vary.
+
+    Returns:
+        Signed horizontal distance from the COM to the support interval,
+        divided by torso length: **negative inside** (with magnitude equal to
+        the margin to the nearest edge), **positive outside**, so that a
+        single threshold at 0 separates the two and the sign carries the
+        meaning. NaN when the hull is empty or the torso length is unusable.
+
+    The result is dimensionless by torso-length normalisation, per §3.4's
+    statement that P "is reported in the dimensionless normalization provided
+    by torso length".
+    """
+    hull = np.asarray(hull, dtype=float)
+    if hull.size == 0 or not torso_length or torso_length <= 0.0:
+        return float("nan")
+    com_x = float(np.asarray(com_xy, dtype=float)[0])
+    left, right = float(hull[:, 0].min()), float(hull[:, 0].max())
+    if com_x < left:
+        return (left - com_x) / torso_length
+    if com_x > right:
+        return (com_x - right) / torso_length
+    # Inside: report the margin to the nearest edge as a negative number, so
+    # that "how safely inside" is visible instead of collapsing to zero.
+    return -min(com_x - left, right - com_x) / torso_length
+
+
+def support_width(hull: np.ndarray, torso_length: float) -> float:
+    """Horizontal extent of the support polygon, in torso lengths (§3.4).
+
+    The second geometric signature named in §3.4: a fall may show "a sudden
+    contraction of the support polygon from a full two-foot footprint to a
+    heel-only contact pair". That is a change in the *size* of the support,
+    which the COM offset alone cannot express — a subject can keep the COM
+    well inside a support that is collapsing underneath them. Recording it
+    separately is what gives that half of §3.4 something to be tested with.
+
+    Returns NaN when the hull is empty or the torso length is unusable.
+    """
+    hull = np.asarray(hull, dtype=float)
+    if hull.size == 0 or not torso_length or torso_length <= 0.0:
+        return float("nan")
+    return float(hull[:, 0].max() - hull[:, 0].min()) / torso_length
+
+
 class ExponentialMovingAverage:
     """Time-constant EMA smoother, applied before differentiation.
 
@@ -185,6 +357,162 @@ class ExponentialMovingAverage:
     def reset(self) -> None:
         """Forget all history (call when the subject is lost or on seek)."""
         self._value = None
+
+
+class ImmobilityTimer:
+    """Quantity I — how long the subject has been essentially still (§3.4).
+
+    §3.4 defines I as "the total wall-clock duration within which the head
+    and torso landmark positions remain within a small radius ε around their
+    average post-trigger position", measured **after a kinematic trigger
+    fires**. This implementation generalises the scope: the clock runs
+    continuously, on every frame, with no trigger needed. Stage 3 then reads
+    the value it already holds at the moment the trigger fires, which is the
+    same number §3.4 asks for, obtained without making the quantity depend
+    on a decision stage that has not been built yet. The practical gain is
+    that immobility becomes visible and recordable during Phase 5 instead of
+    waiting for the state machine.
+
+    One consequence must be stated, because it is a real divergence and not
+    a free generalisation. §3.4 anchors ε to the *average post-trigger
+    position*. This class anchors it to the position at which the current
+    stillness episode began. Those differ whenever the trigger fires while
+    the body is still moving — which is the normal case, since a fall
+    triggers on the way down and comes to rest afterwards. §3.4's average
+    would then be smeared across the tail of the fall, forcing ε to absorb
+    motion that is not stillness. Anchoring to the episode start measures
+    what the quantity is named after. The draft needs one sentence changed
+    for the two to agree.
+
+    How an episode works, and why it is built around a *mean*: §3.4 measures
+    the radius "around their average position", so the anchor is the running
+    mean of the episode so far, per landmark, over the frames where that
+    landmark was actually seen. Every sample of the episode is re-checked
+    against that mean each frame; the moment one falls outside ε the episode
+    ends and a new one begins from the current frame, clock at zero.
+
+    Re-checking all of them, rather than only the newest, is what catches a
+    subject who creeps rather than moves: the mean follows them, so each new
+    frame looks close to it, while the frames from the start of the episode
+    fall further behind. Anchoring to a single frame instead would also work
+    for that case but would carry that one frame's landmark noise into the
+    radius; averaging removes it.
+
+    A note on the guide's version of this quantity, which is **not** what is
+    implemented: its pseudocode accumulates positions from the trigger
+    onward, never clears them, and returns 0 whenever any sample deviates.
+    Once a subject moves at all after the trigger, that formulation can
+    never report a positive immobility again. §3.4's wording — "the total
+    wall-clock duration *within which* the positions remain within ε" — asks
+    for the duration of the stretch in which they stay near the average, and
+    that is what the episode structure gives.
+
+    Args:
+        epsilon_torso: stillness radius in torso lengths (``stage3.epsilon``).
+        max_samples: cap on the episode buffer. Default ≈30 s at 30 fps,
+            matching the Stage-3 observation window, beyond which the mean
+            slides. Without it a subject asleep in frame would grow the
+            buffer without bound.
+
+    Cost: re-checking the episode is O(samples) per frame instead of O(1).
+    Measured on this machine: 0.13 ms per frame at 30 samples, 0.33 ms at
+    300, 0.74 ms at the 900-sample cap. Worth stating because the live loop
+    was measured at 200 ms per frame, so this is under half a percent of it
+    even in the worst case — the frame budget is being spent somewhere else
+    entirely.
+    """
+
+    def __init__(self, epsilon_torso: float, max_samples: int = 900) -> None:
+        if epsilon_torso <= 0.0:
+            raise ValueError("epsilon must be > 0")
+        if max_samples < 2:
+            raise ValueError("max_samples must be >= 2")
+        self.epsilon_torso = float(epsilon_torso)
+        self.max_samples = int(max_samples)
+        self._samples: list[np.ndarray] = []
+        self._started_at: float | None = None
+
+    def update(self, timestamp: float, points: np.ndarray, torso_length: float
+               ) -> tuple[float, float]:
+        """Feed this frame's tracked landmarks; returns (seconds, displacement).
+
+        Args:
+            timestamp: seconds, on the same clock as every other quantity.
+            points: (N, 2) tracked landmark positions in pixels. Rows may be
+                NaN for a landmark that is not visible this frame — the nose
+                disappears in a face-down posture, which is precisely the
+                posture this quantity exists to measure, so a missing row
+                must not end the episode. A landmark only contributes to its
+                own mean over the frames where it was actually seen.
+            torso_length: Step-0 scale, so the radius is dimensionless.
+
+        Returns:
+            ``(still_seconds, max_displacement)``: how long the current
+            episode has lasted, and how far the worst landmark of the whole
+            episode currently sits from its mean, in torso lengths. The
+            second value is what makes ε calibratable — it shows how close
+            the episode ran to breaking. Both NaN when nothing can be
+            compared or the scale is unusable.
+        """
+        pts = np.asarray(points, dtype=float)[:, :2]
+        if not torso_length or torso_length <= 0.0 or pts.size == 0:
+            self.reset()
+            return float("nan"), float("nan")
+
+        if self._samples and self._samples[0].shape != pts.shape:
+            self._begin(timestamp, pts)
+            return 0.0, 0.0
+        if not self._samples:
+            self._begin(timestamp, pts)
+            return 0.0, 0.0
+
+        self._samples.append(pts.copy())
+        if len(self._samples) > self.max_samples:
+            del self._samples[: len(self._samples) - self.max_samples]
+
+        stack = np.stack(self._samples)                       # (frames, N, 2)
+        # The per-landmark mean over the frames where that landmark was
+        # actually seen. Computed explicitly rather than with ``nanmean`` so
+        # a landmark never seen at all yields NaN without a warning, and so
+        # the "only counts where observed" rule is visible in the code.
+        seen = np.isfinite(stack).all(axis=2)                  # (frames, N)
+        counts = seen.sum(axis=0)                              # (N,)
+        totals = np.where(seen[..., None], stack, 0.0).sum(axis=0)
+        # The NaN branch is belt-and-braces: a landmark seen in no frame is
+        # NaN in every sample, so its deviations are NaN and ``nanmax``
+        # already skips it whatever mean is written here — a mutation
+        # replacing this with a plain division passes every test (verified).
+        # It stays so the array never carries a fictitious origin that a
+        # future reader might take for a position.
+        mean = np.where(counts[:, None] > 0,
+                        totals / np.maximum(counts, 1)[:, None],
+                        np.nan)                                # (N, 2)
+        # Every sample of the episode is re-checked against the CURRENT mean,
+        # not just the newest one. That is what catches a slow drift: the
+        # mean follows a creeping subject, so each new frame looks close to
+        # it, while the frames from the start of the episode fall further and
+        # further behind. Checking only the latest sample would let someone
+        # crawl across the room and read as immobile the whole way.
+        deviations = np.linalg.norm(stack - mean, axis=2)      # (frames, N)
+        if not np.isfinite(deviations).any():
+            self._begin(timestamp, pts)
+            return 0.0, 0.0
+        displacement = float(np.nanmax(deviations)) / torso_length
+
+        if displacement > self.epsilon_torso:
+            self._begin(timestamp, pts)
+            return 0.0, displacement
+
+        return max(0.0, timestamp - float(self._started_at)), displacement
+
+    def _begin(self, timestamp: float, pts: np.ndarray) -> None:
+        self._samples = [pts.copy()]
+        self._started_at = float(timestamp)
+
+    def reset(self) -> None:
+        """Forget the current episode (subject lost, seek, discontinuity)."""
+        self._samples = []
+        self._started_at = None
 
 
 class VelocityEstimator:

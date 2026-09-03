@@ -31,7 +31,34 @@ stage1:                        # [Phase 2-3] kinematic trigger (T + V), §3.4/§
   history_max_gap_s: 0.5       # a larger gap between samples clears velocity
                                # history (differentiating across a detection
                                # loss or a seek would produce a fake spike)
-  min_consecutive_frames: 3    # frames the trigger must hold (hysteresis)
+  # Which reading of §3.5's "instantaneous combination of the two quantities
+  # [that] exceeds a configurable trigger threshold while V remains negative"
+  # the trigger implements. Measured on 13 real falls with a 0.1 s hold:
+  # score 13/13, sequential 12/13, v_only 13/13 (one false positive),
+  # simultaneous 8/13.
+  #
+  # 'score' is the default because it follows that sentence literally — a
+  # combination of both quantities, on a single frame, against a threshold,
+  # with V negative on that same frame — and because it loses no falls. The
+  # other three stay available: §3.7 requires the single-threshold ablation,
+  # and comparing readings of the same sentence is itself a result.
+  # PROVISIONAL — confirmed by the dataset, not settled by these numbers.
+  trigger_formulation: score   # score | simultaneous | sequential | v_only
+  trigger_score: 2.2           # 'score' only. Each term is its quantity over
+                               # its own threshold, so 2.0 means "both exactly
+                               # at threshold" and above that means the two
+                               # together are more extreme than that. At 2.2
+                               # the 13 falls fired and the 4 non-fall sessions
+                               # did not — but 4 sessions prove nothing about
+                               # specificity, so this number is a placeholder.
+  trigger_hold_s: 0.1          # how long the condition must persist before
+                               # firing (hysteresis). In SECONDS: a frame
+                               # count would mean a different physical
+                               # duration on the Pi than on a laptop, and
+                               # the trigger is measurably sensitive to it.
+  confirm_window_s: 1.0        # 'sequential' only: how long after the V event
+                               # T may still arrive and confirm. Real falls
+                               # show T-V peak offsets of 0.03 s to 1.8 s.
 
 state_display:                 # [Phase 2] person-state labels — DISPLAY/LOG ONLY.
                                # No §3.5 stage consumes these; they exist so a
@@ -44,6 +71,14 @@ state_display:                 # [Phase 2] person-state labels — DISPLAY/LOG O
   standing_extension: 1.1      # hip-to-ankle extent / torso at/above -> legs extended
   crouch_extension: 0.6        # below this -> legs collapsed (CROUCHING)
   walking_vh_tps: 0.25         # |V horizontal| above this while upright -> WALKING
+  max_extension_ratio: 3.0     # above this the hip-to-ankle ratio is not a
+                               # leg: the torso is foreshortened to a few
+                               # pixels and the ratio is dividing by it. On
+                               # PEF-FallDB, 20 of 128 clips recorded values
+                               # over 3, up to 183 torso lengths. Beyond this
+                               # the quantity reads NaN (unknown), never a
+                               # clamped number that would look measured.
+                               # A human hip-to-ankle span is ~1.5 torsos.
   ratio_time_constant_s: 0.1   # smoothing applied to the FINISHED extension
                                # ratio, never to its inputs. Ankles
                                # are among the noisiest landmarks; without
@@ -51,15 +86,66 @@ state_display:                 # [Phase 2] person-state labels — DISPLAY/LOG O
                                # the standing/sitting boundary changes label
                                # 7x more often. 0 disables it.
 
+alerts:                        # [Phase 5b+] the §3.5 output, §3.6 transports
+  # Which verdicts produce an alert. §3.5 dispatches a CONFIRMED fall; a
+  # nullified one is the alarm being called off. Events no stage could
+  # resolve (stage3_unresolved, stage2_inconclusive) are RECORDED but not
+  # dispatched — a deliberate reading of §3.5. On a device meant to catch
+  # falls, "I could not tell" may deserve a quieter notification instead of
+  # silence; that is a question for the dataset, which is why it is a knob.
+  dispatch_verdicts:
+    - stage3_confirmed
+
 stage2:                        # [Phase 4] geometric verification (P), §3.4/§3.5
-  com_eval_window_frames: 10   # frames around the trigger over which P is judged
-  com_votes_required: 5        # k-of-n frames with COM outside support polygon
+  # Quantity P is computed every frame from Phase 4a on; the STAGE that
+  # consumes it (the k-of-n vote below) arrives with the state machine.
+  com_hip_weight: 0.65         # weight of the hip cluster in the COM estimate.
+                               # §3.4: "the hip cluster carries the dominant
+                               # contribution". PROVISIONAL — the body's mass
+                               # sits near the sacrum, so >0.5 is anatomy, but
+                               # the exact value awaits the dataset.
+  # The window opens AT the trigger and runs forward: when Stage 1 fires the
+  # body is still on its way down, so judging the geometry on the trigger
+  # frame would test the posture the subject was leaving.
+  com_eval_window_s: 0.33      # how long P is watched before the verdict.
+                               # In SECONDS (was 10 frames): a frame count
+                               # is a different duration on the Pi.
+  com_outside_fraction: 0.5    # share of MEASURABLE frames in the window that
+                               # must show the COM outside the support. A
+                               # fraction, not a vote count: "5 of 10" is
+                               # unreachable at 10 fps over a third of a second.
+  com_min_samples: 3           # fewer measurable frames than this -> verdict
+                               # 'inconclusive', never 'rejected'. Occluded
+                               # feet must not read as "no fall".
   min_foot_visibility: 0.5     # below this, feet are occluded -> P inconclusive
+  contact_band_torso: 0.15     # §3.4 builds the support polygon from the foot
+                               # landmarks "in bipedal contact". With no
+                               # calibrated ground plane, the floor is the
+                               # lowest foot landmark still inside the frame,
+                               # and anything more than this far above it has
+                               # left the floor. In torso lengths, so it means
+                               # the same at any camera distance. PROVISIONAL.
 
 stage3:                        # [Phase 5] immobility confirmation (I), §3.4/§3.5
   epsilon: 0.05                # stillness radius, torso-lengths
-  movement_ref_seconds: 0.5    # compare current position vs. this far back
-  threshold_W_seconds: 5.0     # sustained immobility that confirms severity
-  observation_window_seconds: 30.0  # max post-trigger observation before verdict
+  threshold_W_seconds: 5.0     # §3.4: "if I exceeds a confirmation threshold W,
+                               # the event is classified as a confirmed fall"
+  observation_window_seconds: 30.0  # upper bound on how long a verdict may stay
+                               # open. It resolves earlier: on a held recovery,
+                               # or as soon as I reaches W.
   upright_T_deg: 30.0          # trunk angle below which posture counts as upright
+  recovery_hold_seconds: 1.0   # how long upright must last to be a recovery
+                               # rather than a wobble
+  # Severity (§3.3) is defined by RECOVERY, not by impact: recovered alone =
+  # mild, partially recovered = moderate, remained down = severe. Separating
+  # mild from moderate needs to know whether the subject STOOD or merely sat
+  # up, and the trunk angle alone cannot tell those apart. The signal that
+  # can is the hip-to-ankle extension — recorded as extension_ratio_EXP, an
+  # EXPERIMENTAL column. Setting this true lets an _EXP signal into a
+  # decision, which this project's own rule says needs draft text first;
+  # §3.5's "hip landmark recovery to upright" is the closest the paper comes
+  # to authorising it. With it false, any recovery is reported as moderate —
+  # never mild, because claiming a full recovery one cannot verify is the
+  # error that matters. PENDING: draft wording.
+  severity_uses_leg_extension: true
   cooldown_seconds: 3.0        # refractory period after an event resolves

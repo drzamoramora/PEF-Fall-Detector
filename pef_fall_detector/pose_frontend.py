@@ -55,6 +55,23 @@ LEFT_FOOT_INDEX, RIGHT_FOOT_INDEX = 31, 32
 #: Landmarks every core quantity depends on; used for the reliability check.
 CORE_LANDMARKS = (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP)
 
+#: Landmarks Quantity I watches for stillness — §3.4's "head and torso
+#: landmark positions". The nose leads because it is the head, and it is
+#: also the one that vanishes in a face-down posture; the torso four are
+#: what keep the measurement alive when it does.
+HEAD_AND_TORSO_LANDMARKS = (
+    NOSE, LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP,
+)
+
+#: The support polygon of §3.4: "the ankle landmark positions (left ankle
+#: landmark 27 and right ankle landmark 28) plus their subsequent foot
+#: landmarks in bipedal contact" — ankles, heels and foot indices.
+FOOT_LANDMARKS = (
+    LEFT_ANKLE, RIGHT_ANKLE,
+    LEFT_HEEL, RIGHT_HEEL,
+    LEFT_FOOT_INDEX, RIGHT_FOOT_INDEX,
+)
+
 
 @dataclass
 class PoseFrame:

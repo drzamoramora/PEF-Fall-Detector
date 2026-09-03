@@ -168,5 +168,64 @@ class TestRunMetadata(unittest.TestCase):
             self.assertFalse(logger.path.with_suffix(".meta.json").exists())
 
 
+class TestSurvivingAnUncleanEnd(unittest.TestCase):
+    """What reaches the disk when the process never gets to close the file.
+
+    Found on this project's own material, not imagined: a clip played to its
+    end left a 0-byte event record that had, in fact, logged a confirmed fall.
+    The rows were in Python's write buffer and the process ended without a
+    close. On the §3.6 device — a Raspberry Pi that can lose power mid-session
+    — the buffer is exactly where a detection must not be sitting.
+    """
+
+    def test_an_event_row_reaches_the_disk_before_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = AuditLogger(tmp, "clip", fields=["frame_index"],
+                                 flush_each_row=True)
+            logger.log({"frame_index": 7})
+            # Read the file through a SEPARATE handle, without closing the
+            # logger: this is what a reader — or a post-mortem — would see if
+            # the process died right now.
+            self.assertIn("7", logger.path.read_text())
+            logger.close()
+
+    def test_without_flushing_a_single_row_may_still_be_buffered(self) -> None:
+        # The contrast that justifies the flag. Not a defect for the per-frame
+        # record, where tens of rows a second fill the buffer in moments; a
+        # serious one for a record that may hold a single row for minutes.
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = AuditLogger(tmp, "clip", fields=["frame_index"])
+            logger.log({"frame_index": 7})
+            self.assertEqual(logger.path.read_text(), "",
+                             "el búfer ya no retiene la fila; revise la premisa")
+            logger.close()
+            self.assertIn("7", logger.path.read_text())
+
+    def test_writing_after_close_raises_instead_of_truncating(self) -> None:
+        # The landmine this replaced: the file is opened in "w" mode and only
+        # on the first row, so a write after close would reopen it, wipe a
+        # finished session and start over. Silently.
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = AuditLogger(tmp, "clip", fields=["frame_index"])
+            logger.log({"frame_index": 1})
+            logger.close()
+            saved = logger.path.read_text()
+            with self.assertRaises(RuntimeError):
+                logger.log({"frame_index": 2})
+            self.assertEqual(logger.path.read_text(), saved,
+                             "el registro cerrado fue alterado")
+
+    def test_closing_twice_is_harmless(self) -> None:
+        # The window can reach the end of a video and then be closed by the
+        # user; both paths finalise the record.
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = AuditLogger(tmp, "clip", fields=["frame_index"])
+            logger.log({"frame_index": 1})
+            logger.close()
+            logger.close()
+            self.assertEqual(
+                json.loads(logger.path.with_suffix(".meta.json").read_text())["rows"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

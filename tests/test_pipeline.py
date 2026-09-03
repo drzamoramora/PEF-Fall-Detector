@@ -22,10 +22,15 @@ from pef_fall_detector.audit_log import PHASE2_FIELDS, csv_column
 from pef_fall_detector.config import Config
 from pef_fall_detector.pipeline import FramePipeline
 from pef_fall_detector.pose_frontend import (
+    NOSE,
     LEFT_ANKLE,
+    LEFT_FOOT_INDEX,
+    LEFT_HEEL,
     LEFT_HIP,
     LEFT_SHOULDER,
     RIGHT_ANKLE,
+    RIGHT_FOOT_INDEX,
+    RIGHT_HEEL,
     RIGHT_HIP,
     RIGHT_SHOULDER,
     PoseFrame,
@@ -48,7 +53,10 @@ TEST_CFG = {
         "velocity_window_s": 5 / 30.0,
         "ema_time_constant_s": 0.093,
         "history_max_gap_s": 0.5,
-        "min_consecutive_frames": 3,
+        "trigger_formulation": "sequential",
+        "trigger_score": 2.2,
+        "trigger_hold_s": 0.1,
+        "confirm_window_s": 1.0,
     },
     "state_display": {
         "transition_v_tps": 0.7,
@@ -56,8 +64,27 @@ TEST_CFG = {
         "leaning_T_deg": 15.0,
         "standing_extension": 1.1,
         "crouch_extension": 0.6,
+        "max_extension_ratio": 3.0,
         "walking_vh_tps": 0.25,
         "ratio_time_constant_s": 0.093,
+    },
+    "alerts": {"dispatch_verdicts": ["stage3_confirmed"]},
+    "stage2": {
+        "com_hip_weight": 0.65,
+        "com_eval_window_s": 0.33,
+        "com_outside_fraction": 0.5,
+        "com_min_samples": 3,
+        "min_foot_visibility": 0.5,
+        "contact_band_torso": 0.15,
+    },
+    "stage3": {
+        "epsilon": 0.05,
+        "threshold_W_seconds": 5.0,
+        "observation_window_seconds": 30.0,
+        "upright_T_deg": 30.0,
+        "recovery_hold_seconds": 1.0,
+        "severity_uses_leg_extension": True,
+        "cooldown_seconds": 3.0,
     },
 }
 
@@ -69,18 +96,44 @@ def make_pose(
     shoulder_y: float = 300.0,
     ankle_y: float = 700.0,
     ankle_visible: bool = True,
+    nose_visible: bool = True,
     x: float = 640.0,
+    feet_x: float | None = None,
+    stance_px: float = 60.0,
 ) -> PoseFrame:
-    """A synthetic upright skeleton with the landmarks the pipeline reads."""
+    """A synthetic upright skeleton with the landmarks the pipeline reads.
+
+    ``feet_x`` defaults to ``x`` (feet under the body). Passing it separately
+    shifts the support polygon away from the trunk, which is how the
+    Quantity-P tests put the COM outside the feet without contorting the
+    rest of the skeleton.
+    """
     lms = np.zeros((33, 3))
+    # The nose is a real position, not the origin: Quantity I anchors on it
+    # while it is visible, so a test that leaves it at (0, 0) cannot tell a
+    # skipped landmark from a landmark that never moved.
+    lms[NOSE, 0], lms[NOSE, 1] = x, shoulder_y - 80.0
     for idx, y in ((LEFT_SHOULDER, shoulder_y), (RIGHT_SHOULDER, shoulder_y),
                    (LEFT_HIP, hip_y), (RIGHT_HIP, hip_y),
                    (LEFT_ANKLE, ankle_y), (RIGHT_ANKLE, ankle_y)):
         lms[idx, 0] = x
         lms[idx, 1] = y
+    # Feet: ankles plus heels and toes, the six landmarks of §3.4's support
+    # polygon. Without them the hull would be built from unset (0, 0) points.
+    fx = x if feet_x is None else feet_x
+    for ankle, heel, toe, side in (
+        (LEFT_ANKLE, LEFT_HEEL, LEFT_FOOT_INDEX, -1.0),
+        (RIGHT_ANKLE, RIGHT_HEEL, RIGHT_FOOT_INDEX, +1.0),
+    ):
+        foot_x = fx + side * stance_px / 2.0
+        lms[ankle, 0], lms[ankle, 1] = foot_x, ankle_y
+        lms[heel, 0], lms[heel, 1] = foot_x - 10.0, ankle_y + 5.0
+        lms[toe, 0], lms[toe, 1] = foot_x + 20.0, ankle_y + 8.0
     vis = np.ones(33)
     if not ankle_visible:
         vis[[LEFT_ANKLE, RIGHT_ANKLE]] = 0.1  # below the 0.5 threshold
+    if not nose_visible:
+        vis[NOSE] = 0.1                       # face buried / turned away
     mid_hip, mid_shoulder, torso = compute_step0(lms)
     return PoseFrame(
         frame_index=frame_index,
@@ -327,6 +380,236 @@ class TestAnalyzeBasics(unittest.TestCase):
         self.assertFalse(result.reliable)
         # Data is never silently discarded: the quantity is still there.
         self.assertIn("T_deg", result.quantities)
+
+
+class TestQuantityPInThePipeline(unittest.TestCase):
+    """P as the pipeline produces it, on synthetic skeletons.
+
+    The pure geometry is covered in ``test_quantity_p``. What is left to
+    prove here is the wiring: that the COM is the hip-weighted one and not
+    Quantity V's midpoint, and that occluded feet reach the record as NaN
+    rather than as a number.
+    """
+
+    def test_balanced_stance_puts_the_com_inside(self) -> None:
+        pipe = FramePipeline(Config(TEST_CFG))
+        q = pipe.analyze(make_pose(0, 0.0)).quantities
+        self.assertLess(q["P_offset"], 0.0)
+        self.assertGreater(q["P_support_width"], 0.0)
+
+    def test_feet_far_from_the_body_put_the_com_outside(self) -> None:
+        # Body at x=640, feet a metre to the left: the COM overhangs.
+        pipe = FramePipeline(Config(TEST_CFG))
+        q = pipe.analyze(make_pose(0, 0.0, feet_x=300.0)).quantities
+        self.assertGreater(q["P_offset"], 0.0)
+
+    def test_occluded_feet_make_p_undefined(self) -> None:
+        pipe = FramePipeline(Config(TEST_CFG))
+        q = pipe.analyze(make_pose(0, 0.0, ankle_visible=False)).quantities
+        self.assertTrue(math.isnan(q["P_offset"]))
+        self.assertTrue(math.isnan(q["P_support_width"]))
+
+    def test_toppling_drives_p_from_inside_to_outside(self) -> None:
+        """The §3.4 fall signature, end to end: "projection of COM outside
+        the support polygon".
+
+        A single frame with the COM outside proves the arithmetic; what the
+        paper actually claims is a *transition*. This walks the body away
+        from planted feet and asserts that P crosses zero once, in the right
+        direction — the shape Stage 2 will eventually test for.
+        """
+        pipe = FramePipeline(Config(TEST_CFG))
+        offsets = []
+        for i in range(40):
+            body_x = 640.0 + i * 6.0          # torso drifts right, feet stay
+            pf = make_pose(i, i / 30.0, x=body_x, feet_x=640.0)
+            offsets.append(pipe.analyze(pf).quantities["P_offset"])
+
+        self.assertLess(offsets[0], 0.0, "de pie equilibrado deberia dar dentro")
+        self.assertGreater(offsets[-1], 0.0, "volcado deberia dar fuera")
+        crossings = sum(
+            1 for a, b in zip(offsets, offsets[1:]) if (a <= 0.0) != (b <= 0.0)
+        )
+        self.assertEqual(crossings, 1, "P deberia cruzar el cero una sola vez")
+
+    def test_com_is_hip_weighted_not_the_velocity_centroid(self) -> None:
+        # §3.4 defines two different points: V's centroid is a 0.5/0.5
+        # midpoint, P's COM is hip-dominant. With the trunk leaning, the two
+        # sit at different x, and P must use the hip-weighted one. A pose
+        # whose shoulders are offset from the hips makes the difference
+        # measurable.
+        cfg = Config(TEST_CFG)
+        pipe = FramePipeline(cfg)
+        pf = make_pose(0, 0.0)
+        pf.landmarks[[LEFT_SHOULDER, RIGHT_SHOULDER], 0] = 400.0   # lean left
+        pf.mid_hip, pf.mid_shoulder, pf.torso_length = compute_step0(pf.landmarks)
+        q = pipe.analyze(pf).quantities
+
+        w = float(cfg.stage2.com_hip_weight)
+        hip_x, sh_x = float(pf.mid_hip[0]), float(pf.mid_shoulder[0])
+        expected_com_x = w * hip_x + (1.0 - w) * sh_x
+        midpoint_x = 0.5 * (hip_x + sh_x)
+        self.assertNotAlmostEqual(expected_com_x, midpoint_x, places=3)
+
+        hull_right = 640.0 + 60.0 / 2.0 + 20.0        # rightmost toe
+        hull_left = 640.0 - 60.0 / 2.0 - 10.0         # leftmost heel
+        margin = min(expected_com_x - hull_left, hull_right - expected_com_x)
+        self.assertAlmostEqual(q["P_offset"], -margin / pf.torso_length, places=6)
+
+
+class TestQuantityIInThePipeline(unittest.TestCase):
+    """I as the pipeline produces it. The timer itself is covered in
+    ``test_quantity_i``; what is left is the wiring and the reset policy."""
+
+    def test_a_still_subject_accumulates_time(self) -> None:
+        pipe = FramePipeline(Config(TEST_CFG))
+        secs = float("nan")
+        for i in range(31):
+            secs = pipe.analyze(make_pose(i, i / 10.0)).quantities["I_still_s"]
+        self.assertAlmostEqual(secs, 3.0, places=6)
+
+    def test_moving_zeroes_the_clock(self) -> None:
+        pipe = FramePipeline(Config(TEST_CFG))
+        for i in range(21):
+            pipe.analyze(make_pose(i, i / 10.0))
+        # Torso is 200 px here, so 40 px is 0.2 torso — well past epsilon.
+        q = pipe.analyze(make_pose(21, 2.1, x=680.0)).quantities
+        self.assertEqual(q["I_still_s"], 0.0)
+
+    def test_losing_the_subject_restarts_the_clock(self) -> None:
+        # Not merely a pause: the clock must not resume where it left off.
+        # A body reappearing inside the same radius is equally consistent
+        # with a different person standing there, and nothing yet
+        # distinguishes the two.
+        pipe = FramePipeline(Config(TEST_CFG))
+        for i in range(31):
+            pipe.analyze(make_pose(i, i / 10.0))
+        pipe.analyze(PoseFrame(frame_index=31, timestamp=3.1, detected=False,
+                               frame_size=(1280, 960)))
+        q = pipe.analyze(make_pose(32, 3.2)).quantities
+        self.assertEqual(q["I_still_s"], 0.0)
+
+    def test_the_face_getting_buried_does_not_restart_the_clock(self) -> None:
+        # A forward fall in two acts: the face is visible on the way down and
+        # buried once the subject is prone. The nose must drop out of the
+        # comparison, not be replaced by a stand-in position — a substituted
+        # value looks like the head teleporting and resets the very clock
+        # that confirms the fall.
+        pipe = FramePipeline(Config(TEST_CFG))
+        for i in range(21):
+            pipe.analyze(make_pose(i, i / 10.0))
+        secs = 0.0
+        for i in range(21, 41):
+            secs = pipe.analyze(
+                make_pose(i, i / 10.0, nose_visible=False)
+            ).quantities["I_still_s"]
+        self.assertAlmostEqual(secs, 4.0, places=6)
+
+    def test_unreliable_frames_report_i_as_unknown(self) -> None:
+        pipe = FramePipeline(Config(TEST_CFG))
+        pf = make_pose(0, 0.0)
+        pf.core_visibility = 0.02
+        q = pipe.analyze(pf).quantities
+        self.assertTrue(math.isnan(q["I_still_s"]))
+
+
+class TestAlertDispatchFromThePipeline(unittest.TestCase):
+    """The seam end to end: a confirmed fall reaches a sink."""
+
+    @staticmethod
+    def _toppling_pose(index: int, timestamp: float, angle_deg: float,
+                       hip_y: float) -> PoseFrame:
+        """A skeleton with the trunk rotated ``angle_deg`` from vertical.
+
+        ``make_pose`` always stacks the shoulders directly above the hips, so
+        its T is identically 0 — fine for the quantities it was written for,
+        useless for driving a trigger that needs the trunk to rotate. Here
+        the trunk keeps its 200 px length and swings, which is what a fall
+        actually does to the geometry.
+        """
+        pf = make_pose(index, timestamp, hip_y=hip_y, feet_x=640.0)
+        rad = math.radians(angle_deg)
+        pf.landmarks[[LEFT_SHOULDER, RIGHT_SHOULDER], 0] = 640.0 + 200.0 * math.sin(rad)
+        pf.landmarks[[LEFT_SHOULDER, RIGHT_SHOULDER], 1] = hip_y - 200.0 * math.cos(rad)
+        pf.landmarks[NOSE, 0] = 640.0 + 260.0 * math.sin(rad)
+        pf.landmarks[NOSE, 1] = hip_y - 260.0 * math.cos(rad)
+        pf.mid_hip, pf.mid_shoulder, pf.torso_length = compute_step0(pf.landmarks)
+        return pf
+
+    def _fall_frames(self):
+        """Topple past 45 deg, then lie still past W — a confirmed severe fall."""
+        frames = []
+        for i in range(20):                       # 0.67 s of toppling
+            frames.append(self._toppling_pose(
+                i, i / 30.0, angle_deg=i * 4.5, hip_y=500.0 + i * 12.0))
+        for i in range(20, 300):                  # motionless on the floor
+            frames.append(self._toppling_pose(
+                i, i / 30.0, angle_deg=90.0, hip_y=740.0))
+        return frames
+
+    def test_a_confirmed_fall_reaches_the_sink_with_its_evidence(self) -> None:
+        pipe = FramePipeline(Config(TEST_CFG))
+        received = []
+        pipe.alerts.add_sink(received.append)
+        pipe.source_name = "clip.mp4"
+        for pf in self._fall_frames():
+            pipe.analyze(pf)
+        self.assertEqual(len(pipe.machine.events), 1, "la Etapa 1 no disparo")
+        self.assertEqual(len(received), 1, "no se despacho la alerta")
+        a = received[0]
+        self.assertEqual(a.source, "clip.mp4")
+        self.assertEqual(a.verdict, "stage3_confirmed")
+        self.assertEqual(a.severity, "severe")
+        # The alert must arrive AFTER the funnel resolved, never on the frame
+        # the event was merely raised on.
+        self.assertNotEqual(a.verdict, "stage1_only")
+        # And it must carry the evidence, not just the verdict (§3.5).
+        for fragment in ("SEVERE", "T=", "V=", "COM outside", "still"):
+            self.assertIn(fragment, a.message())
+        # The prelude must name the posture the subject was in BEFORE the
+        # event. Left updating during the fall it would report LYING —
+        # "subject was lying down before they fell", which is both useless
+        # to a caregiver and wrong.
+        self.assertTrue(a.prior_state)
+        self.assertNotIn(a.prior_state, ("LYING", "NOT_DETECTED"))
+
+    def test_the_resolved_event_surfaces_once_on_the_deciding_frame(self) -> None:
+        """What PEF-Lab's event record and outcome banner hang on.
+
+        ``event`` marks the frame the funnel started wondering; this marks
+        the frame it decided. Surfacing the verdict on the raising frame
+        would record ``stage1_only`` for everything; surfacing it on every
+        subsequent frame would write the same event to the record dozens of
+        times.
+        """
+        pipe = FramePipeline(Config(TEST_CFG))
+        resolved = []
+        for pf in self._fall_frames():
+            result = pipe.analyze(pf)
+            if result.resolved_event is not None:
+                resolved.append((result.pose.frame_index, result.resolved_event))
+        self.assertEqual(len(resolved), 1, "el veredicto debe aparecer una sola vez")
+        deciding_frame, ev = resolved[0]
+        self.assertNotEqual(ev.verdict, "stage1_only")
+        self.assertGreater(deciding_frame, ev.frame_index,
+                           "el veredicto no puede caer en el frame del disparo")
+
+    def test_nothing_is_dispatched_when_nothing_happens(self) -> None:
+        pipe = FramePipeline(Config(TEST_CFG))
+        received = []
+        pipe.alerts.add_sink(received.append)
+        for i in range(120):
+            pipe.analyze(make_pose(i, i / 30.0))
+        self.assertEqual(received, [])
+
+    def test_the_alert_names_what_the_subject_was_doing_before(self) -> None:
+        # §3.5's explainability, in the one line a caregiver reads. The state
+        # must be the pre-event one, not the posture the fall produced.
+        pipe = FramePipeline(Config(TEST_CFG))
+        for i in range(40):
+            pipe.analyze(make_pose(i, i / 30.0))
+        self.assertTrue(pipe._recent_state)
+        self.assertNotEqual(pipe._recent_state, "LYING")
 
 
 class TestRowMatchesTheSchema(unittest.TestCase):
