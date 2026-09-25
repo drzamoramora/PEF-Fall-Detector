@@ -84,6 +84,25 @@ EXPERIMENTAL_QUANTITIES = frozenset({
                           # anchor. Not a §3.4 quantity: it is the internal
                           # term I is thresholded on, recorded because ε
                           # cannot be calibrated without seeing it.
+    "H_ratio",            # Quantity H (not in the paper): body height vs. the
+                          # subject's own calibrated standing baseline.
+                          # Proposed to cover two gaps measured in this
+                          # project's footage — P unmeasurable when feet are
+                          # occluded, T falsely low when a fall's rotation
+                          # axis points at the camera. See quantities.py.
+    "H_raw",              # H's numerator/denominator ratio BEFORE baselining
+                          # (vertical spine extent / shoulder width). Recorded
+                          # so a calibration pass can see the raw signal
+                          # independently of how the baseline behaved.
+    "H_baseline",         # H's personal baseline, as currently calibrated.
+                          # NaN until the subject has been seen confidently
+                          # standing; recorded to see the baseline converge.
+    "reach_proximity",    # Quantity R (not in §3.4): smallest wrist-to-ankle
+                          # distance, torso lengths. Proposed as the signal
+                          # that can tell a deliberate bend (tying a shoe)
+                          # apart from a fall — T/V/P/I/H all read posture,
+                          # this is the only one that reads the hands. Logged
+                          # only; not wired into any §3.5 stage yet.
 })
 
 
@@ -101,9 +120,12 @@ def csv_column(name: str) -> str:
 #: runs stay readable by the same tooling.
 #:
 #: Columns ending in ``_EXP`` are experimental (see ``EXPERIMENTAL_SUFFIX``):
-#: they are diagnostic or display signals, and **no stage of §3.5 consumes
-#: them**. Any of them entering a decision requires editing the draft first,
-#: with the evidence that justified it.
+#: signals the paper does not define. Most are diagnostic only; two
+#: (``H_ratio_EXP``, indirectly ``H_raw_EXP``/``H_baseline_EXP``) ARE wired
+#: into Stage1Trigger/Stage3Evaluator as OR'd fallbacks, gated by the
+#: ``experimental.*`` thresholds in config.yaml — see quantities.py's module
+#: docstring. The mark is about the QUANTITY'S STATUS in the paper, not
+#: about whether today's config happens to consume it.
 PHASE2_FIELDS = PHASE1_FIELDS + [
     "T_deg",              # Quantity T: trunk inclination angle (§3.4)
     csv_column("world_torso_len_m"),
@@ -114,12 +136,24 @@ PHASE2_FIELDS = PHASE1_FIELDS + [
     csv_column("Vh_tps"),
     csv_column("extension_ratio"),
     csv_column("state"),
+    "trigger_score",      # what Stage 1 compares against trigger_score (§3.5's
+                          # "instantaneous combination of the two quantities"):
+                          # T/threshold_T + V/threshold_V over the peak window.
+                          # Empty when the formulation is not "score" or V is
+                          # not downward (the trigger does not evaluate it then).
     "P_offset",           # Quantity P: signed COM-to-support offset, torso
                           # lengths (negative = inside, positive = outside)
     "P_support_width",    # width of the support polygon, torso lengths —
                           # §3.4's "sudden contraction" signature
     "I_still_s",          # Quantity I: seconds the subject has been still
+    "still_fraction",     # share of Stage-3 frames with I >= persistent_still_s
+                          # so far (phase 3, §3.5 "if the immobility persists");
+                          # empty outside Stage 3.
     csv_column("I_displacement"),
+    csv_column("H_ratio"),
+    csv_column("H_raw"),
+    csv_column("H_baseline"),
+    csv_column("reach_proximity"),
     "stage",              # §3.5 funnel position: MONITORING/CONFIRMING/COOLDOWN
     "stage1_fired",       # 1 on the exact frame the kinematic trigger fired
     "reliable",           # 1 = detection + core visibility above threshold;
@@ -147,6 +181,13 @@ EVENT_FIELDS = [
     "p_samples",            # the window with the COM outside, and how many
                             # frames that share was computed from. A verdict
                             # without its evidence can only be believed.
+    csv_column("H_ratio"),  # Quantity H (EXPERIMENTAL) at the firing frame —
+                            # recorded even when it was NOT what fired, so a
+                            # reviewer can tell whether Stage1Trigger's H+V
+                            # fallback or T/V's own formulation was responsible.
+    "motivo",               # the rule that decided the verdict, with the numbers
+                            # it read (TriggerEvent.reason). §3.5: "a downstream
+                            # reviewer can reconstruct the decision".
 ]
 
 
@@ -200,9 +241,21 @@ class AuditLogger:
 
     # ------------------------------------------------------------------ core
     def _open(self) -> None:
-        """Create the directory and the file. Called on the first row only."""
+        """Create the directory and the file. Called on the first row only.
+
+        Names carry the time to the second, so two records of the same
+        source opened within one second used to share a name — and ``"w"``
+        mode silently truncated the first. Re-analysing a short clip is
+        enough to do it. The later record takes a numbered name instead;
+        nothing already on disk is ever overwritten.
+        """
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, "w", newline="", encoding="utf-8")
+        if self.path.exists():
+            stem, n = self.path.stem, 2
+            while (candidate := self.path.with_name(f"{stem}-{n}.csv")).exists():
+                n += 1
+            self.path = candidate
+        self._fh = open(self.path, "x", newline="", encoding="utf-8")
         # extrasaction="raise": an unknown column name is a bug, and a silent
         # drop would produce a record that looks complete but is not.
         self._writer = csv.DictWriter(

@@ -61,6 +61,11 @@ class Alert:
     #: What the subject was doing before the event, for the human reading it.
     prior_state: str = ""
     source: str = ""
+    #: The rule that decided the severity (TriggerEvent.reason). The
+    #: quantities above are the evidence; this is what they were held
+    #: against. Without it the recipient sees numbers but not the verdict's
+    #: logic, which is the half of explainability an alert can carry.
+    reason: str = ""
 
     def message(self) -> str:
         """One-line, human-readable, and complete enough to act on.
@@ -83,6 +88,8 @@ class Alert:
             f"COM outside {num(100 * self.p_outside_fraction, '.0f')}% of window, "
             f"still {num(self.max_immobility_s, '.1f')}s"
         )
+        if self.reason:
+            parts.append(f"why: {self.reason}")
         return " | ".join(parts)
 
 

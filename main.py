@@ -40,7 +40,15 @@ def run_headless(args: argparse.Namespace) -> int:
     """Process a video file sequentially and print a verification summary."""
     cfg = load_config(args.config)
     source = VideoFileSource(args.video)
-    pipeline = FramePipeline(cfg)
+    # A recorded clip is labelled from how the episode ENDED (§3.3), the
+    # same choice gui/lab_window.py makes for any non-live source. Without
+    # it this run resolved greedily, as the live §3.6 device must, and an
+    # event still open when the clip ran out — subject on the floor — was
+    # never judged. Measured on A05-S1, same clip and same config:
+    # stage2_inconclusive here, stage3_confirmed/severe in PEF-Lab. Every
+    # NotRecovered clip depends on this, so a headless run that skips it
+    # does not reproduce the paper's labels at all.
+    pipeline = FramePipeline(cfg, labelling=not source.is_live)
     # The §3.5 alert, on the only transport that exists before Phase 7.
     pipeline.source_name = Path(args.video).name
     pipeline.alerts.add_sink(console_sink)
@@ -81,10 +89,12 @@ def run_headless(args: argparse.Namespace) -> int:
     detected_frames = 0
     reliable_frames = 0
     index = 0
+    last_timestamp: float | None = None
     while True:
         ok, frame, timestamp = source.read()
         if not ok:
             break
+        last_timestamp = timestamp
         result = pipeline.process(frame, index, timestamp)
         logger.log_pose_frame(result.pose, extra=result.csv_extra())
 
@@ -106,6 +116,12 @@ def run_headless(args: argparse.Namespace) -> int:
                 state_counts[result.state] = state_counts.get(result.state, 0) + 1
         index += 1
 
+    # Close any event still being judged BEFORE the record is written, as
+    # gui/lab_window.py does at end of file: a clip that ends with the
+    # subject on the floor has an open event, and that event is precisely
+    # the answer the label needs.
+    if last_timestamp is not None:
+        pipeline.finalise(last_timestamp)
     pipeline.close()
     source.release()
     logger.close()
@@ -127,6 +143,8 @@ def run_headless(args: argparse.Namespace) -> int:
             "p_outside_fraction": ("" if math.isnan(ev.p_outside_fraction)
                                    else f"{ev.p_outside_fraction:.3f}"),
             "p_samples": ev.p_samples,
+            "H_ratio_EXP": "" if math.isnan(ev.h_ratio) else f"{ev.h_ratio:.3f}",
+            "motivo": ev.reason,
         })
     events.close()
 
@@ -197,6 +215,8 @@ def run_headless(args: argparse.Namespace) -> int:
               + ("" if math.isnan(ev.p_outside_fraction)
                  else f" (COM outside {100*ev.p_outside_fraction:.0f}% "
                       f"of {ev.p_samples} frames)"))
+        if ev.reason:
+            print(f"            motivo: {ev.reason}")
     print(f"Alerts    : {n_alerts} dispatched "
           f"(verdicts that alert: {', '.join(cfg.alerts.dispatch_verdicts)})")
     print(f"Audit CSV : {logger.path}")

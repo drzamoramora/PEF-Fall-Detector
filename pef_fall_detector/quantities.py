@@ -16,6 +16,34 @@ Implemented so far:
     V — vertical centroid velocity       [Phase 2.2-2.3]
     P — COM vs. support polygon          [Phase 4]
     I — post-fall immobility duration    [Phase 5]
+    H — body height vs. personal baseline [EXPERIMENTAL, not in §3.4]
+    R — wrist-to-ankle proximity          [EXPERIMENTAL, not in §3.4]
+
+Quantity H is not part of the paper. It is proposed to cover two measured
+gaps shared by T and P: both degrade exactly when a fall needs them most.
+P becomes unmeasurable the moment feet are occluded or leave frame — the
+most common failure of this project's own sensor. T reads a falsely low,
+"upright"-looking angle when a fall's rotation axis points toward or away
+from the camera, because the trunk vector's 2D projection nearly vanishes in
+that orientation — a projection limit, not a tracking bug (§3.2 already
+documents that this project does not trust MediaPipe's monocular z, which is
+the only channel that could recover that rotation directly). H sidesteps
+both: it reads how much vertical spread is left among whatever spine
+landmarks are visible, relative to the subject's own calibrated standing
+baseline, using shoulder width (not torso length) as the scale reference
+because shoulder width survives the exact rotation that breaks T. Like every
+``_EXP`` signal in this project, it must not enter a decision before the
+draft — or here, evidence from PEF-FallDB — says so; see ``HeightBaseline``
+and ``body_height_ratio`` below for the caveats that come with it.
+
+Quantity R is not part of the paper either, and answers a different question
+than H does. T, V, P, I and H all read POSTURE — how the body is arranged —
+and a deliberate bend (tying a shoe, picking something off the floor)
+produces close to the same posture as a fall by every one of them. None
+reads INTENT, because none looks at the hands. R does: it is the distance
+from wrist to ankle, and a person tying a shoe reaches for their feet while
+a person falling does not. Logged only, same discipline as H, pending
+calibration against labelled clips; see ``wrist_ankle_proximity`` below.
 
 Sign convention for velocities (IMPORTANT): V follows the paper's physical
 convention — **negative = moving down** (a fall produces a large negative V,
@@ -42,6 +70,10 @@ VERTICAL_AXIS = np.array([0.0, -1.0])
 #: angle amplified out of nothing. Well under any real detection (a torso
 #: spans tens to hundreds of pixels), so it only catches degenerate frames.
 MIN_TRUNK_PX = 1e-3
+
+#: Same reasoning as MIN_TRUNK_PX, applied to Quantity H's scale reference:
+#: below this shoulder width (pixels) it is too short to divide by.
+MIN_SHOULDER_PX = 1e-3
 
 
 def trunk_inclination_deg(mid_hip: np.ndarray, mid_shoulder: np.ndarray) -> float:
@@ -310,6 +342,232 @@ def support_width(hull: np.ndarray, torso_length: float) -> float:
     return float(hull[:, 0].max() - hull[:, 0].min()) / torso_length
 
 
+def body_vertical_extent(spine_points: np.ndarray) -> float:
+    """Quantity H's numerator (EXPERIMENTAL): observed vertical span of the
+    spine chain — nose, mid-shoulder, mid-hip, mid-ankle.
+
+    T asks for one fixed pair (hip, shoulder) and P asks for the feet
+    specifically. This asks a looser question instead: how much vertical
+    spread is there among *whatever* of the spine is currently visible. A
+    subject collapsing to the floor loses that spread regardless of which
+    part of the chain a camera can still see, or which way they fell —
+    including a fall whose rotation axis points at the camera, where T's own
+    trunk vector (hip-to-shoulder alone) projects to almost nothing while the
+    wider chain (down to the ankles, when visible) still shows the collapse.
+
+    Args:
+        spine_points: (N, 2) or (N, 3) array, one row per candidate landmark
+            in any order. A row of NaN means that landmark was not visible
+            this frame (visibility threshold, out of frame) — the caller's
+            job, same convention as ``feet_in_contact``.
+
+    Returns:
+        ``max(y) - min(y)`` in pixels over the rows with a finite y, or NaN
+        when fewer than two landmarks were visible: a span needs two points,
+        and a fabricated zero would read as "no height" rather than as
+        "could not measure".
+    """
+    pts = np.asarray(spine_points, dtype=float)
+    ys = pts[:, 1]
+    finite = ys[np.isfinite(ys)]
+    if finite.size < 2:
+        return float("nan")
+    return float(finite.max() - finite.min())
+
+
+def shoulder_width(left_shoulder: np.ndarray, right_shoulder: np.ndarray) -> float:
+    """Quantity H's scale reference (EXPERIMENTAL): shoulder-to-shoulder distance.
+
+    Everything else in this module normalises by torso length — exactly the
+    measurement that collapses when a fall's rotation axis points at the
+    camera (see ``body_vertical_extent``). Shoulder width is used for H
+    instead because it responds to yaw (turning side-on to the camera), not
+    to the forward/backward pitch that breaks the trunk vector in that
+    failure mode: during the critical transition of a fall toward or away
+    from the camera, the shoulders keep presenting roughly the same width
+    even as the trunk foreshortens to nothing.
+
+    This is not a universal fix. A subject who yaws AND pitches away from the
+    camera at once degrades this reference too — the same class of
+    camera-angle dependence §3.4 already names for Quantity P
+    (``com_support_offset``). Stated here rather than hidden, same reasoning.
+
+    Returns:
+        Distance between the shoulder landmarks in pixels, or NaN below
+        ``MIN_SHOULDER_PX`` — a numerator divided by noise is not a
+        measurement, the same guard ``MIN_TRUNK_PX`` applies to the trunk.
+    """
+    diff = (np.asarray(left_shoulder, dtype=float)[:2]
+            - np.asarray(right_shoulder, dtype=float)[:2])
+    width = float(np.linalg.norm(diff))
+    if width < MIN_SHOULDER_PX:
+        return float("nan")
+    return width
+
+
+def body_height_ratio_raw(vertical_extent_px: float, shoulder_width_px: float) -> float:
+    """This frame's (vertical extent / shoulder width), before baselining.
+
+    Kept separate from the final :func:`body_height_ratio` because the same
+    raw number serves two different purposes: it is what
+    :class:`HeightBaseline` accumulates while the subject is confidently
+    standing, and it is also the numerator of the final reading once a
+    baseline exists. Splitting them keeps each function honest about which
+    question it answers.
+
+    Returns NaN when either input is unusable, rather than a ratio built on
+    a division by an unmeasured or degenerate value.
+    """
+    if (math.isnan(vertical_extent_px) or math.isnan(shoulder_width_px)
+            or shoulder_width_px <= 0.0):
+        return float("nan")
+    return vertical_extent_px / shoulder_width_px
+
+
+class HeightBaseline:
+    """Personal calibration for Quantity H (EXPERIMENTAL).
+
+    H is defined relative to the subject's OWN geometry, not an absolute
+    pixel count — the same reason T needs no such baseline (it is already an
+    angle) but P and this quantity do (both are lengths that scale with
+    distance to the camera). Anchoring to torso length, the usual ruler in
+    this module, was rejected specifically for H: torso length is the
+    quantity that fails in the camera-axis fall this measure exists to catch
+    (see ``body_vertical_extent``), so the baseline is expressed in shoulder
+    widths instead, which survive that failure mode.
+
+    Mirrors the pattern behind ``trunk_reference_window_s`` in config.yaml:
+    the baseline only moves on frames the CALLER has independently judged as
+    confidently standing (low T, standing-range leg extension). Feeding it a
+    value from a lean, a crouch, or the fall itself would calibrate the
+    "upright" reference against a posture that is not upright. An
+    :class:`ExponentialMovingAverage` underneath gives it a time constant in
+    seconds rather than a frame count, same reasoning as every other timing
+    parameter in this project.
+    """
+
+    def __init__(self, time_constant_s: float = 2.0) -> None:
+        if time_constant_s <= 0.0:
+            raise ValueError("time_constant_s must be > 0")
+        self._ema = ExponentialMovingAverage(time_constant_s)
+
+    def update(self, dt: float, raw_ratio: float, is_standing: bool) -> float:
+        """Feed one frame; returns the baseline's current value (NaN until set).
+
+        Only a frame with ``is_standing=True`` and a measurable
+        ``raw_ratio`` moves the baseline. Every other frame — including a
+        frame from the very fall H is meant to catch — only reads whatever
+        baseline already exists; it must not recalibrate against a collapsed
+        posture.
+        """
+        if is_standing and not math.isnan(raw_ratio):
+            self._ema.update(raw_ratio, dt)
+        return self.value
+
+    @property
+    def value(self) -> float:
+        return self._ema.value
+
+    def reset(self) -> None:
+        """Forget the calibration (subject lost, seek, discontinuity)."""
+        self._ema.reset()
+
+
+def body_height_ratio(raw_ratio: float, baseline_ratio: float) -> float:
+    """Quantity H (EXPERIMENTAL): current body height relative to the
+    subject's own calibrated standing baseline.
+
+    H ~ 1     standing, at the same (vertical extent / shoulder width) as the
+              calibrated baseline
+    H -> 0    collapsed: little vertical spread left relative to shoulder
+              width, whatever the trunk vector's 2D angle happens to read
+
+    NOT part of §3.4 and NOT wired into any §3.5 stage. Proposed to cover two
+    gaps measured on this project's own footage: P becomes unmeasurable the
+    moment feet are occluded or leave frame, and T reads a falsely low,
+    "upright"-looking angle when a fall's rotation axis points toward or away
+    from the camera (the trunk vector's 2D projection nearly vanishes; see
+    ``body_vertical_extent``). H depends on neither the feet specifically nor
+    the direction any one segment rotated, only on how much vertical spread
+    the visible spine chain has left — which a forward-or-backward collapse
+    still destroys even when T cannot see it.
+
+    Two limits to carry alongside any use of this number:
+
+    * It shares T and P's monocular, camera-angle dependence — a subject who
+      also turns side-on to the camera degrades the shoulder-width reference
+      it is built on (see ``shoulder_width``).
+    * It confirms POSTURE, not INTENT, exactly like T: a deliberate deep bend
+      (tying a shoe) collapses H the same way a fall does. It is a candidate
+      corroborating signal for Stage 3 when P is inconclusive, not a
+      discriminator between a fall and a voluntary movement — that is a
+      separate problem this quantity does not address. ``wrist_ankle_proximity``
+      below is proposed for THAT problem instead.
+
+    Returns:
+        Dimensionless ratio, or NaN when either input is unusable — no
+        baseline established yet, or an unmeasurable current frame — exactly
+        as honest as every other NaN in this module.
+    """
+    if math.isnan(raw_ratio) or math.isnan(baseline_ratio) or baseline_ratio <= 0.0:
+        return float("nan")
+    return raw_ratio / baseline_ratio
+
+
+def wrist_ankle_proximity(wrists: np.ndarray, ankles: np.ndarray,
+                          torso_length: float) -> float:
+    """Quantity R (EXPERIMENTAL, not in §3.4): how close the hands are to the feet.
+
+    Proposed for a problem T, V, P, I and H all share and none of them
+    solve: each of those reads POSTURE (how the body is arranged), and a
+    deliberate bend — tying a shoe, picking something off the floor —
+    produces close to the same posture as a fall. None of them encode INTENT,
+    because none of them look at what the hands are doing. A person tying a
+    shoe reaches for their feet; a person falling does not. This is a
+    genuinely new degree of freedom, not a reformulation of T/V/P/I/H — it is
+    the first quantity in this module that reads the arms at all.
+
+    Defined as the SMALLEST wrist-to-ankle distance among every wrist/ankle
+    pair that is actually visible (up to four: two wrists by two ankles),
+    normalised by torso length so it means the same thing at any camera
+    distance, per §3.2's convention for every other quantity here. Smaller
+    means a hand is closer to a foot.
+
+    Args:
+        wrists: (2, 2) array, one row per wrist (left, right), pixel
+            coordinates. A row of NaN means that wrist was not visible —
+            the caller's job (visibility threshold), same convention as
+            every other quantity in this module.
+        ankles: (2, 2) array, one row per ankle (left, right), same
+            convention.
+        torso_length: Step-0 scale.
+
+    Returns:
+        Distance in torso lengths, or NaN when no wrist/ankle pair is
+        measurable or the torso length is unusable — an unobserved quantity
+        reads as unknown, never as "far" or "close".
+
+    NOT a discriminator by itself. This module stays pure measurement, same
+    as T/V/P/I/H: it reports a distance, not a verdict on whether that
+    distance means "reaching". What counts as close enough to indicate
+    intent is a threshold decision for whoever calibrates it against
+    labelled clips — this quantity is logged, not wired into any §3.5 stage,
+    for exactly that reason.
+    """
+    if not torso_length or torso_length <= 0.0:
+        return float("nan")
+    w = np.asarray(wrists, dtype=float)[:, :2]
+    a = np.asarray(ankles, dtype=float)[:, :2]
+    w = w[np.isfinite(w).all(axis=1)]
+    a = a[np.isfinite(a).all(axis=1)]
+    if w.size == 0 or a.size == 0:
+        return float("nan")
+    # Small (<=4) pairwise distance set: a loop is clearer than broadcasting
+    # for four numbers at most, and this runs once per frame, not per pixel.
+    dists = [float(np.linalg.norm(wp - ap)) for wp in w for ap in a]
+    return min(dists) / torso_length
+
+
 class ExponentialMovingAverage:
     """Time-constant EMA smoother, applied before differentiation.
 
@@ -353,6 +611,11 @@ class ExponentialMovingAverage:
             alpha = 1.0 - math.exp(-dt / self.tau)
             self._value = alpha * value + (1.0 - alpha) * self._value
         return self._value
+
+    @property
+    def value(self):
+        """Current smoothed value, or NaN before the first sample."""
+        return float("nan") if self._value is None else self._value
 
     def reset(self) -> None:
         """Forget all history (call when the subject is lost or on seek)."""

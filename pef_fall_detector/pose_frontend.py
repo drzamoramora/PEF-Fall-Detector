@@ -47,10 +47,16 @@ import numpy as np
 # MediaPipe Pose landmark indices (kept as named constants for auditability).
 NOSE = 0
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
+LEFT_WRIST, RIGHT_WRIST = 15, 16
 LEFT_HIP, RIGHT_HIP = 23, 24
 LEFT_ANKLE, RIGHT_ANKLE = 27, 28
 LEFT_HEEL, RIGHT_HEEL = 29, 30
 LEFT_FOOT_INDEX, RIGHT_FOOT_INDEX = 31, 32
+
+#: The hands, for Quantity R (EXPERIMENTAL, quantities.wrist_ankle_proximity)
+#: — not part of any core reliability check, since a fall does not require
+#: the hands to be visible the way it requires the torso.
+WRIST_LANDMARKS = (LEFT_WRIST, RIGHT_WRIST)
 
 #: Landmarks every core quantity depends on; used for the reliability check.
 CORE_LANDMARKS = (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP)
@@ -109,6 +115,10 @@ class PoseFrame:
     mid_shoulder: np.ndarray | None = None
     torso_length: float | None = None
     core_visibility: float = 0.0
+    #: First frame after the tracker was re-seeded (fase 4): its landmarks
+    #: come from a fresh detection, not from tracking the previous frame, so
+    #: the pipeline treats it as a break in continuity.
+    reacquired: bool = False
     world_landmarks: np.ndarray = field(default_factory=lambda: np.empty((0, 3)))
     world_torso_length: float | None = None
 
@@ -153,6 +163,8 @@ class PoseFrontend:
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
         smooth_landmarks: bool = True,
+        visibility_threshold: float = 0.5,
+        reacquire_after_s: float = 0.0,
     ) -> None:
         # Imported here so that pure-math consumers of this module
         # (tests, quantities) never need MediaPipe installed.
@@ -164,6 +176,24 @@ class PoseFrontend:
             min_tracking_confidence=min_tracking_confidence,
             smooth_landmarks=smooth_landmarks,
         )
+        # Re-adquisición (fase 4). MediaPipe Pose es detector + rastreador: el
+        # detector corre solo cuando el rastreo se pierde, y el rastreo se da
+        # por bueno mientras la *presencia* supere min_tracking_confidence.
+        # La presencia y la visibilidad de los landmarks son salidas
+        # distintas: en A16-S1 el rastreador quedó pegado 5.4 s a una región
+        # vieja (la del sujeto pasando pegado a la cámara) con presencia alta
+        # y visibilidad del núcleo en 0.00-0.05, mientras el cuerpo entero
+        # caía y yacía a la vista. Ninguna etapa del §3.5 puede ver una caída
+        # que el front-end no entrega. Si el núcleo sigue por debajo de
+        # visibility_threshold durante reacquire_after_s, se reinicia el
+        # grafo para que el siguiente cuadro pase otra vez por el detector.
+        # No cambia ningún landmark de un cuadro bueno; 0 lo apaga.
+        self._visibility_threshold = float(visibility_threshold)
+        self._reacquire_after_s = float(reacquire_after_s)
+        self._low_since: float | None = None
+        self._reseeded = False
+        #: Timestamps where the tracker was re-seeded (diagnostic).
+        self.reacquisitions: list[float] = []
 
     def process(self, frame_bgr: np.ndarray, frame_index: int, timestamp: float) -> PoseFrame:
         """Run pose estimation on one BGR frame and derive Step-0 anchors."""
@@ -173,6 +203,7 @@ class PoseFrontend:
         results = self._pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
 
         if results.pose_landmarks is None:
+            self._low_since = None      # sin rastreo: el detector ya corre solo
             return PoseFrame(
                 frame_index=frame_index,
                 timestamp=timestamp,
@@ -206,6 +237,9 @@ class PoseFrontend:
             # component is meaningful, unlike the monocular image-space z.
             world_torso_length = float(np.linalg.norm(w_shoulder - w_hip))
 
+        reacquired, self._reseeded = self._reseeded, False
+        self._watch_tracker(timestamp, core_visibility)
+
         return PoseFrame(
             frame_index=frame_index,
             timestamp=timestamp,
@@ -217,9 +251,24 @@ class PoseFrontend:
             mid_shoulder=mid_shoulder,
             torso_length=torso_length,
             core_visibility=core_visibility,
+            reacquired=reacquired,
             world_landmarks=world_landmarks,
             world_torso_length=world_torso_length,
         )
+
+    def _watch_tracker(self, timestamp: float, core_visibility: float) -> None:
+        """Re-seed the tracker after a sustained low-visibility lock (see __init__)."""
+        if self._reacquire_after_s <= 0.0 or core_visibility >= self._visibility_threshold:
+            self._low_since = None
+            return
+        if self._low_since is None:
+            self._low_since = timestamp
+            return
+        if timestamp - self._low_since >= self._reacquire_after_s - 1e-9:
+            self._pose.reset()
+            self._reseeded = True
+            self.reacquisitions.append(timestamp)
+            self._low_since = None
 
     def close(self) -> None:
         """Release MediaPipe's inference graph and its native resources."""

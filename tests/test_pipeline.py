@@ -56,7 +56,11 @@ TEST_CFG = {
         "trigger_formulation": "sequential",
         "trigger_score": 2.2,
         "trigger_hold_s": 0.1,
+        "min_trunk_ratio": 0.15,
+        "trunk_reference_window_s": 1.0,
         "confirm_window_s": 1.0,
+        "trigger_peak_window_s": 0.0,
+        "trigger_score_provisional": 0.0,
     },
     "state_display": {
         "transition_v_tps": 0.7,
@@ -75,6 +79,10 @@ TEST_CFG = {
         "com_outside_fraction": 0.5,
         "com_min_samples": 3,
         "min_foot_visibility": 0.5,
+        "descent_floor_tps": -1.0,
+        "descent_window_s": 2.0,
+        "descent_min_depth_tps": -1.3,
+        "descent_min_sustained_s": 0.40,
         "contact_band_torso": 0.15,
     },
     "stage3": {
@@ -85,6 +93,15 @@ TEST_CFG = {
         "recovery_hold_seconds": 1.0,
         "severity_uses_leg_extension": True,
         "cooldown_seconds": 3.0,
+        "persistent_still_s": 0.5,
+        "persistent_immobility_fraction": 0.0,
+    },
+    "experimental": {
+        "height_baseline_time_constant_s": 2.0,
+        "trigger_H_ratio": 0.0,
+        "trigger_H_erect": 0.0,
+        "trigger_H_sequence_window_s": 2.0,
+        "recovery_H_ratio": 0.0,
     },
 }
 

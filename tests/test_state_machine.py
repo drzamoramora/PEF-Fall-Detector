@@ -498,6 +498,15 @@ class TestStage3Evaluator(unittest.TestCase):
         frames = [(85.0, min(4.0, i * DT), 0.3) for i in range(150)]
         self.assertEqual(self._play(frames), (CONFIRMED_FALL, SEVERE))
 
+    def test_immobile_but_not_lying_is_moderate_not_severe(self) -> None:
+        # The gap this closes: T stuck at 40 -- between upright_t_deg=30 and
+        # lying_t_deg=60 -- is kneeling, propped, or bent over (crouched
+        # still tying a shoe is exactly this shape), not "remained down".
+        # Reaching the immobility threshold here must not read as SEVERE
+        # just because it never counted as a recovery either.
+        frames = [(40.0, min(4.0, i * DT), 0.3) for i in range(150)]
+        self.assertEqual(self._play(frames), (CONFIRMED_FALL, MODERATE))
+
     def test_a_brief_wobble_upright_is_not_a_recovery(self) -> None:
         # Half a second upright, then back down: not a get-up. Without the
         # hold requirement this would nullify a real fall.
@@ -607,6 +616,220 @@ class TestFullFunnel(unittest.TestCase):
         events = self._play(frames)
         self.assertEqual(events[0].verdict, CONFIRMED_FALL)
         self.assertEqual(events[0].severity, SEVERE)
+
+
+class TestHeightFallbackTrigger(unittest.TestCase):
+    """Quantity H's OR'd fallback in Stage1Trigger (EXPERIMENTAL).
+
+    The axis-aligned-fall scenario from the design discussion: T stays low
+    (its 2D-projected trunk vector nearly vanishes when the rotation axis
+    points at the camera), so no T/V formulation above can fire — but H,
+    built from the wider spine chain, still shows the collapse. T=5, V=-3
+    throughout: SCORE's own arithmetic gives 5/45 + (-3)/(-1.5) = 2.11,
+    under its 2.2 threshold, so the primary path never fires on its own —
+    isolating the fallback.
+    """
+
+    def test_disabled_by_default(self) -> None:
+        trg = trigger(SCORE, threshold_h_ratio=0.0)
+        fired = [trg.update(i * DT, 5.0, -3.0, h_ratio=0.2) for i in range(10)]
+        self.assertFalse(any(fired))
+
+    def test_h_and_v_together_fire_when_t_alone_would_not(self) -> None:
+        trg = trigger(SCORE, threshold_h_ratio=0.35)
+        fired = [trg.update(i * DT, 5.0, -3.0, h_ratio=0.2) for i in range(10)]
+        self.assertTrue(any(fired))
+
+    def test_h_alone_without_v_does_not_fire(self) -> None:
+        # H collapsed, but V is not falling: not a fall by either signal.
+        trg = trigger(SCORE, threshold_h_ratio=0.35)
+        fired = [trg.update(i * DT, 5.0, 0.2, h_ratio=0.1) for i in range(10)]
+        self.assertFalse(any(fired))
+
+    def test_v_alone_without_h_does_not_fire_the_fallback(self) -> None:
+        # V falling, but H unmeasured (NaN): an absence of evidence is not
+        # evidence, the same rule every other NaN quantity in this project
+        # follows.
+        trg = trigger(SCORE, threshold_h_ratio=0.35)
+        fired = [trg.update(i * DT, 5.0, -3.0, h_ratio=float("nan"))
+                 for i in range(10)]
+        self.assertFalse(any(fired))
+
+    def test_fallback_respects_the_hold(self) -> None:
+        # A single frame is noise, same hysteresis as every other condition
+        # in this class.
+        trg = trigger(SCORE, threshold_h_ratio=0.35, hold_s=HOLD)
+        self.assertFalse(trg.update(0.0, 5.0, -3.0, h_ratio=0.2))
+
+    def test_normal_formulation_still_fires_without_passing_h(self) -> None:
+        # Backward compatibility: the default h_ratio=NaN must not change
+        # any formulation's own behaviour.
+        trg = trigger(SCORE)
+        self.assertTrue(any(feed(trg, [(80.0, -5.0)] * 10)))
+
+
+class TestHeightErectSequence(unittest.TestCase):
+    """``threshold_h_erect``: the H+V fallback must see a genuine
+    standing-to-collapsed STORY, not just a bare instantaneous collapse.
+
+    IMPORTANT what this does NOT prove: it does not separate a fall from a
+    deliberate crouch (tying a shoe) — both are erect-then-collapsed, same
+    shape. These tests only pin what the guard actually checks: that H was
+    confirmed at/above the erect threshold at some point in the recent
+    window before the collapse.
+    """
+
+    def test_never_confirmed_erect_never_fires(self) -> None:
+        # H starts already collapsed -- no standing baseline was ever seen
+        # in this window -- so even with V falling the fallback must not
+        # manufacture a transition that was never observed.
+        trg = trigger(SCORE, threshold_h_ratio=0.35, threshold_h_erect=0.85)
+        fired = [trg.update(i * DT, 5.0, -3.0, h_ratio=0.2) for i in range(10)]
+        self.assertFalse(any(fired))
+
+    def test_fires_once_recently_confirmed_erect(self) -> None:
+        trg = trigger(SCORE, threshold_h_ratio=0.35, threshold_h_erect=0.85,
+                     h_sequence_window_s=2.0)
+        fired = []
+        for i in range(20):
+            ts = i * DT
+            h = 0.9 if i < 5 else 0.2       # erect, then collapses
+            fired.append(trg.update(ts, 5.0, -3.0, h_ratio=h))
+        self.assertTrue(any(fired))
+
+    def test_the_erect_confirmation_expires_outside_the_window(self) -> None:
+        trg = trigger(SCORE, threshold_h_ratio=0.35, threshold_h_erect=0.85,
+                     h_sequence_window_s=0.5)
+        # Confirmed erect at t=0, then nothing decisive (H mid-range, V not
+        # falling) for well over the 0.5 s window -- long enough for that
+        # confirmation to age out -- and only THEN the collapse: the stale
+        # confirmation from t=0 must not still count.
+        trg.update(0.0, 5.0, 0.0, h_ratio=0.9)
+        for i in range(1, 25):                  # 24 frames = 0.8 s > window
+            trg.update(i * DT, 5.0, 0.0, h_ratio=0.6)
+        fired = []
+        for i in range(25, 40):
+            ts = i * DT
+            fired.append(trg.update(ts, 5.0, -3.0, h_ratio=0.2))
+        self.assertFalse(any(fired))
+
+    def test_disabled_reverts_to_the_bare_instantaneous_check(self) -> None:
+        trg = trigger(SCORE, threshold_h_ratio=0.35, threshold_h_erect=0.0)
+        fired = [trg.update(i * DT, 5.0, -3.0, h_ratio=0.2) for i in range(10)]
+        self.assertTrue(any(fired))
+
+
+class TestHeightFallbackRecovery(unittest.TestCase):
+    """Quantity H's OR'd fallback in Stage3Evaluator.observe (EXPERIMENTAL).
+
+    Symmetric to the trigger fallback: a subject standing back up while
+    pitched toward/away from the camera can leave T too foreshortened to
+    read a clean "upright" angle, so the live recovery check never fires on
+    T alone — but H, which does not share that failure mode, can.
+    """
+
+    def _ev(self, **kw) -> Stage3Evaluator:
+        kw.setdefault("window_s", 10.0)
+        kw.setdefault("threshold_w_s", 3.0)
+        kw.setdefault("upright_t_deg", 30.0)
+        kw.setdefault("recovery_hold_s", 1.0)
+        kw.setdefault("standing_extension", 1.1)
+        return Stage3Evaluator(**kw)
+
+    def _play(self, frames, ev):
+        """frames = [(t_deg, i_still_s, extension_ratio, h_ratio)]."""
+        ev.start(0.0)
+        for i, (t_deg, still, ext, h_ratio) in enumerate(frames):
+            ev.observe(i * DT, t_deg, still, ext, h_ratio)
+        return ev.verdict()
+
+    def test_disabled_by_default_never_recovers_on_h_alone(self) -> None:
+        ev = self._ev()  # threshold_h_ratio_recovery defaults to 0.0
+        frames = [(85.0, min(4.0, i * DT), 0.3, 1.0) for i in range(150)]
+        self.assertEqual(self._play(frames, ev), (CONFIRMED_FALL, SEVERE))
+
+    def test_h_recovers_when_t_cannot(self) -> None:
+        # T is stuck at 40 deg — never clears upright_t_deg=30 — simulating
+        # the foreshortened-trunk failure mode, but H climbs back to
+        # baseline as the subject actually stands up.
+        ev = self._ev(threshold_h_ratio_recovery=0.75, use_leg_extension=False)
+        frames = ([(85.0, 0.5, 0.4, 0.1)] * 15
+                  + [(40.0, 0.0, 1.3, 0.9)] * 60)
+        self.assertEqual(self._play(frames, ev), (NULLIFIED, MODERATE))
+
+    def test_low_h_does_not_by_itself_manufacture_a_recovery(self) -> None:
+        ev = self._ev(threshold_h_ratio_recovery=0.75)
+        frames = [(85.0, min(4.0, i * DT), 0.3, 0.15) for i in range(150)]
+        self.assertEqual(self._play(frames, ev), (CONFIRMED_FALL, SEVERE))
+
+    def test_a_valid_t_is_not_overruled_by_low_h(self) -> None:
+        # T at 40 (sat up / knelt) with H collapsed. Until 23/09 H won and
+        # this was SEVERE; that is what sent A12-S1 and A12-S4 — sitting on
+        # the floor, truth PartiallyRecovered — to NotRecovered. T was
+        # measured, so T decides.
+        ev = self._ev(threshold_h_ratio_lying=0.35)
+        frames = [(40.0, min(4.0, i * DT), 0.3, 0.15) for i in range(150)]
+        self.assertEqual(self._play(frames, ev), (CONFIRMED_FALL, MODERATE))
+
+    def test_h_decides_lying_when_t_is_unmeasured(self) -> None:
+        # The fallback H exists for: no trunk angle at all, body collapsed.
+        ev = self._ev(threshold_h_ratio_lying=0.35)
+        frames = [(float("nan"), min(4.0, i * DT), 0.3, 0.15) for i in range(150)]
+        self.assertEqual(self._play(frames, ev), (CONFIRMED_FALL, SEVERE))
+
+    def test_unmeasured_t_with_h_not_collapsed_is_not_lying(self) -> None:
+        ev = self._ev(threshold_h_ratio_lying=0.35)
+        frames = [(float("nan"), min(4.0, i * DT), 0.3, 0.9) for i in range(150)]
+        self.assertEqual(self._play(frames, ev), (CONFIRMED_FALL, MODERATE))
+
+    def test_h_disabled_leaves_the_ambiguous_case_moderate(self) -> None:
+        ev = self._ev()  # threshold_h_ratio_lying defaults to 0.0
+        frames = [(40.0, min(4.0, i * DT), 0.3, 0.15) for i in range(150)]
+        self.assertEqual(self._play(frames, ev), (CONFIRMED_FALL, MODERATE))
+
+    def test_finalise_trusts_a_measured_t_over_low_h(self) -> None:
+        # The labelling path, with A12-S1's measured ending: T final 35.0,
+        # H final 0.344. Three bands say "sat up" -> moderate, and H must
+        # not turn that into "remained down".
+        ev = self._ev(threshold_h_ratio_lying=0.35, defer_to_end=True)
+        ev.start(0.0)
+        for i in range(60):
+            ev.observe(i * DT, 35.0, 0.0, 0.3, 0.344)
+        ev.finalise()
+        self.assertEqual(ev.verdict(), (CONFIRMED_FALL, MODERATE))
+
+    def test_finalise_still_reads_a_horizontal_t_as_severe_whatever_h(self) -> None:
+        # Deferring to T cuts both ways: a high H does not rescue a trunk
+        # that ended horizontal.
+        ev = self._ev(threshold_h_ratio_lying=0.35, defer_to_end=True)
+        ev.start(0.0)
+        for i in range(60):
+            ev.observe(i * DT, 88.0, 0.0, 0.3, 1.0)
+        ev.finalise()
+        self.assertEqual(ev.verdict(), (CONFIRMED_FALL, SEVERE))
+
+
+class TestHeightFallbackInTheMachine(unittest.TestCase):
+    """End-to-end: the H+V fallback raises a real Stage-1 event, with h_ratio
+    threaded all the way into the auditable :class:`TriggerEvent`."""
+
+    def test_the_fallback_raises_an_event_and_records_h_ratio(self) -> None:
+        machine = FallStateMachine(
+            trigger(SCORE, threshold_h_ratio=0.35),
+            Stage2Evaluator(window_s=0.3, outside_fraction=0.5, min_samples=3),
+            Stage3Evaluator(window_s=10.0, threshold_w_s=2.0, upright_t_deg=30.0,
+                            recovery_hold_s=1.0, standing_extension=1.1),
+            cooldown_s=3.0,
+        )
+        raised = None
+        for i in range(10):
+            ev = machine.update(i, i * DT, 5.0, -3.0, 0.4, 0.0, 0.3, 0.2)
+            if ev is not None:
+                raised = ev
+                break
+        self.assertIsNotNone(raised)
+        self.assertAlmostEqual(raised.t_deg, 5.0)
+        self.assertAlmostEqual(raised.h_ratio, 0.2)
 
 
 if __name__ == "__main__":

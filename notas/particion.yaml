@@ -1,0 +1,74 @@
+# Partición de PEF-FallDB para calibración y prueba
+#
+# POR QUÉ EXISTE
+# Todo lo que viene después del Paso 1 ajusta algo: umbrales, fronteras de
+# banda, criterios de descarte. Medir esos ajustes sobre los mismos clips que
+# los produjeron da un número que no se puede publicar. Este archivo fija de
+# antemano qué clips no se tocan.
+#
+# POR ACTOR, NO POR CLIP
+# Cada actor aporta 4 clips y tiene una sola clase. Partir por clip pondría al
+# mismo sujeto de los dos lados, y el sistema se ajustaría a esa persona en vez
+# de al fenómeno.
+#
+# LA REGLA, Y POR QUÉ ES UNA REGLA
+# Dentro de cada clase, ordenar los actores por ID y tomar CADA TERCERO para
+# prueba. Es arbitraria a propósito: cuando se escribió, ya se sabía qué
+# actores fallaban (A06, A09, A14, B10 con 3 de 4 cada uno), y esa información
+# no se puede des-ver. Una partición elegida a criterio habría quedado
+# contaminada por ese conocimiento. Una regla mecánica sobre los IDs no puede
+# estarlo.
+#
+# Verificación de que no quedó sesgada: la prueba se lleva el 31 % de los clips
+# y el 27 % de los errores del 27/08. Ni fácil ni difícil de más.
+#
+# PROVISIONAL
+# El §3.7 pide retener "settings, ubicaciones de cámara y condiciones de
+# iluminación", no actores. El material tiene esas dimensiones pero aún no está
+# anotado (ver CONVENCION-NOMBRES.md). Esta partición controla identidad del
+# sujeto, que es MENOS de lo que el paper promete, y se reemplaza en cuanto el
+# renombrado esté hecho. Hasta entonces NO debe reportarse como la partición
+# del §3.7.
+
+version: 1
+fecha: 2026-09-03
+regla: "cada tercer actor de cada clase, ordenados por ID"
+nota: "A3 es A13 (errata en el nombre del archivo). 32 actores, 128 clips."
+
+test:
+  # 10 actores, 40 clips (8 Recovered, 8 NotRecovered, 8 Partially, 16 NoFall)
+  - A07   # Recovered
+  - A16   # Recovered
+  - A08   # NotRecovered
+  - A17   # NotRecovered
+  - A09   # PartiallyRecovered
+  - A18   # PartiallyRecovered
+  - B03   # NoFall
+  - B06   # NoFall
+  - B09   # NoFall
+  - B12   # NoFall
+
+train:
+  # 22 actores, 88 clips
+  - A01
+  - A04
+  - A10
+  - A13
+  - A02
+  - A05
+  - A11
+  - A14
+  - A03
+  - A06
+  - A12
+  - A15
+  - B01
+  - B02
+  - B04
+  - B05
+  - B07
+  - B08
+  - B10
+  - B11
+  - B13
+  - B14

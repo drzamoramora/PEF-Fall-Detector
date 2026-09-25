@@ -1,9 +1,23 @@
-# MediaPipe pinned: last release with the classic mp.solutions.pose API used
-# by the implementation guide; bundles pose models inside the wheel (fully
-# offline, reproducible — see pose_frontend.py docstring for the rationale).
+# Versiones exactas del entorno de referencia: las mismas con las que se midio
+# PEF-FallDB (104/128). Van fijadas con == y no con >= porque los landmarks de
+# MediaPipe cambian con la version de OpenCV y numpy (clips A01-S4, A14-S1,
+# A17-S4: mismo codigo y misma config, otro veredicto con OpenCV 5.0).
+# Instalar en un venv limpio:
+#   python3.11 -m venv venv && source venv/bin/activate
+#   pip install -r requirements.txt
+
+# MediaPipe fijado: ultima version con la API clasica mp.solutions.pose que usa
+# la guia de implementacion; trae los modelos de pose dentro del wheel (offline,
+# reproducible; ver el docstring de pose_frontend.py).
 mediapipe==0.10.14
-opencv-python>=4.9
-numpy>=1.26
-PySide6>=6.6
-pyqtgraph>=0.13
-PyYAML>=6.0
+protobuf==4.25.9
+
+# OpenCV: mediapipe 0.10.14 depende de opencv-contrib-python, que ya trae cv2.
+# No instalar tambien opencv-python: los dos escriben el mismo paquete cv2 y,
+# con versiones distintas, gana el ultimo que se instalo.
+opencv-contrib-python==4.13.0.92
+
+numpy==2.4.4
+PySide6==6.11.2
+pyqtgraph==0.14.0
+PyYAML==6.0.3

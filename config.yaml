@@ -8,29 +8,60 @@
 # from day one so the full calibration surface is visible.
 # =============================================================================
 
-pose:                          # [Phase 1] MediaPipe Pose front-end (§3.2)
-  model_complexity: 1          # 0=lite, 1=full (§3.2 default), 2=heavy (low-light)
+pose: # [Phase 1] MediaPipe Pose front-end (§3.2)
+  # PESADO. El §3.2 lo autoriza literalmente: "with the heavy variant
+  # reserved for low-light or multi-person scenarios where LANDMARK DRIFT IS
+  # OBSERVED IN PRACTICE". Se observo drift, esta medido y confirmado
+  # visualmente: en A09-S3 el esqueleto se invierte 163 grados en 33 ms y no
+  # vuelve, y MediaPipe reporta 0.961 de confianza en ese mismo cuadro.
+  # De las 24 caidas NotRecovered, las 19 con esqueleto fiel aciertan 19/19 y
+  # las 4 sin el aciertan 0/4: el cuello de botella no es la logica del §3.4
+  # ni del §3.5, es la percepcion que las alimenta.
+  # CUIDADO: cambiar esto cambia los landmarks, y con ellos TODO lo calibrado
+  # encima — trigger_score, los bordes de la banda, las bandas de severidad
+  # 30/60. Ninguno de esos numeros sigue siendo valido hasta recalibrar.
+  # Cuesta velocidad de inferencia, que toca el §3.6.
+  # NOTA OPERATIVA: model_complexity 2 NO se puede correr en el contenedor de
+  # desarrollo. MediaPipe no trae el modelo pesado — lo descarga la primera
+  # vez desde storage.googleapis.com, que el proxy de ese entorno bloquea
+  # (403). Se mide solo en la maquina del autor.
+  # 23/09: vuelve a 1. El modelo cambia QUE caidas se pierden, no cuantas:
+  # con 1 se perdia A08-S3; con 2 se detecta, pero se pierden A08-S1 y A08-S2
+  # (el esqueleto desaparece con la persona en el suelo). La referencia tiene
+  # que ser una sola para que las fases sean comparables, y 1 es el default
+  # del §3.2, el que corre en el Pi del §3.6, y el que midio mejor en conjunto
+  # (78.1 % contra 73.4 % del pesado).
+  model_complexity: 1 # 0=lite, 1=full (§3.2 default), 2=heavy
   min_detection_confidence: 0.5
   min_tracking_confidence: 0.5
-  smooth_landmarks: true       # MediaPipe's internal temporal smoothing
-  visibility_threshold: 0.5    # below this, a landmark is treated as unreliable
+  smooth_landmarks: true # MediaPipe's internal temporal smoothing
+  visibility_threshold: 0.5 # below this, a landmark is treated as unreliable
+  # Fase 4: si el nucleo (hombros y caderas) sigue bajo visibility_threshold
+  # este tiempo con el rastreador "enganchado", se reinicia MediaPipe para que
+  # el detector vuelva a buscar a la persona (A16-S1: 5.4 s pegado a una
+  # region vieja mientras el sujeto caia a la vista). 0 lo apaga. Mismo valor
+  # que stage1.history_max_gap_s: mas alla de ese hueco la velocidad ya se
+  # descarta, asi que esperar mas no conserva nada.
+  reacquire_after_s: 0.5
 
-logging:                       # [Phase 1] per-frame audit CSV (§3.5 auditability)
-  output_dir: "logs"           # created next to the working directory if missing
+logging: # [Phase 1] per-frame audit CSV (§3.5 auditability)
+  output_dir: "logs" # created next to the working directory if missing
 
-stage1:                        # [Phase 2-3] kinematic trigger (T + V), §3.4/§3.5
-  threshold_T_deg: 45.0        # trunk inclination angle to arouse suspicion
-  threshold_V: -1.5            # vertical centroid velocity, torso-lengths/second
+stage1: # [Phase 2-3] kinematic trigger (T + V), §3.4/§3.5
+  threshold_T_deg: 45.0 # trunk inclination angle to arouse suspicion
+  threshold_V: -1.5 # vertical centroid velocity, torso-lengths/second
   # Window and smoothing are expressed in SECONDS, never in frames: the same
   # "5 frames" spanned 0.08 s in one of this project's clips and 0.40 s in
   # another, and a longer window flattens the peak, so a threshold tuned on
   # 30 fps footage would miss falls on a slower device.
-  velocity_window_s: 0.167     # time span of the discrete derivative
-  ema_time_constant_s: 0.1     # centroid smoothing before differentiation;
-                               # 0 disables it (honest way to run without)
-  history_max_gap_s: 0.5       # a larger gap between samples clears velocity
-                               # history (differentiating across a detection
-                               # loss or a seek would produce a fake spike)
+  velocity_window_s: 0.167 # time span of the discrete derivative
+  ema_time_constant_s:
+    0.1 # centroid smoothing before differentiation;
+    # 0 disables it (honest way to run without)
+  history_max_gap_s:
+    0.5 # a larger gap between samples clears velocity
+    # history (differentiating across a detection
+    # loss or a seek would produce a fake spike)
   # Which reading of §3.5's "instantaneous combination of the two quantities
   # [that] exceeds a configurable trigger threshold while V remains negative"
   # the trigger implements. Measured on 13 real falls with a 0.1 s hold:
@@ -43,50 +74,139 @@ stage1:                        # [Phase 2-3] kinematic trigger (T + V), §3.4/§
   # other three stay available: §3.7 requires the single-threshold ablation,
   # and comparing readings of the same sentence is itself a result.
   # PROVISIONAL — confirmed by the dataset, not settled by these numbers.
-  trigger_formulation: score   # score | simultaneous | sequential | v_only
-  trigger_score: 2.2           # 'score' only. Each term is its quantity over
-                               # its own threshold, so 2.0 means "both exactly
-                               # at threshold" and above that means the two
-                               # together are more extreme than that. At 2.2
-                               # the 13 falls fired and the 4 non-fall sessions
-                               # did not — but 4 sessions prove nothing about
-                               # specificity, so this number is a placeholder.
-  trigger_hold_s: 0.1          # how long the condition must persist before
-                               # firing (hysteresis). In SECONDS: a frame
-                               # count would mean a different physical
-                               # duration on the Pi than on a laptop, and
-                               # the trigger is measurably sensitive to it.
-  confirm_window_s: 1.0        # 'sequential' only: how long after the V event
-                               # T may still arrive and confirm. Real falls
-                               # show T-V peak offsets of 0.03 s to 1.8 s.
+  trigger_formulation: score # score | simultaneous | sequential | v_only
+  trigger_score:
+    2.6 # 'score' only. Each term is its quantity over
+    # its own threshold, so 2.0 means "both exactly
+    # at threshold" y por encima significa que las
+    # dos juntas son mas extremas que eso.
+    # 2.2 era el valor calibrado para el disparador
+    # instantaneo. Con la ventana de pico la
+    # condicion es mas facil de cumplir, asi que el
+    # umbral se recalibro: barrido 2.2-3.0 sobre los
+    # 88 clips de CALIBRACION. 2.5 y 2.6 EMPATAN
+    # ahi (72/88 = 81.8% los dos), separados por un
+    # clip en cada direccion: 2.5 pierde una caida
+    # menos, 2.6 da una alarma falsa menos. La
+    # calibracion no puede distinguirlos.
+    # El empate se rompio con un criterio declarado
+    # de antemano — preferir menos alarmas falsas,
+    # porque el §3.7 pide reportar falsos positivos
+    # por hora y con 9.7 minutos de metraje ADL cada
+    # alarma indebida se extrapola muy alto — y NO
+    # mirando la particion de prueba. Que sobre los
+    # 128 uno de 97 y el otro 100 no es evidencia de
+    # que 2.6 sea mejor: es la diferencia que la
+    # particion existe para no dejarnos creer.
+    # El resto de la curva, para el §3.5 ("tunable
+    # at deployment time"): a 2.2 la sensibilidad
+    # sube a 93.1% con especificidad 71.4%; a 2.8
+    # baja a 76.4% con 91.1%; a 3.0, 72.2% / 92.9%.
+    # Quien despliegue en un contexto donde perder
+    # una caida sea inaceptable debe bajarlo.
+  # Banda del disparador: el borde inferior, por debajo del umbral pleno.
+  # Medido sobre PEF-FallDB, la proporcion de caidas crece de forma monotona
+  # con el puntaje, sin inversiones:
+  #     < 1.8      5.3 % caidas      2.6 - 3.5   57.7 %
+  #   1.8 - 2.2    7.1 %             > 3.5       90.9 %
+  #   2.2 - 2.6   35.7 %
+  # O sea que el puntaje se comporta como una confianza y no como un
+  # interruptor, y eso es lo que hace legitimo tratarlo por tramos.
+  # Un puntaje en la banda levanta un evento PROVISIONAL: entra al embudo
+  # igual que cualquier otro, pero solo puede terminar en alarma si la
+  # inmovilidad lo confirma (stage3_confirmed). Si resuelve por postura, o no
+  # resuelve, queda en 'provisional_unconfirmed' y se lee como NoFall.
+  # Esto no inventa mecanismo: el §3.5 ya describe un embudo donde la
+  # sospecha se confirma o se descarta, y el §3.4 ya condiciona la
+  # confirmacion a que I supere W. La banda solo le exige a la evidencia mas
+  # debil la prueba mas fuerte que el paper ya define.
+  # 0.0 desactiva la banda -> corte unico, que es la ablacion del §3.7.
+  # MEDIDO Y APAGADO. Con la banda en 2.2, sobre los 128 clips:
+  #   banda con el defecto de la marca   83/128 = 64.8 %  (sens 59.7 %)
+  #   banda con la promocion arreglada   91/120 = 75.8 %  (sens 80.6 %)
+  #   sin banda                         100/128 = 78.1 %  (sens 81.9 %)
+  # La banda arreglada quedo neutra-negativa: rechazo 17 eventos, de los
+  # cuales 7 eran ADL (bien) y 10 eran caidas (mal). La exigencia de
+  # inmovilidad no separa ADL de caida, separa a quien se queda quieto de
+  # quien no — y varias caidas reales se mueven despues.
+  # El mecanismo queda implementado y probado por si Stage 2 consigue algun
+  # dia un discriminador de verdad (ver el criterio de descenso). Hasta
+  # entonces, 0.0.
+  trigger_score_provisional: 0.0
 
-state_display:                 # [Phase 2] person-state labels — DISPLAY/LOG ONLY.
-                               # No §3.5 stage consumes these; they exist so a
-                               # human can verify the quantities and so alerts
-                               # can say what the subject was doing before the
-                               # event. Provisional values; tuned in 2.6.
-  transition_v_tps: 0.7        # |V| above this (torso/s) -> TRANSITION
-  lying_T_deg: 60.0            # trunk at/above this -> LYING
-  leaning_T_deg: 15.0          # trunk at/above this (legs extended) -> LEANING
-  standing_extension: 1.1      # hip-to-ankle extent / torso at/above -> legs extended
-  crouch_extension: 0.6        # below this -> legs collapsed (CROUCHING)
-  walking_vh_tps: 0.25         # |V horizontal| above this while upright -> WALKING
-  max_extension_ratio: 3.0     # above this the hip-to-ankle ratio is not a
-                               # leg: the torso is foreshortened to a few
-                               # pixels and the ratio is dividing by it. On
-                               # PEF-FallDB, 20 of 128 clips recorded values
-                               # over 3, up to 183 torso lengths. Beyond this
-                               # the quantity reads NaN (unknown), never a
-                               # clamped number that would look measured.
-                               # A human hip-to-ankle span is ~1.5 torsos.
-  ratio_time_constant_s: 0.1   # smoothing applied to the FINISHED extension
-                               # ratio, never to its inputs. Ankles
-                               # are among the noisiest landmarks; without
-                               # this, a perfectly still subject sitting near
-                               # the standing/sitting boundary changes label
-                               # 7x more often. 0 disables it.
+  # Guarda de plausibilidad del tronco (§3.2). El §3.4 descarta T bajo
+  # 0.001 px, umbral que ninguna pose real alcanza: en el clip A14 el tronco
+  # se proyecto a 2 px con confianza 0.99 y T dio 176.9 junto a 26.0 grados en
+  # cuadros consecutivos. Aqui la comparacion es contra la MEDIANA reciente del
+  # mismo sujeto — una razon entre cuadros, que es lo que el §3.2 pide — y no
+  # contra un conteo absoluto de pixeles, porque un sujeto lejos de la camara
+  # tiene un tronco corto sin que nada este mal.
+  # Suelto a proposito: una caida real tambien acorta el tronco (mediana 0.40
+  # de su propio valor reciente, medido sobre las 56 caidas que dispararon),
+  # asi que un valor apretado rechazaria caidas. Esto quita geometria
+  # imposible, no geometria escorzada. 0 lo desactiva.
+  min_trunk_ratio: 0.15
+  trunk_reference_window_s: 1.0
+  trigger_hold_s:
+    0.1 # how long the condition must persist before
+    # firing (hysteresis). In SECONDS: a frame
+    # count would mean a different physical
+    # duration on the Pi than on a laptop, and
+    # the trigger is measurably sensitive to it.
+  confirm_window_s:
+    1.0 # 'sequential' only: how long after the V event
+    # T may still arrive and confirm. Real falls
+    # show T-V peak offsets of 0.03 s to 1.8 s.
+  # Ventana de pico: de que tan atras puede venir cada cantidad.
+  # El §3.5 pide una combinacion "instantanea" de T y V. Esa es una condicion
+  # ADICIONAL que el §3.4 no implica: el §3.4 describe la firma temporal de
+  # cada cantidad por separado — T llegando al rango de caida "within a short
+  # time window", V muy negativa "within a short window" — y no dice que
+  # coincidan.
+  # No coinciden, y por mecanica, no por casualidad: T es una posicion y V es
+  # una velocidad del mismo cuerpo. El centroide va mas rapido cuando el
+  # tronco aun esta casi vertical, y el tronco alcanza su mayor inclinacion
+  # cuando el movimiento ya casi se detuvo. Medido sobre PEF-FallDB, en las
+  # caidas que el disparador perdio los dos picos estan separados entre 0.6 s
+  # y 3.1 s — nunca menos de medio segundo. Doce clips con el tronco llegando
+  # a 178 grados y el sistema sin ver nada.
+  # El §3.5 ya le concede a cada etapa una longitud de ventana calibrable
+  # ("Each stage's input variables, threshold values, and window lengths are
+  # tunable at deployment time"), asi que esto es un parametro que el paper ya
+  # declaro, no maquinaria nueva.
+  # 0.0 = lectura literal del §3.5, ambas cantidades del mismo cuadro. Es el
+  # comportamiento anterior exacto y la ablacion que pide el §3.7.
+  trigger_peak_window_s: 0.8
 
-alerts:                        # [Phase 5b+] the §3.5 output, §3.6 transports
+state_display: # [Phase 2] person-state labels — DISPLAY/LOG ONLY.
+  # No §3.5 stage consumes these; they exist so a
+  # human can verify the quantities and so alerts
+  # can say what the subject was doing before the
+  # event. Provisional values; tuned in 2.6.
+  transition_v_tps: 0.7 # |V| above this (torso/s) -> TRANSITION
+  lying_T_deg: 60.0 # trunk at/above this -> LYING
+  leaning_T_deg: 15.0 # trunk at/above this (legs extended) -> LEANING
+  standing_extension: 1.1 # hip-to-ankle extent / torso at/above -> legs extended
+  crouch_extension: 0.6 # below this -> legs collapsed (CROUCHING)
+  walking_vh_tps: 0.25 # |V horizontal| above this while upright -> WALKING
+  max_extension_ratio:
+    3.0 # above this the hip-to-ankle ratio is not a
+    # leg: the torso is foreshortened to a few
+    # pixels and the ratio is dividing by it. On
+    # PEF-FallDB, 20 of 128 clips recorded values
+    # over 3, up to 183 torso lengths. Beyond this
+    # the quantity reads NaN (unknown), never a
+    # clamped number that would look measured.
+    # A human hip-to-ankle span is ~1.5 torsos.
+  ratio_time_constant_s:
+    0.1 # smoothing applied to the FINISHED extension
+    # ratio, never to its inputs. Ankles
+    # are among the noisiest landmarks; without
+    # this, a perfectly still subject sitting near
+    # the standing/sitting boundary changes label
+    # 7x more often. 0 disables it.
+
+alerts: # [Phase 5b+] the §3.5 output, §3.6 transports
   # Which verdicts produce an alert. §3.5 dispatches a CONFIRMED fall; a
   # nullified one is the alarm being called off. Events no stage could
   # resolve (stage3_unresolved, stage2_inconclusive) are RECORDED but not
@@ -96,46 +216,81 @@ alerts:                        # [Phase 5b+] the §3.5 output, §3.6 transports
   dispatch_verdicts:
     - stage3_confirmed
 
-stage2:                        # [Phase 4] geometric verification (P), §3.4/§3.5
+stage2: # [Phase 4] geometric verification (P), §3.4/§3.5
   # Quantity P is computed every frame from Phase 4a on; the STAGE that
   # consumes it (the k-of-n vote below) arrives with the state machine.
-  com_hip_weight: 0.65         # weight of the hip cluster in the COM estimate.
-                               # §3.4: "the hip cluster carries the dominant
-                               # contribution". PROVISIONAL — the body's mass
-                               # sits near the sacrum, so >0.5 is anatomy, but
-                               # the exact value awaits the dataset.
+  com_hip_weight:
+    0.65 # weight of the hip cluster in the COM estimate.
+    # §3.4: "the hip cluster carries the dominant
+    # contribution". PROVISIONAL — the body's mass
+    # sits near the sacrum, so >0.5 is anatomy, but
+    # the exact value awaits the dataset.
   # The window opens AT the trigger and runs forward: when Stage 1 fires the
   # body is still on its way down, so judging the geometry on the trigger
   # frame would test the posture the subject was leaving.
-  com_eval_window_s: 0.33      # how long P is watched before the verdict.
-                               # In SECONDS (was 10 frames): a frame count
-                               # is a different duration on the Pi.
-  com_outside_fraction: 0.5    # share of MEASURABLE frames in the window that
-                               # must show the COM outside the support. A
-                               # fraction, not a vote count: "5 of 10" is
-                               # unreachable at 10 fps over a third of a second.
-  com_min_samples: 3           # fewer measurable frames than this -> verdict
-                               # 'inconclusive', never 'rejected'. Occluded
-                               # feet must not read as "no fall".
-  min_foot_visibility: 0.5     # below this, feet are occluded -> P inconclusive
-  contact_band_torso: 0.15     # §3.4 builds the support polygon from the foot
-                               # landmarks "in bipedal contact". With no
-                               # calibrated ground plane, the floor is the
-                               # lowest foot landmark still inside the frame,
-                               # and anything more than this far above it has
-                               # left the floor. In torso lengths, so it means
-                               # the same at any camera distance. PROVISIONAL.
+  com_eval_window_s:
+    0.33 # how long P is watched before the verdict.
+    # In SECONDS (was 10 frames): a frame count
+    # is a different duration on the Pi.
+  com_outside_fraction:
+    0.5 # share of MEASURABLE frames in the window that
+    # must show the COM outside the support. A
+    # fraction, not a vote count: "5 of 10" is
+    # unreachable at 10 fps over a third of a second.
+  com_min_samples:
+    3 # fewer measurable frames than this -> verdict
+    # 'inconclusive', never 'rejected'. Occluded
+    # feet must not read as "no fall".
+  # Descenso controlado vs caida (§3.4). El §3.5 le da a esta etapa el trabajo
+  # de rechazar "a controlled sit-down in which COM stays within the support
+  # polygon", pero medido sobre PEF-FallDB esa premisa es falsa: los ADL que
+  # disparan ponen el COM FUERA del apoyo en el 100 % de los cuadros medibles,
+  # porque sentarse traslada el peso al mueble. Lo que si separa es la
+  # magnitud del descenso, que es como el §3.4 describe V: "a sit-down event
+  # produces a monotonic negative V over a longer window, and a fall produces
+  # a large-magnitude negative V within a short window".
+  # Se rechaza solo si el descenso fue POCO PROFUNDO **y** BREVE: un descenso
+  # corto puede ser violento (sincope) y uno lento puede ser una caida; solo
+  # fallar en ambas a la vez indica control.
+  # DESACTIVADO 03/09 tras medirlo de punta a punta. Ver el intento fallido en
+  # notas/TRASPASO-DRAFT.md: calibrado dio "pierde 1 caida de 40", medido dio
+  # "pierde 4", porque la calibracion midio el descenso sobre el CLIP ENTERO y
+  # el codigo lo evalua sobre una ventana movil que cierra 0.33 s despues del
+  # disparo. En varias caidas el descenso fuerte ocurre despues de ese cierre.
+  # Sobre los 128: gano 3 NoFall y perdio 4 caidas. Especificidad 75 -> 94 %,
+  # sensibilidad 71 -> 67 %. Para un detector de caidas ese intercambio va en
+  # la direccion equivocada: una alarma falsa molesta, una caida perdida es
+  # alguien en el suelo sin auxilio.
+  # La separacion medida (0.82 s en caidas contra 0.32 s en ADL) es real; lo
+  # que esta mal es donde se evalua. Reactivar solo tras re-calibrar con la
+  # MISMA ventana que usa el codigo.
+  descent_min_depth_tps: 0.0 # 0 desactiva el rechazo por descenso
+  descent_floor_tps: -1.0
+  descent_window_s: 2.0
+  descent_min_sustained_s: 0.40
+  min_foot_visibility: 0.5 # below this, feet are occluded -> P inconclusive
+  contact_band_torso:
+    0.15 # §3.4 builds the support polygon from the foot
+    # landmarks "in bipedal contact". With no
+    # calibrated ground plane, the floor is the
+    # lowest foot landmark still inside the frame,
+    # and anything more than this far above it has
+    # left the floor. In torso lengths, so it means
+    # the same at any camera distance. PROVISIONAL.
 
-stage3:                        # [Phase 5] immobility confirmation (I), §3.4/§3.5
-  epsilon: 0.05                # stillness radius, torso-lengths
-  threshold_W_seconds: 5.0     # §3.4: "if I exceeds a confirmation threshold W,
-                               # the event is classified as a confirmed fall"
-  observation_window_seconds: 30.0  # upper bound on how long a verdict may stay
-                               # open. It resolves earlier: on a held recovery,
-                               # or as soon as I reaches W.
-  upright_T_deg: 30.0          # trunk angle below which posture counts as upright
-  recovery_hold_seconds: 1.0   # how long upright must last to be a recovery
-                               # rather than a wobble
+stage3: # [Phase 5] immobility confirmation (I), §3.4/§3.5
+  epsilon: 0.05 # stillness radius, torso-lengths
+  threshold_W_seconds:
+    5.0 # §3.4: "if I exceeds a confirmation threshold W,
+    # the event is classified as a confirmed fall"
+  observation_window_seconds:
+    30.0 # upper bound on how long a verdict may stay
+    # open. It resolves earlier: on a held recovery,
+    # or as soon as I reaches W.
+  upright_T_deg: 30.0 # trunk angle below which posture counts as upright
+  recovery_hold_seconds:
+    1.0 # how long upright must last to be a recovery
+    # rather than a wobble
   # Severity (§3.3) is defined by RECOVERY, not by impact: recovered alone =
   # mild, partially recovered = moderate, remained down = severe. Separating
   # mild from moderate needs to know whether the subject STOOD or merely sat
@@ -148,4 +303,99 @@ stage3:                        # [Phase 5] immobility confirmation (I), §3.4/§
   # never mild, because claiming a full recovery one cannot verify is the
   # error that matters. PENDING: draft wording.
   severity_uses_leg_extension: true
-  cooldown_seconds: 3.0        # refractory period after an event resolves
+  cooldown_seconds: 3.0 # refractory period after an event resolves
+  # Fase 4: tras un rechazo de la Etapa 2 no hay enfriamiento (vuelve a
+  # MONITORING). El rechazo no es una caida; el pestillo del disparador ya
+  # evita la rafaga. true = comportamiento anterior.
+  cooldown_after_rejection: false
+  persistent_still_s: 0.5     # a Stage-3 frame counts as still when I >= this (s)
+  persistent_immobility_fraction: 0.5
+  # Fase 6a (§3.5 "hip landmark recovery to upright"): si al final T dice "en
+  # el suelo" pero la cadera subio al menos esto (en torsos) durante los
+  # ultimos getup_window_s, el sujeto se esta levantando -> moderate. Umbral
+  # entre lo medido en entrenamiento: A14-S3 (NotRecovered) 0.21 y A06-S14
+  # (se levanta) 0.70. 0 lo apaga.
+  getup_rise_torsos: 0.45
+  getup_window_s: 2.0
+    # §3.5 "if the immobility persists": an ending that is neither lying
+    # nor standing (sat up, knelt, propped) is SEVERE instead of moderate
+    # when at least this share of Stage-3 frames were still. Separates A17
+    # (reclined against a wall, NotRecovered: 63.4 / 57.8 %) from every
+    # other fall ending below 60 deg (0-35.3 %). Chosen on all 128 clips,
+    # not on the calibration split, with only two positives. 0 disables.
+
+experimental: # signals NOT in §3.4/§3.5. See quantities.py's
+  # module docstring for Quantity H's rationale,
+  # and body_height_ratio()'s docstring for the
+  # two limits it does not overcome (camera-angle
+  # dependence, and it confirms posture, not
+  # intent) before touching either threshold
+  # below.
+  #
+  # The two thresholds ARE wired into the §3.5
+  # funnel (Stage1Trigger, Stage3Evaluator) as
+  # OR'd fallbacks — never mixed into T/V's own,
+  # already-calibrated arithmetic. Both default
+  # to 0.0, which disables them by construction
+  # (H is always positive when defined, so
+  # "<= 0" and ">= 0"-as-disabled can never be
+  # satisfied by a real reading): a stock config
+  # runs identically to before H existed. NEITHER
+  # VALUE IS CALIBRATED YET — they are placeholder
+  # numbers chosen for plausibility (H ~ 1
+  # standing, -> 0 collapsed; see
+  # HeightBaseline), enabled here so the
+  # mechanism can be exercised end-to-end, not
+  # because PEF-FallDB has confirmed them. Sweep
+  # against the dataset before trusting a fall
+  # count or a false-alarm count produced with
+  # these on — same discipline already applied to
+  # trigger_score and descent_min_depth_tps.
+  height_baseline_time_constant_s:
+    2.0
+    # Quantity H: EMA time constant for the personal
+    # standing-height calibration (HeightBaseline).
+    # Seconds, not frames, same reasoning as every
+    # other *_time_constant_s in this file.
+  trigger_H_ratio:
+    0.35 # Stage1Trigger's OR'd fallback: H at/below this,
+    # combined with V still falling, fires the
+    # trigger even when T's own formulation does
+    # not — the axis-aligned-fall blind spot.
+    # 0.0 disables it.
+  trigger_H_erect:
+    0.85 # Requires H to have read at/above this — subject
+    # confirmed standing — within the last
+    # trigger_H_sequence_window_s seconds before the
+    # H+V fallback above may fire at all. Encodes
+    # the STORY (erect, then a short-window
+    # collapse) instead of a bare instantaneous
+    # reading. READ THE CAVEAT ON
+    # Stage1Trigger.threshold_h_erect before
+    # treating this as a fix for voluntary bends
+    # (tying a shoe, picking something up): a
+    # deliberate crouch is ALSO erect-then-collapsed
+    # — same shape, different intent — and this
+    # guard cannot tell them apart. It only removes
+    # noise-only collapses and subjects never seen
+    # standing. 0.0 disables the requirement.
+  trigger_H_sequence_window_s:
+    2.0
+    # How far back trigger_H_erect may look for a
+    # confirmed-standing reading. Seconds, not
+    # frames, same convention as every window in
+    # this file.
+  recovery_H_ratio:
+    0.75 # Stage3Evaluator's OR'd fallback: H at/above
+    # this counts as "upright" for recovery even
+    # when T does not clear upright_T_deg. 0.0
+    # disables it.
+    #
+    # trigger_H_ratio is reused (not duplicated) as
+    # Stage3Evaluator's threshold_h_ratio_lying: the
+    # same "H at/below this = collapsed" reading
+    # confirms a SEVERE (remained down) immobility
+    # verdict, alongside T >= lying_T_deg, instead
+    # of confirming SEVERE from stillness alone —
+    # see Stage3Evaluator.threshold_h_ratio_lying's
+    # docstring for the gap this closes.

@@ -32,28 +32,42 @@ import numpy as np
 from .alerts import Alert, AlertDispatcher
 from .audit_log import csv_column
 from .config import Config
-from .person_state import classify_state
+from .person_state import STANDING, WALKING, classify_state
 from .pose_frontend import (
     FOOT_LANDMARKS,
     HEAD_AND_TORSO_LANDMARKS,
     LEFT_ANKLE,
+    LEFT_HIP,
+    LEFT_SHOULDER,
+    LEFT_WRIST,
+    NOSE,
     RIGHT_ANKLE,
+    RIGHT_HIP,
+    RIGHT_SHOULDER,
+    RIGHT_WRIST,
     PoseFrame,
     PoseFrontend,
 )
 from .quantities import (
     ExponentialMovingAverage,
+    HeightBaseline,
     ImmobilityTimer,
     VelocityEstimator,
+    body_height_ratio,
+    body_height_ratio_raw,
+    body_vertical_extent,
     centroid,
     com_support_offset,
     feet_in_contact,
+    shoulder_width,
     support_polygon,
     support_width,
     trunk_band,
     trunk_inclination_deg,
+    wrist_ankle_proximity,
 )
 from .state_machine import (
+    DescentTracker,
     FallStateMachine,
     Stage,
     Stage1Trigger,
@@ -204,6 +218,10 @@ class FramePipeline:
         self._visibility_threshold = float(cfg.pose.visibility_threshold)
         self._max_gap_s = float(cfg.stage1.history_max_gap_s)
         self._max_extension_ratio = float(cfg.state_display.max_extension_ratio)
+        self._min_trunk_ratio = float(cfg.stage1.min_trunk_ratio)
+        self._trunk_window_s = float(cfg.stage1.trunk_reference_window_s)
+        #: (timestamp, torso_px) of recent frames, for the plausibility guard.
+        self._trunk_history: list[tuple[float, float]] = []
         # The pose front-end is created lazily, on the first real frame. This
         # keeps MediaPipe out of the import path of :meth:`analyze`, so the
         # per-frame logic can be unit-tested against synthetic PoseFrames
@@ -229,6 +247,16 @@ class FramePipeline:
         # Quantity I (§3.4), run continuously rather than post-trigger — see
         # ImmobilityTimer for why, and for the one draft sentence it needs.
         self._immobility = ImmobilityTimer(float(cfg.stage3.epsilon))
+        # Quantity H (EXPERIMENTAL, not in §3.4) — see quantities.py's module
+        # docstring and _quantity_h below for what it is and how it is
+        # assembled from the pose each frame. Whether it actually affects a
+        # decision is entirely the experimental.trigger_H_* / recovery_H_ratio
+        # thresholds below: all disabled at 0.0 reproduces pre-H behaviour
+        # exactly (their non-zero shipped defaults are placeholders pending
+        # calibration — see config.yaml).
+        self._height_baseline = HeightBaseline(
+            time_constant_s=float(cfg.experimental.height_baseline_time_constant_s)
+        )
         # Stage 1 (§3.5). The formulation is a config choice, not a code
         # decision — see state_machine for the measurements behind that.
         self.machine = FallStateMachine(
@@ -239,6 +267,13 @@ class FramePipeline:
                 hold_s=float(cfg.stage1.trigger_hold_s),
                 confirm_window_s=float(cfg.stage1.confirm_window_s),
                 threshold_score=float(cfg.stage1.trigger_score),
+                threshold_score_provisional=float(
+                    cfg.stage1.trigger_score_provisional),
+                peak_window_s=float(cfg.stage1.trigger_peak_window_s),
+                threshold_h_ratio=float(cfg.experimental.trigger_H_ratio),
+                threshold_h_erect=float(cfg.experimental.trigger_H_erect),
+                h_sequence_window_s=float(
+                    cfg.experimental.trigger_H_sequence_window_s),
             ),
             Stage2Evaluator(
                 window_s=float(cfg.stage2.com_eval_window_s),
@@ -255,8 +290,23 @@ class FramePipeline:
                 defer_to_end=self.labelling,
                 lying_t_deg=float(cfg.state_display.lying_T_deg),
                 max_extension=float(cfg.state_display.max_extension_ratio),
+                threshold_h_ratio_recovery=float(
+                    cfg.experimental.recovery_H_ratio),
+                threshold_h_ratio_lying=float(cfg.experimental.trigger_H_ratio),
+                persistent_still_s=float(cfg.stage3.persistent_still_s),
+                persistent_fraction=float(cfg.stage3.persistent_immobility_fraction),
+                getup_rise_torsos=float(
+                    cfg.stage3.as_dict().get("getup_rise_torsos", 0.0)),
+                getup_window_s=float(cfg.stage3.as_dict().get("getup_window_s", 2.0)),
             ),
             cooldown_s=float(cfg.stage3.cooldown_seconds),
+            cooldown_after_rejection=bool(
+                cfg.stage3.as_dict().get("cooldown_after_rejection", True)),
+            descent=DescentTracker(
+                floor_tps=float(cfg.stage2.descent_floor_tps),
+                window_s=float(cfg.stage2.descent_window_s)),
+            min_depth_tps=float(cfg.stage2.descent_min_depth_tps),
+            min_sustained_s=float(cfg.stage2.descent_min_sustained_s),
         )
         # The §3.5 output seam. No sink is attached by default: PEF-Lab adds
         # a screen banner, the headless runner a console line, and Phase 7
@@ -295,6 +345,9 @@ class FramePipeline:
                 min_detection_confidence=cfg.pose.min_detection_confidence,
                 min_tracking_confidence=cfg.pose.min_tracking_confidence,
                 smooth_landmarks=cfg.pose.smooth_landmarks,
+                visibility_threshold=float(cfg.pose.visibility_threshold),
+                reacquire_after_s=float(
+                    cfg.pose.as_dict().get("reacquire_after_s", 0.0)),
             )
         t0 = time.perf_counter()
         pf = self._frontend.process(frame_bgr, frame_index, timestamp)
@@ -334,13 +387,33 @@ class FramePipeline:
             # pending verdict alone; a real loss abandons it, because after
             # long enough there is no guarantee the body that reappears is the
             # same one (measured in multi-person footage).
+            closed = None
             if self._lost_since is None:
                 self._lost_since = timestamp
             elif timestamp - self._lost_since > self._max_gap_s:
-                self._abandon_pending_event()
+                # Seen on the floor and then lost: close on what was seen
+                # (FallStateMachine.close_if_last_seen_down); otherwise
+                # abandon, as before.
+                closed = self.machine.close_if_last_seen_down(timestamp)
+                if closed is not None:
+                    self._dispatch(closed)
+                else:
+                    self._abandon_pending_event()
             return FrameResult(pose=pf, reliable=False,
-                               stage=self.machine.stage.value)
+                               stage=self.machine.stage.value,
+                               resolved_event=closed)
         self._lost_since = None
+
+        # Fase 4: el rastreador se re-sembro (pose_frontend). Los landmarks de
+        # este cuadro vienen de una deteccion nueva, no de seguir al anterior:
+        # misma ruptura de continuidad que una perdida breve.
+        if pf.reacquired:
+            self._discontinuous = True
+            # Y la ventana de pico del disparador: lo anterior al reinicio era
+            # un esqueleto pegado, no el mismo cuerpo. (Una perdida comun NO
+            # la limpia: medido, eso perdio 4 caidas reales cuya deteccion
+            # parpadea durante la caida.)
+            self.machine.trigger.reset()
 
         # A jump in time — forward past the gap threshold, or backwards at
         # all — means the operator moved elsewhere in the recording.
@@ -374,6 +447,8 @@ class FramePipeline:
 
         # --- Quantity T: trunk inclination (§3.4) ---------------------------
         t_deg = trunk_inclination_deg(pf.mid_hip, pf.mid_shoulder)
+        if not self._trunk_is_plausible(pf.torso_length, timestamp):
+            t_deg = float("nan")
         quantities["T_deg"] = t_deg
         hud_lines.append(f"T (trunk): {t_deg:5.1f} deg  [{trunk_band(t_deg)}]")
 
@@ -407,6 +482,31 @@ class FramePipeline:
         if state and self.machine.stage is Stage.MONITORING:
             self._recent_state = state
 
+        # --- Quantity H: body height vs. personal baseline (EXPERIMENTAL) ---
+        # Not in §3.4. Whether it affects Stage 1/3 at all is entirely the
+        # experimental.* thresholds passed into the FallStateMachine above —
+        # see _quantity_h and quantities.body_height_ratio.
+        h_ratio, h_raw, h_baseline = self._quantity_h(pf, dt, state)
+        quantities["H_ratio"] = h_ratio
+        quantities["H_raw"] = h_raw
+        quantities["H_baseline"] = h_baseline
+        if math.isnan(h_ratio):
+            hud_lines.append("H (height): -- [EXP]")
+        else:
+            hud_lines.append(f"H (height): {h_ratio:4.2f}  [EXP]")
+
+        # --- Quantity R: wrist-to-ankle proximity (EXPERIMENTAL) ------------
+        # Not in §3.4, not wired into any §3.5 stage yet (pending calibration
+        # — see quantities.wrist_ankle_proximity). Logged so it can be
+        # evaluated as the discriminator H and T cannot be: intent, not
+        # posture (tying a shoe vs. falling look alike to everything above).
+        reach = self._quantity_reach(pf)
+        quantities["reach_proximity"] = reach
+        if math.isnan(reach):
+            hud_lines.append("R (reach): -- [EXP]")
+        else:
+            hud_lines.append(f"R (reach): {reach:4.2f}  [EXP]")
+
         # --- Quantity P: COM vs. support polygon (§3.4) ---------------------
         com_px, hull_px, p_offset, p_width = self._quantity_p(pf)
         quantities["P_offset"] = p_offset
@@ -438,7 +538,29 @@ class FramePipeline:
         if reliable:
             event = self.machine.update(pf.frame_index, timestamp,
                                         t_deg, v_tps, p_offset,
-                                        i_seconds, extension_ratio)
+                                        i_seconds, extension_ratio, h_ratio)
+            # Fase 6a: la altura de la cadera, para leer un levantarse en
+            # curso al final (Stage3Evaluator.getup_rise).
+            if (self.machine.stage is Stage.OBSERVING and self.machine.stage3 is not None
+                    and pf.mid_hip is not None and pf.torso_length):
+                self.machine.stage3.observe_hip(timestamp, float(pf.mid_hip[1]),
+                                                float(pf.torso_length))
+        # What Stage 1 actually compared on this frame — the score over the
+        # peak window, not T and V separately. A curve crossing the old
+        # threshold_T / threshold_V lines says nothing about firing; this does.
+        # Only fresh when the machine ran; an unreliable frame has none.
+        quantities["trigger_score"] = (
+            float(getattr(self.machine.trigger, "last_score", float("nan")))
+            if reliable else float("nan"))
+        # Phase 3's running measure: share of Stage-3 frames with I >= the
+        # still cut. Read from the evaluator itself, so the curve PEF-Lab draws
+        # and the rule finalise() applies cannot disagree. Only meaningful
+        # while Stage 3 is observing.
+        st3 = self.machine.stage3
+        quantities["still_fraction"] = (
+            float(st3.still_fraction)
+            if st3 is not None and self.machine.stage is Stage.OBSERVING
+            else float("nan"))
         stage = self.machine.stage
         resolved = self.machine.just_resolved
         if resolved is not None:
@@ -483,6 +605,7 @@ class FramePipeline:
             max_immobility_s=event.max_immobility_s,
             prior_state=self._recent_state,
             source=self.source_name,
+            reason=getattr(event, "reason", ""),
         ))
 
     def _quantity_i(self, pf: PoseFrame, timestamp: float) -> tuple[float, float]:
@@ -556,6 +679,145 @@ class FramePipeline:
             com_support_offset(com, hull, pf.torso_length),
             support_width(hull, pf.torso_length),
         )
+
+    def _quantity_h(self, pf: PoseFrame, dt: float, state: str | None
+                    ) -> tuple[float, float, float]:
+        """Quantity H for one frame (EXPERIMENTAL, not in §3.4).
+
+        NOT consumed by any §3.5 stage. Proposed to cover two gaps measured
+        on this project's own footage that T and P share: P is undefined the
+        moment feet are occluded or leave frame, and T reads a falsely low,
+        "upright"-looking angle when a fall's rotation axis points toward or
+        away from the camera (its trunk vector's 2D projection nearly
+        vanishes). See ``quantities.body_height_ratio`` for the two limits it
+        does NOT overcome — camera-angle dependence, and confirming posture
+        rather than intent — before this number is read as more than a
+        diagnostic.
+
+        Assembled here, rather than from ``pf.mid_hip``/``pf.mid_shoulder``
+        directly, because those midpoints do not carry per-landmark
+        visibility: H needs to know WHICH of nose, shoulders, hips and
+        ankles were actually seen this frame, so a point below the
+        visibility threshold can be dropped (NaN) instead of silently
+        trusted — the same policy already applied to the ankles in
+        ``_hip_ankle_extension``.
+
+        The calibration input (``is_standing``) reuses ``classify_state``'s
+        own STANDING/WALKING verdict — both are upright with legs extended,
+        which is exactly the posture ``HeightBaseline`` needs to calibrate
+        against.
+
+        Returns:
+            ``(H, raw_ratio, baseline)`` — H is the candidate reading; the
+            other two are logged alongside it so a calibration pass can see
+            how the baseline converged and whether a given frame's raw ratio
+            was itself trustworthy, without having to re-derive them.
+        """
+        vis = pf.visibility
+        threshold = self._visibility_threshold
+
+        def midpoint_or_nan(a: int, b: int) -> np.ndarray:
+            if vis[a] < threshold or vis[b] < threshold:
+                return np.array([np.nan, np.nan])
+            return pf.landmarks[[a, b], :2].mean(axis=0)
+
+        nose = (pf.landmarks[NOSE, :2] if vis[NOSE] >= threshold
+                else np.array([np.nan, np.nan]))
+        spine = np.array([
+            nose,
+            midpoint_or_nan(LEFT_SHOULDER, RIGHT_SHOULDER),
+            midpoint_or_nan(LEFT_HIP, RIGHT_HIP),
+            midpoint_or_nan(LEFT_ANKLE, RIGHT_ANKLE),
+        ])
+        extent = body_vertical_extent(spine)
+
+        if vis[LEFT_SHOULDER] < threshold or vis[RIGHT_SHOULDER] < threshold:
+            width = float("nan")
+        else:
+            width = shoulder_width(pf.landmarks[LEFT_SHOULDER, :2],
+                                   pf.landmarks[RIGHT_SHOULDER, :2])
+
+        raw_ratio = body_height_ratio_raw(extent, width)
+        is_standing = state in (STANDING, WALKING)
+        baseline = self._height_baseline.update(dt, raw_ratio, is_standing)
+        return body_height_ratio(raw_ratio, baseline), raw_ratio, baseline
+
+    def _quantity_reach(self, pf: PoseFrame) -> float:
+        """Quantity R for one frame (EXPERIMENTAL, not in §3.4): how close
+        the hands are to the feet.
+
+        NOT consumed by any §3.5 stage — logged so it can be evaluated
+        against labelled clips before it is. See
+        ``quantities.wrist_ankle_proximity`` for what it is proposed to
+        cover: T, V, P, I and H all read posture, and a deliberate bend
+        (tying a shoe) produces close to the same posture as a fall by every
+        one of them. This is the only quantity in the module that looks at
+        the hands at all, which is what makes it a candidate for telling the
+        two apart instead of just confirming that "something collapsed"
+        happened again.
+
+        Per-landmark visibility gating, same policy as every other quantity
+        here: a wrist or ankle below the threshold is passed as NaN rather
+        than trusted.
+        """
+        vis = pf.visibility
+        threshold = self._visibility_threshold
+        wrists = pf.landmarks[[LEFT_WRIST, RIGHT_WRIST], :2].copy()
+        wrists[vis[[LEFT_WRIST, RIGHT_WRIST]] < threshold] = np.nan
+        ankles = pf.landmarks[[LEFT_ANKLE, RIGHT_ANKLE], :2].copy()
+        ankles[vis[[LEFT_ANKLE, RIGHT_ANKLE]] < threshold] = np.nan
+        return wrist_ankle_proximity(wrists, ankles, pf.torso_length)
+
+    def _trunk_is_plausible(self, torso_px: float, timestamp: float) -> bool:
+        """Whether the projected trunk is long enough for T to mean anything.
+
+        This is the guard §3.2 already promises — *"depth ambiguity from the
+        monocular input is mitigated by tracking within-frame and across-frame
+        landmark displacement ratios rather than relying on absolute 3D
+        distances"* — and which the code did not implement.
+
+        WHY THE §3.4 GUARD IS NOT ENOUGH. That section discards T when
+        |trunk| < 0.001 px. No real pose reaches that, so the guard never
+        fires. Measured on clip A14: the trunk projected to **2 px** while
+        MediaPipe reported 0.99 confidence, and T produced 176.9 deg next to
+        26.0 deg on consecutive frames. Two pixels is 2000x the paper's
+        threshold, so the frame sailed through and the noise reached Stage 1.
+
+        WHY THE COMPARISON IS TO THE SUBJECT'S OWN RECENT TRUNK, not to the
+        frame or to an absolute pixel count. A subject far from the camera
+        legitimately has a short trunk in pixels; nothing is wrong with that
+        frame. What is not legitimate is a trunk that collapses relative to
+        what the SAME subject measured a moment ago. That is an across-frame
+        ratio, which is what §3.2 asks for.
+
+        The reference is a **median**, not the existing EMA: the collapse
+        itself drags a mean down with it, so a mean would normalise away the
+        very event being detected.
+
+        WHAT THIS GUARD CANNOT DO, and it matters. A genuine fall also
+        shortens the projected trunk — measured across the 56 falls that
+        fired, the trunk drops to a median of 0.40 of its own recent value.
+        So this cannot separate a fall from an artefact, and a tight ratio
+        would reject real falls. It is set loose on purpose: it removes
+        frames whose geometry is impossible (collapses to 0.05-0.07 were
+        recorded), not frames that are merely foreshortened. Telling an axial
+        fall from a collapsed estimate is not possible from a projected trunk
+        at all — that is the limitation documented as D4.
+        """
+        if self._min_trunk_ratio <= 0.0:
+            return True
+        if not torso_px or torso_px != torso_px:
+            return True                      # nothing to judge; §3.4 handles it
+        cutoff = timestamp - self._trunk_window_s
+        while self._trunk_history and self._trunk_history[0][0] < cutoff:
+            self._trunk_history.pop(0)
+        recent = [t for _ts, t in self._trunk_history]
+        self._trunk_history.append((timestamp, float(torso_px)))
+        if len(recent) < 3:
+            return True                      # no reference yet
+        recent.sort()
+        reference = recent[len(recent) // 2]
+        return torso_px >= self._min_trunk_ratio * reference
 
     def _hip_ankle_extension(self, pf: PoseFrame, dt: float) -> float:
         """Hip-to-ankle DISTANCE in torso units (posture feature, 2.4).
@@ -660,6 +922,12 @@ class FramePipeline:
         # those apart, resuming the clock across a gap would let the system
         # certify stillness it never observed.
         self._immobility.reset()
+        # The height baseline is a calibration of THIS subject; resuming it
+        # across a gap risks calibrating "standing" against a different body,
+        # the same reasoning as the immobility clock above.
+        self._height_baseline.reset()
+        # The trunk reference belongs to a continuous observation of one body.
+        self._trunk_history.clear()
         self._last_timestamp = None
         self._discontinuous = False
 
