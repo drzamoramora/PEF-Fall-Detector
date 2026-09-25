@@ -45,6 +45,7 @@ from .state_machine import (
     CONFIRMED_FALL,
     MILD,
     MODERATE,
+    NOT_DOWN,
     NULLIFIED,
     SEVERE,
 )
@@ -127,6 +128,11 @@ def class_for_event(verdict: str, severity: str,
     clips where the subject simply left the frame.
     """
     if verdict == "stage2_rejected":
+        return NO_FALL
+    # Fase 8.3: la Etapa 3 midio que el cuerpo no llego al suelo (cantidad A).
+    # Es un juicio activo, como el rechazo de la Etapa 2, no una falta de
+    # evidencia: NoFall siempre, sin importar ``unresolved_as``.
+    if verdict == NOT_DOWN:
         return NO_FALL
     return _FROM_SEVERITY.get((verdict, severity), unresolved_as)
 

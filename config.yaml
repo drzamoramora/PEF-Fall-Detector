@@ -333,19 +333,33 @@ quantity_a: # EXPERIMENTAL (fase 8): A = altura de la cabeza sobre los tobillos
   # en la direccion de la gravedad (puntos 3D de mundo de MediaPipe), dividida
   # por la altura del mismo sujeto de pie. ~1 de pie, ~0.3-0.7 sentado o
   # arrodillado, ~0 en el suelo. En tension con el §3.2, que excluye la
-  # profundidad monocular: por eso se mide antes de decidir nada.
-  # Fase 8.1: SOLO se registra (A_head_EXP, A_hip_EXP); ninguna etapa la lee.
+  # profundidad monocular: el autor acepto el cambio (25/09): A usa las
+  # coordenadas de mundo solo como cociente autocalibrado (POSIBLES-CAMBIOS C5).
+  # Fase 8.1: se registra (A_head_EXP, A_hip_EXP). Fases 8.2 y 8.3: la Etapa 3
+  # la lee al cierre (modo etiquetado), cada regla con su interruptor.
   #
   # Calibracion ("arriba" y altura de pie) con el propio sujeto parado:
   standing_T_deg: 20.0     # tronco erguido en la imagen
   standing_knee_deg: 150.0 # y piernas rectas en 3D (180 = rectas)
   min_standing_s: 0.5      # tiempo de pie antes de dar A (antes: NaN)
   max_samples: 300         # cuadros de pie que se recuerdan (~10 s)
-  # Umbrales medidos en entrenamiento (25/09, notas/ANALISIS-82-90.md).
-  # En 8.1 solo se dibujan en PEF-Lab; las fases 8.2-8.3 los usarian.
-  band_floor: 0.26         # bajo esto: en el suelo (NotRecovered)
-  band_standing: 0.82      # sobre esto: de pie (Recovered)
-  floor_reached: 0.28      # "llego al suelo" cerca del disparo
+  # Fase 8.2: la postura final sale de A cuando esta calibrada (si no, T).
+  # Bandas de los huecos de la particion de entrenamiento (ANALISIS-82-90.md).
+  severity_from_a: true
+  band_floor: 0.26         # A final <= esto: en el suelo (severe)
+  band_standing: 0.82      # A final >= esto: de pie (mild)
+  # Fase 8.3: "¿llego al suelo?". Si la cabeza nunca bajo de floor_reached
+  # entre reach_before_s antes y reach_after_s despues del disparo, y la cadera
+  # termino sobre hip_raised, no hubo caida (NoFall, sin alarma). Se abstiene
+  # si A no estaba calibrada al disparar (A16-S3 en el Mac).
+  # 0.31 y no 0.28 (decidido 25/09): los NoFall de entrenamiento que hay que
+  # rechazar empiezan en 0.34; menos el p90 de la diferencia entre plataformas
+  # (0.04) deja toda caida real a mas de 0.04 del corte.
+  reach_check: true
+  floor_reached: 0.31
+  hip_raised: 0.22         # la cadera final debe estar elevada (protege A17-S2)
+  reach_before_s: 1.0
+  reach_after_s: 4.0
 
 experimental: # signals NOT in §3.4/§3.5. See quantities.py's
   # module docstring for Quantity H's rationale,

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -260,7 +261,7 @@ class FramePipeline:
             time_constant_s=float(cfg.experimental.height_baseline_time_constant_s)
         )
         # Quantity A (EXPERIMENTAL, fase 8): head height against gravity, 3D.
-        # Logged only — no stage reads it (fase 8.1). See quantities.py.
+        # Logged since 8.1; read by Stage 3 in 8.2/8.3 (config switches). See quantities.py.
         qa = cfg.as_dict().get("quantity_a", {}) or {}
         self._a_standing_t = float(qa.get("standing_T_deg", 20.0))
         self._a_standing_knee = float(qa.get("standing_knee_deg", 150.0))
@@ -268,6 +269,22 @@ class FramePipeline:
             min_standing_s=float(qa.get("min_standing_s", 0.5)),
             max_samples=int(qa.get("max_samples", 300)),
         )
+        # Fases 8.2 y 8.3: la Etapa 3 lee A (ver Stage3Evaluator.finalise).
+        # Cada regla tiene su interruptor; apagadas, A solo se registra (8.1).
+        use_a_sev = bool(qa.get("severity_from_a", False))
+        use_a_reach = bool(qa.get("reach_check", False))
+        a_band_floor = float(qa.get("band_floor", 0.26)) if use_a_sev else 0.0
+        a_band_standing = float(qa.get("band_standing", 0.82))
+        a_reach_floor = float(qa.get("floor_reached", 0.31)) if use_a_reach else 0.0
+        a_hip_raised = float(qa.get("hip_raised", 0.22))
+        a_before = float(qa.get("reach_before_s", 1.0))
+        a_after = float(qa.get("reach_after_s", 4.0))
+        #: (timestamp, A_head, A_hip) of the last few seconds, so Stage 3 can
+        #: read the second BEFORE the trigger, which it was not yet watching.
+        self._a_history: deque[tuple[float, float, float]] = deque()
+        self._a_history_s = a_before + 4.0
+        #: (trigger timestamp, A calibrated on that frame) of the last event.
+        self._a_trigger: tuple[float, bool] | None = None
         # Stage 1 (§3.5). The formulation is a config choice, not a code
         # decision — see state_machine for the measurements behind that.
         self.machine = FallStateMachine(
@@ -309,6 +326,12 @@ class FramePipeline:
                 getup_rise_torsos=float(
                     cfg.stage3.as_dict().get("getup_rise_torsos", 0.0)),
                 getup_window_s=float(cfg.stage3.as_dict().get("getup_window_s", 2.0)),
+                a_band_floor=a_band_floor,
+                a_band_standing=a_band_standing,
+                a_reach_floor=a_reach_floor,
+                a_hip_raised=a_hip_raised,
+                a_reach_before_s=a_before,
+                a_reach_after_s=a_after,
             ),
             cooldown_s=float(cfg.stage3.cooldown_seconds),
             cooldown_after_rejection=bool(
@@ -519,12 +542,15 @@ class FramePipeline:
             hud_lines.append(f"R (reach): {reach:4.2f}  [EXP]")
 
         # --- Quantity A: head height against gravity, 3D (EXPERIMENTAL) ------
-        # Fase 8.1: measured and logged, read by no stage. Its calibration is
-        # causal (only frames up to this one), so the record is what a live
-        # device would have had.
+        # Logged since 8.1; Stage 3 reads it in 8.2/8.3 (see below). Its
+        # calibration is causal (only frames up to this one), so the record is
+        # what a live device would have had.
         a_head, a_hip = self._quantity_a(pf, t_deg, reliable, timestamp)
         quantities["A_head"] = a_head
         quantities["A_hip"] = a_hip
+        self._a_history.append((float(timestamp), a_head, a_hip))
+        while self._a_history and self._a_history[0][0] < timestamp - self._a_history_s:
+            self._a_history.popleft()
         if math.isnan(a_head):
             hud_lines.append("A (3D)   : -- (calibrando) [EXP]")
         else:
@@ -568,6 +594,17 @@ class FramePipeline:
                     and pf.mid_hip is not None and pf.torso_length):
                 self.machine.stage3.observe_hip(timestamp, float(pf.mid_hip[1]),
                                                 float(pf.torso_length))
+            # Fases 8.2/8.3: la cantidad A. Se anota si estaba calibrada en el
+            # cuadro del disparo; al empezar la Etapa 3 se le entrega el
+            # segundo previo, y despues cada cuadro observado.
+            if event is not None:
+                self._a_trigger = (float(event.timestamp), bool(self._gravity.calibrated))
+            st3a = self.machine.stage3
+            if self.machine.stage is Stage.OBSERVING and st3a is not None:
+                if not st3a.a_armed and self._a_trigger is not None:
+                    st3a.arm_a(self._a_trigger[0], self._a_trigger[1], self._a_history)
+                elif st3a.a_armed:
+                    st3a.observe_a(timestamp, a_head, a_hip)
         # What Stage 1 actually compared on this frame — the score over the
         # peak window, not T and V separately. A curve crossing the old
         # threshold_T / threshold_V lines says nothing about firing; this does.

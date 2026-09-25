@@ -28,21 +28,26 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QRectF, Qt, QTimer
-from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QFont, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
+    QSplitter,
+    QStyle,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -59,6 +64,7 @@ from ..evaluation import binary_metrics, load_split, report, split_rows
 from ..overlay import draw_overlay
 from ..pipeline import FramePipeline
 from ..sources import CameraSource, FrameSource, VideoFileSource
+from . import theme
 from .review_cache import ClipAnalysis, PassRecorder, ReviewCache, config_key
 
 #: Velocidades de reproducción. En la revisión congelada no corre MediaPipe,
@@ -105,13 +111,99 @@ def _format_time(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+PLAY_TEXT, PAUSE_TEXT = "Play", "Pause"
+CAMERA_START, CAMERA_STOP = "Start Camera", "Stop Camera"
+#: Minimum plot height. The curves live in a scroll area, so this never
+#: adds up into the window's own minimum height.
+PLOT_MIN_HEIGHT = 125
+
+
+def _separator() -> QFrame:
+    line = QFrame()
+    line.setFrameShape(QFrame.VLine)
+    line.setStyleSheet(f"color: {theme.BORDER};")
+    return line
+
+
+def _caption(text: str) -> QLabel:
+    label = QLabel(text.upper())
+    label.setObjectName("cardTitle")
+    return label
+
+
+def _card(title: str) -> tuple[QFrame, QVBoxLayout]:
+    """A titled panel: rounded, one step lighter than the window."""
+    frame = QFrame()
+    frame.setObjectName("card")
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(12, 8, 12, 10)
+    layout.setSpacing(6)
+    layout.addWidget(_caption(title))
+    return frame, layout
+
+
+def _legend_row(colour: str, text: str) -> QWidget:
+    row = QWidget()
+    h = QHBoxLayout(row)
+    h.setContentsMargins(0, 0, 0, 0)
+    swatch = QLabel()
+    swatch.setFixedSize(14, 14)
+    swatch.setStyleSheet(f"background-color: {colour}; border: 1px solid {theme.BORDER}; "
+                         f"border-radius: 3px;")
+    h.addWidget(swatch)
+    h.addWidget(QLabel(text), stretch=1)
+    return row
+
+
+class _VideoView(QLabel):
+    """The video frame, rescaled to whatever space the layout gives it.
+
+    Its size policy is Ignored so the pixmap never drives the layout (a
+    pixmap-sized label grows the window frame after frame); the explicit
+    minimum still holds.
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(426, 240)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self._source: QPixmap | None = None
+
+    def show_image(self, pixmap: QPixmap) -> None:
+        self._source = pixmap
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self._source is None or self._source.isNull():
+            return
+        target = self.size() - QSize(4, 4)
+        self.setPixmap(self._source.scaled(target, Qt.KeepAspectRatio,
+                                           Qt.SmoothTransformation))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().resizeEvent(event)
+        self._rescale()
+
+
+def _fit_to_screen(window: QWidget) -> None:
+    """Open at a size that fits the screen, leaving room for the menu bar and dock."""
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        window.resize(1280, 800)
+        return
+    geo = screen.availableGeometry()
+    window.resize(min(1520, int(geo.width() * 0.94)), min(960, int(geo.height() * 0.92)))
+
+
 class LabWindow(QWidget):
     """PEF-Lab: source selection + overlay display + audit logging."""
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
-        self.setWindowTitle("PEF-Lab — Fall Detector Workbench (Phase 1)")
-        self.resize(1000, 760)
+        self.setWindowTitle("PEF-Lab — Fall Detection Workbench")
+        self.setMinimumSize(980, 640)
+        _fit_to_screen(self)
 
         self.cfg = cfg
         self.source: FrameSource | None = None
@@ -182,51 +274,127 @@ class LabWindow(QWidget):
 
     # ------------------------------------------------------------------ UI --
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        """Window layout. Appearance only: no detection logic lives here.
 
-        self.video_label = QLabel("Open a video or start the camera to begin.")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(800, 540)
-        self.video_label.setStyleSheet("background-color: #202020; color: #aaaaaa;")
-        layout.addWidget(self.video_label, stretch=1)
+        Sized for a laptop screen (checked at 1280x760): no block has a fixed
+        height that adds up past that, and the curves sit in a scroll area,
+        so they can never push the controls off screen again (what happened
+        on the author's Mac on 25/09).
+
+            header : sources (open video, add folder, camera, re-analyze, close)
+            top    : video + playback + timeline  |  stage, verdict, queue / view
+            bottom : curves (Paper / Experimental), full width, resizable
+            footer : status line
+        """
+        self.setStyleSheet(theme.QSS)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 6)
+        root.setSpacing(8)
+        style = self.style()
+
+        # --- Header: where the frames come from ----------------------------
+        header = QFrame()
+        header.setObjectName("header")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(14, 8, 10, 8)
+        hl.setSpacing(8)
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        app_title = QLabel("PEF-Lab")
+        app_title.setObjectName("appTitle")
+        app_sub = QLabel("Physics-informed fall detection · workbench")
+        app_sub.setObjectName("appSubtitle")
+        titles.addWidget(app_title)
+        titles.addWidget(app_sub)
+        hl.addLayout(titles)
+        hl.addStretch(1)
+
+        self.open_video_btn = QPushButton("Open Video…")
+        self.open_video_btn.setObjectName("primary")
+        self.open_video_btn.setIcon(style.standardIcon(QStyle.SP_DialogOpenButton))
+        self.open_video_btn.setToolTip("Analyze a recorded clip (.mp4, .avi, .mov, .mkv)")
+        self.open_video_btn.clicked.connect(self._on_open_video)
+        hl.addWidget(self.open_video_btn)
+        self.queue_add_btn = QPushButton("Add Folder…")
+        self.queue_add_btn.setIcon(style.standardIcon(QStyle.SP_DirOpenIcon))
+        self.queue_add_btn.setToolTip("Load a folder of clips into the queue (see the Queue tab)")
+        self.queue_add_btn.clicked.connect(self._on_queue_add_folder)
+        hl.addWidget(self.queue_add_btn)
+        hl.addWidget(_separator())
+        hl.addWidget(QLabel("Camera"))
+        self.camera_spin = QSpinBox()
+        self.camera_spin.setRange(0, 9)
+        self.camera_spin.setToolTip("Camera index")
+        hl.addWidget(self.camera_spin)
+        self.camera_btn = QPushButton(CAMERA_START)
+        self.camera_btn.setIcon(style.standardIcon(QStyle.SP_ComputerIcon))
+        self.camera_btn.clicked.connect(self._on_toggle_camera)
+        hl.addWidget(self.camera_btn)
+        hl.addWidget(_separator())
+        # The only way to analyze an already frozen clip again in this
+        # session: an explicit decision, which writes a new record.
+        self.reanalyze_btn = QPushButton("Re-analyze")
+        self.reanalyze_btn.setIcon(style.standardIcon(QStyle.SP_BrowserReload))
+        self.reanalyze_btn.setToolTip("Discard the frozen analysis and run a new pass, "
+                                      "with a new record")
+        self.reanalyze_btn.clicked.connect(self._on_reanalyze)
+        hl.addWidget(self.reanalyze_btn)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setObjectName("danger")
+        self.close_btn.setIcon(style.standardIcon(QStyle.SP_DialogCloseButton))
+        self.close_btn.setToolTip("Close the current source")
+        self.close_btn.clicked.connect(self._close_source)
+        hl.addWidget(self.close_btn)
+        root.addWidget(header)
+
+        # --- Video and the state readouts -----------------------------------
+        self.video_label = _VideoView("Open a video or start the camera to begin.")
+        self.video_label.setObjectName("videoView")
 
         self.status_label = QLabel("")
-        layout.addWidget(self.status_label)
+        self.status_label.setObjectName("statusLine")
 
-        # Stage-1 readout: current funnel position and the events raised so
-        # far. Kept beside the curves rather than buried in the HUD because
-        # while calibrating, WHEN it fired matters more than the frame it
-        # fired on.
         # The alarm. A confirmed fall must be impossible to miss while
         # testing with the camera — a line of grey text is not an alarm.
         # Hidden until one fires, so its presence alone carries meaning.
         self.alert_banner = QLabel("")
         self.alert_banner.setAlignment(Qt.AlignCenter)
+        self.alert_banner.setWordWrap(True)
         self.alert_banner.setVisible(False)
-        layout.addWidget(self.alert_banner)
 
+        # Funnel position: a coloured chip for the stage, and the detail line
+        # (events so far, the last firing) under it.
+        self.stage_chip = QLabel(theme.STAGE_NAMES["MONITORING"])
+        self.stage_chip.setStyleSheet(theme.chip_style(theme.STAGE_COLOURS["MONITORING"]))
         self.stage_label = QLabel("Stage: MONITORING   |   events: 0")
-        self.stage_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self.stage_label)
+        self.stage_label.setWordWrap(True)
+        self.stage_label.setObjectName("muted")
 
-        # --- Curvas ------------------------------------------------------
-        # Dos pestañas con el mismo eje de tiempo, el mismo cursor y las mismas
-        # marcas de disparo y veredicto:
-        #   «Paper»: lo que decide el embudo (T, V, el puntaje que de verdad se
-        #            compara, P, I y el % quieto de la fase 3);
-        #   «Experimentales [EXP]»: lo que se registra fuera del §3.4 (H, R,
-        #            piernas, Vh, el desplazamiento de I), con las líneas de la
-        #            configuración contra las que cada una se compara.
-        # Debajo, a todo el ancho: el veredicto con su motivo y la línea de
-        # tiempo de la pasada.
-        pg.setConfigOptions(antialias=False)  # cheap drawing at 30 FPS
+        # --- Curves ---------------------------------------------------------
+        # Two tabs sharing the time axis, the cursor and the firing / verdict
+        # marks:
+        #   «Paper»: what decides the funnel (T, V, the score actually
+        #            compared, P, I and phase 3's still share);
+        #   «Experimental [EXP]»: what is logged outside §3.4 (A, H, R, legs,
+        #            Vh, I's displacement), with the config lines each one is
+        #            compared against.
+        pg.setConfigOptions(antialias=False, background=theme.PLOT_BG,
+                            foreground=theme.PLOT_FG)  # cheap drawing at 30 FPS
         score_formulation = str(self.cfg.stage1.trigger_formulation) == "score"
-        #: clave de FrameResult.quantities -> curva que la dibuja
+        #: FrameResult.quantities key -> the curve that draws it
         self._series: dict[str, object] = {}
 
         def plot(title: str, y0: float | None = None, y1: float | None = None):
-            w = pg.PlotWidget(title=title)
-            w.setFixedHeight(130)
+            w = pg.PlotWidget()
+            w.setTitle(title, size="9pt", color=theme.TEXT)
+            w.setMinimumHeight(PLOT_MIN_HEIGHT)
+            w.setMinimumWidth(200)
+            w.showGrid(x=True, y=True, alpha=0.12)
+            tick_font = QFont()
+            tick_font.setPointSize(8)
+            for side in ("left", "bottom"):
+                w.getAxis(side).setStyle(tickFont=tick_font, tickTextOffset=3)
+            w.getAxis("left").setWidth(34)
             if y0 is not None:
                 w.setYRange(y0, y1)
             return w
@@ -246,161 +414,168 @@ class LabWindow(QWidget):
             self._series[key] = c
             return c
 
-        def grid_of(plots):
-            page = QWidget()
-            g = QGridLayout(page)
-            g.setContentsMargins(0, 0, 0, 0)
+        def grid_of(plots, cols=3):
+            """A tab page: the plots in a grid, inside a scroll area.
+
+            The scroll area is what keeps the window's minimum height small:
+            without it every plot row adds to it (a seventh plot once pushed
+            the buttons off the Mac's screen).
+            """
+            inner = QWidget()
+            g = QGridLayout(inner)
+            g.setContentsMargins(6, 6, 6, 6)
+            g.setSpacing(6)
             for i, w in enumerate(plots):
-                g.addWidget(w, i // 3, i % 3)
+                g.addWidget(w, i // cols, i % cols)
+            page = QScrollArea()
+            page.setWidgetResizable(True)
+            page.setFrameShape(QFrame.NoFrame)
+            page.setWidget(inner)
             return page
 
         # ---- Paper ---------------------------------------------------------
-        # T hasta 180: por encima de 120 viven los esqueletos invertidos, que
-        # son el modo de falla central de este proyecto. Las líneas son las
-        # bandas del §3.4 y los cortes de la Etapa 3, con las etiquetas
-        # escalonadas porque 30, 45 y 60 quedan a pocos píxeles.
-        self.t_plot = plot("T — tronco (grados)", 0, 180)
+        # T up to 180: above 120 live the inverted skeletons, this project's
+        # central failure mode. The lines are §3.4's bands and Stage 3's cuts,
+        # labels staggered because 30, 45 and 60 sit a few pixels apart.
+        self.t_plot = plot("T — trunk angle (deg)", 0, 180)
         hline(self.t_plot, 15, "", (90, 90, 90))
         hline(self.t_plot, 90, "", (90, 90, 90))
         hline(self.t_plot, float(self.cfg.stage3.upright_T_deg),
-              f"erguido < {float(self.cfg.stage3.upright_T_deg):.0f}", (120, 180, 120), at=0.12)
-        # Con la formulación "score" threshold_T no dispara por sí sola: es
-        # la escala del puntaje. Se dibuja tenue y se dice qué es.
+              f"upright < {float(self.cfg.stage3.upright_T_deg):.0f}", (120, 180, 120), at=0.12)
+        # With the "score" formulation threshold_T does not fire on its own:
+        # it is the score's scale. Drawn faint, and named for what it is.
         hline(self.t_plot, float(self.cfg.stage1.threshold_T_deg),
-              "escala T" if score_formulation else "threshold_T",
+              "T scale" if score_formulation else "threshold_T",
               (130, 130, 130) if score_formulation else "orange", at=0.45)
         hline(self.t_plot, float(self.cfg.state_display.lying_T_deg),
-              f"suelo \u2265 {float(self.cfg.state_display.lying_T_deg):.0f}", (229, 57, 53),
+              f"floor ≥ {float(self.cfg.state_display.lying_T_deg):.0f}", (229, 57, 53),
               at=0.78)
         self.t_curve = curve(self.t_plot, "T_deg", "y")
 
-        self.v_plot = plot("V — velocidad vertical (torso/s, neg = baja)", -4, 4)
+        self.v_plot = plot("V — vertical velocity (torso/s, neg = down)", -4, 4)
         hline(self.v_plot, float(self.cfg.stage1.threshold_V),
-              "escala V" if score_formulation else "threshold_V",
+              "V scale" if score_formulation else "threshold_V",
               (110, 110, 110) if score_formulation else "orange")
         hline(self.v_plot, 0.0, "", (120, 120, 120), dash=False)
         self.v_curve = curve(self.v_plot, "V_tps", "m")
 
-        # Lo que la Etapa 1 compara de verdad: T/escala_T + V/escala_V sobre
-        # la ventana de pico. Vacío donde el disparador no lo evalúa.
-        self.s_plot = plot("Puntaje del disparador", 0, 5)
+        # What Stage 1 actually compares: T/T_scale + V/V_scale over the peak
+        # window. Empty where the trigger does not evaluate it.
+        self.s_plot = plot("Trigger score", 0, 5)
         hline(self.s_plot, float(self.cfg.stage1.trigger_score),
-              f"dispara \u2265 {float(self.cfg.stage1.trigger_score):.1f}", (229, 57, 53),
+              f"fires ≥ {float(self.cfg.stage1.trigger_score):.1f}", (229, 57, 53),
               dash=False, width=2)
         provisional = float(getattr(self.cfg.stage1, "trigger_score_provisional", 0.0) or 0.0)
         if provisional > 0.0:
-            hline(self.s_plot, provisional, f"banda {provisional:.1f}", (255, 152, 0), at=0.5)
+            hline(self.s_plot, provisional, f"band {provisional:.1f}", (255, 152, 0), at=0.5)
         self.s_curve = curve(self.s_plot, "trigger_score", (255, 255, 255))
 
         # Quantity P. Zero is the whole decision line: the sign says inside
         # or outside the support, so it is solid, not a configurable threshold.
-        self.p_plot = plot("P — COM vs apoyo (torso, >0 = fuera)", -1.5, 1.5)
-        hline(self.p_plot, 0.0, "fuera", "orange", dash=False, width=2)
+        self.p_plot = plot("P — COM vs support (torso, >0 = outside)", -1.5, 1.5)
+        hline(self.p_plot, 0.0, "outside", "orange", dash=False, width=2)
         self.p_curve = curve(self.p_plot, "P_offset", "c")
 
         # Quantity I. The dashed line is W. It saws back to zero on every
         # movement, which is the quantity working, not a glitch.
-        self.i_plot = plot("I — inmovilidad (s)", 0,
+        self.i_plot = plot("I — immobility (s)", 0,
                            max(2.0, float(self.cfg.stage3.threshold_W_seconds) * 1.5))
         hline(self.i_plot, float(self.cfg.stage3.threshold_W_seconds), "W", "orange")
         self.i_curve = curve(self.i_plot, "I_still_s", "g")
 
-        # Fase 3: la parte de la Etapa 3 que estuvo quieta. Al final del
-        # clip, si queda sobre la línea y la postura no es tumbada ni de pie,
-        # el veredicto es severe (la inmovilidad persistió, §3.5).
-        self.q_plot = plot("% de la Etapa 3 quieto (fase 3)", 0, 1)
+        # Phase 3: the share of Stage 3 that stayed still. At the end of the
+        # clip, above the line and neither lying nor standing -> severe.
+        self.q_plot = plot("Stage 3 still share (phase 3)", 0, 1)
         frac = float(self.cfg.stage3.persistent_immobility_fraction)
         if frac > 0.0:
-            hline(self.q_plot, frac, f"severe si \u2265 {100 * frac:.0f}%", (229, 57, 53),
+            hline(self.q_plot, frac, f"severe if ≥ {100 * frac:.0f}%", (229, 57, 53),
                   dash=False, at=0.2)
         self.q_curve = curve(self.q_plot, "still_fraction", (255, 213, 79))
 
         paper = grid_of((self.t_plot, self.v_plot, self.s_plot,
                          self.p_plot, self.i_plot, self.q_plot))
 
-        # ---- Experimentales -----------------------------------------------
+        # ---- Experimental --------------------------------------------------
         ex = self.cfg.experimental
         sd = self.cfg.state_display
-        # H: el disparo por H usa trigger_H_ratio (y también es el corte de
-        # «tumbado» cuando T no está medida); la recuperación, recovery_H_ratio.
-        self.h_plot = plot("H — altura vs su base [EXP]", 0, 2)
+        # H: the H trigger uses trigger_H_ratio (also the "lying" cut when T
+        # is not measured); recovery uses recovery_H_ratio.
+        self.h_plot = plot("H — height vs baseline [EXP]", 0, 2)
         for value, label, colour, at in (
-                (ex.trigger_H_ratio, "colapso", (229, 57, 53), 0.15),
-                (ex.recovery_H_ratio, "recuperado", (67, 160, 71), 0.45),
-                (ex.trigger_H_erect, "erguido", (120, 180, 120), 0.75)):
+                (ex.trigger_H_ratio, "collapse", (229, 57, 53), 0.15),
+                (ex.recovery_H_ratio, "recovered", (67, 160, 71), 0.45),
+                (ex.trigger_H_erect, "erect", (120, 180, 120), 0.75)):
             if float(value) > 0.0:
                 hline(self.h_plot, float(value), f"{label} {float(value):.2f}", colour, at=at)
         curve(self.h_plot, "H_ratio", (255, 112, 67))
 
-        # H cruda y su base: aquí se ve la base envenenada de B05 (un pico
-        # de H cruda que la base absorbe y arrastra por segundos). Eje
-        # automático, porque ese pico llegó a 98.
-        self.hraw_plot = plot("H cruda (blanco) y su base (cian) [EXP]")
+        # Raw H and its baseline: B05's poisoned baseline shows here (a raw H
+        # spike the baseline absorbs and drags for seconds). Auto axis,
+        # because that spike reached 98.
+        self.hraw_plot = plot("Raw H (white) and baseline (cyan) [EXP]")
         curve(self.hraw_plot, "H_raw", (236, 239, 241))
         curve(self.hraw_plot, "H_baseline", (0, 229, 255), dash=True)
 
-        self.ext_plot = plot("Piernas: cadera-tobillo / torso [EXP]", 0,
+        self.ext_plot = plot("Legs: hip-ankle / torso [EXP]", 0,
                              float(sd.max_extension_ratio) * 1.1)
         hline(self.ext_plot, float(sd.crouch_extension),
-              f"agachado < {float(sd.crouch_extension):.1f}", (255, 152, 0), at=0.15)
+              f"crouched < {float(sd.crouch_extension):.1f}", (255, 152, 0), at=0.15)
         hline(self.ext_plot, float(sd.standing_extension),
-              f"extendidas \u2265 {float(sd.standing_extension):.1f}", (67, 160, 71), at=0.45)
+              f"extended ≥ {float(sd.standing_extension):.1f}", (67, 160, 71), at=0.45)
         hline(self.ext_plot, float(sd.max_extension_ratio),
-              f"m\u00e1x plausible {float(sd.max_extension_ratio):.0f}", (130, 130, 130), at=0.75)
+              f"plausible max {float(sd.max_extension_ratio):.0f}", (130, 130, 130), at=0.75)
         curve(self.ext_plot, "extension_ratio", (171, 71, 188))
 
-        # R: solo se registra; no hay umbral en la configuración, así que no
-        # se dibuja ninguno inventado.
-        self.r_plot = plot("R — mu\u00f1eca a tobillo (torsos) [EXP]", 0, 3)
+        # R: logged only; the config has no threshold for it, so none is drawn.
+        self.r_plot = plot("R — wrist to ankle (torsos) [EXP]", 0, 3)
         curve(self.r_plot, "reach_proximity", (129, 212, 250))
 
-        self.vh_plot = plot("Vh — velocidad horizontal (torso/s) [EXP]", -2, 2)
+        self.vh_plot = plot("Vh — horizontal velocity (torso/s) [EXP]", -2, 2)
         walk = float(sd.walking_vh_tps)
-        hline(self.vh_plot, walk, f"caminando \u00b1{walk:.2f}", (130, 130, 130), at=0.15)
+        hline(self.vh_plot, walk, f"walking ±{walk:.2f}", (130, 130, 130), at=0.15)
         hline(self.vh_plot, -walk, "", (130, 130, 130))
         curve(self.vh_plot, "Vh_tps", (255, 241, 118))
 
-        # Lo que I compara cada cuadro: cuánto se alejó el sujeto del punto
-        # donde empezó a quedarse quieto. Sobre ε, I vuelve a cero.
+        # What I compares every frame: how far the subject moved from where
+        # it started to stay still. Above ε, I drops back to zero.
         eps = float(self.cfg.stage3.epsilon)
-        self.d_plot = plot("Desplazamiento de I (torsos) [EXP]", 0, max(0.2, 4 * eps))
-        hline(self.d_plot, eps, f"\u03b5 {eps:.2f}", "orange", at=0.15)
+        self.d_plot = plot("I displacement (torsos) [EXP]", 0, max(0.2, 4 * eps))
+        hline(self.d_plot, eps, f"ε {eps:.2f}", "orange", at=0.15)
         curve(self.d_plot, "I_displacement", (165, 214, 167))
 
-        # A (fase 8): altura 3D de la cabeza contra la gravedad, 1 = de pie.
-        # Cian la cabeza, violeta punteada la cadera. Las líneas son las
-        # bandas medidas en entrenamiento; en 8.1 ninguna etapa las usa.
+        # A (phase 8): 3D head height against gravity, 1 = standing. Cyan the
+        # head, dashed purple the hip. The lines are the severity bands (8.2)
+        # and the "reached the floor" cut (8.3).
         qa = self.cfg.as_dict().get("quantity_a", {}) or {}
-        self.a_plot = plot("A \u2014 altura 3D de la cabeza (de pie = 1) [EXP]", -0.3, 1.3)
+        self.a_plot = plot("A — 3D head height (standing = 1) [EXP]", -0.3, 1.3)
         for key, label, colour, at in (
-                ("band_standing", "de pie", (67, 160, 71), 0.15),
-                ("band_floor", "en el suelo", (229, 57, 53), 0.45)):
+                ("band_standing", "standing", (67, 160, 71), 0.15),
+                ("floor_reached", "reached floor", (255, 167, 38), 0.62),
+                ("band_floor", "on the floor", (229, 57, 53), 0.12)):
             if key in qa:
                 hline(self.a_plot, float(qa[key]), f"{label} {float(qa[key]):.2f}", colour, at=at)
         curve(self.a_plot, "A_head", (0, 229, 255))
         curve(self.a_plot, "A_hip", (186, 104, 200), dash=True)
 
+        # Four columns here: seven plots in two rows, like the Paper tab.
         experimental = grid_of((self.a_plot, self.h_plot, self.hraw_plot,
                                 self.ext_plot, self.r_plot, self.vh_plot,
-                                self.d_plot))
+                                self.d_plot), cols=4)
 
         self.curve_tabs = QTabWidget()
-        self.curve_tabs.addTab(paper, "Paper (\u00a73.4\u20133.5)")
-        self.curve_tabs.addTab(experimental, "Experimentales [EXP]")
-        layout.addWidget(self.curve_tabs)
+        self.curve_tabs.addTab(paper, "Paper (§3.4–3.5)")
+        self.curve_tabs.addTab(experimental, "Experimental [EXP]")
 
-        # El veredicto y su motivo: la regla que decidió, con sus números.
-        # A todo el ancho, visible con cualquiera de las dos pestañas.
-        self.verdict_label = QLabel("Veredicto: —")
+        # The verdict and its reason: the rule that decided, with its numbers.
+        self.verdict_label = QLabel("—")
         self.verdict_label.setWordWrap(True)
+        self.verdict_label.setTextFormat(Qt.RichText)
         self.verdict_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.verdict_label.setStyleSheet("padding: 4px;")
-        self.verdict_label.setMaximumHeight(64)
-        layout.addWidget(self.verdict_label)
+        self.verdict_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        # Sin enlazar los ejes X: pyqtgraph alinea ejes enlazados por píxel en
-        # pantalla, y con pestañas ocultas eso daba rangos sin sentido. El
-        # rango de tiempo se fija a mano en todas al redibujar.
+        # No linked X axes: pyqtgraph aligns linked axes by screen pixel, and
+        # with hidden tabs that gave nonsense ranges. The time range is set
+        # by hand on every redraw.
         self._curve_plots = (self.t_plot, self.v_plot, self.s_plot, self.p_plot,
                              self.i_plot, self.q_plot, self.a_plot, self.h_plot,
                              self.hraw_plot, self.ext_plot, self.r_plot, self.vh_plot,
@@ -411,103 +586,74 @@ class LabWindow(QWidget):
             w.addItem(c)
             self._cursors.append(c)
 
-        # Línea de tiempo: etapa por cuadro (gris = vigilando, naranja =
-        # Etapa 2, azul = Etapa 3, violeta = enfriamiento), negro donde se
-        # perdió la detección. Marcas: disparo (rojo punteado) y veredicto
-        # (color de la severidad). Las lagunas de detección fueron la clave de
-        # A08-S3; aquí se ven sin adivinarlas por cortes en las curvas.
+        # Timeline: stage per frame (grey = monitoring, orange = Stage 2,
+        # blue = Stage 3, purple = cooldown), black where detection was lost.
+        # Marks: firing (dashed red) and verdict (severity colour). Detection
+        # gaps were the key to A08-S3; here they show without guessing them
+        # from breaks in the curves.
         self.timeline = pg.PlotWidget()
-        self.timeline.setFixedHeight(46)
+        self.timeline.setFixedHeight(34)
         self.timeline.hideAxis("left")
+        self.timeline.hideAxis("bottom")
         self.timeline.setMouseEnabled(x=False, y=False)
         self.timeline.setYRange(0, 1, padding=0)
-        # SIN enlazar a las curvas: pyqtgraph alinea ejes enlazados por píxel
-        # en pantalla, y una franja a todo el ancho enlazada a una curva de un
-        # tercio mostraba 0-34 s para un clip de 10 s. El rango se fija a mano.
+        self.timeline.setToolTip("Stage per frame — grey: monitoring · orange: Stage 2 · "
+                                 "blue: Stage 3 · purple: cooldown · black: no detection")
+        # NOT linked to the curves: pyqtgraph aligns linked axes by screen
+        # pixel, and a full-width strip linked to a one-third-width curve
+        # showed 0-34 s for a 10 s clip. The range is set by hand.
         self.timeline_img = pg.ImageItem()
         self.timeline.addItem(self.timeline_img)
         self.timeline_cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("w", width=2))
         self.timeline.addItem(self.timeline_cursor)
         self._cursors.append(self.timeline_cursor)
-        layout.addWidget(self.timeline)
 
-        # --- Overlay toggles ------------------------------------------------
-        toggles_row = QHBoxLayout()
-        toggles_row.addWidget(QLabel("Show:"))
-        self.chk_skeleton = QCheckBox("Skeleton")
-        self.chk_skeleton.setChecked(True)
-        toggles_row.addWidget(self.chk_skeleton)
-        self.chk_trunk = QCheckBox("Trunk vector")
-        self.chk_trunk.setChecked(True)
-        toggles_row.addWidget(self.chk_trunk)
-        self.chk_centroid = QCheckBox("Centroid")
-        self.chk_centroid.setChecked(True)
-        toggles_row.addWidget(self.chk_centroid)
-        self.chk_support = QCheckBox("Support / COM")
-        self.chk_support.setChecked(True)
-        toggles_row.addWidget(self.chk_support)
-        self.chk_curves = QCheckBox("Curves")
-        self.chk_curves.setChecked(True)
-        self.chk_curves.toggled.connect(self._on_curves_toggled)
-        toggles_row.addWidget(self.chk_curves)
-        toggles_row.addStretch(1)
-        layout.addLayout(toggles_row)
-
-        # Source row
-        source_row = QHBoxLayout()
-        self.open_video_btn = QPushButton("Open Video…")
-        self.open_video_btn.clicked.connect(self._on_open_video)
-        source_row.addWidget(self.open_video_btn)
-        source_row.addSpacing(16)
-        source_row.addWidget(QLabel("Camera index:"))
-        self.camera_spin = QSpinBox()
-        self.camera_spin.setRange(0, 9)
-        source_row.addWidget(self.camera_spin)
-        self.camera_btn = QPushButton("Start Camera")
-        self.camera_btn.clicked.connect(self._on_toggle_camera)
-        source_row.addWidget(self.camera_btn)
-        self.close_btn = QPushButton("Close Source")
-        self.close_btn.clicked.connect(self._close_source)
-        source_row.addWidget(self.close_btn)
-        # La única forma de volver a analizar un clip ya congelado en esta
-        # sesión: una decisión explícita, que escribe un registro nuevo.
-        self.reanalyze_btn = QPushButton("Re-analizar desde 0")
-        self.reanalyze_btn.clicked.connect(self._on_reanalyze)
-        source_row.addWidget(self.reanalyze_btn)
-        source_row.addStretch(1)
-        layout.addLayout(source_row)
-
-        # Playback row (video mode only)
-        playback_row = QHBoxLayout()
-        self.play_btn = QPushButton("Play")
+        # --- Playback bar (video only) ---------------------------------------
+        playbar = QFrame()
+        playbar.setObjectName("playbar")
+        pl = QHBoxLayout(playbar)
+        pl.setContentsMargins(10, 6, 10, 6)
+        pl.setSpacing(6)
+        self.play_btn = QPushButton(PLAY_TEXT)
+        self.play_btn.setObjectName("primary")
+        self.play_btn.setMinimumWidth(96)
+        self.play_btn.setIcon(style.standardIcon(QStyle.SP_MediaPlay))
+        self.play_btn.setToolTip("Play / pause  (Space)")
         self.play_btn.clicked.connect(self._on_play_pause)
-        playback_row.addWidget(self.play_btn)
-        self.step_back_btn = QPushButton("◀ Frame")
+        pl.addWidget(self.play_btn)
+        self.step_back_btn = QPushButton()
+        self.step_back_btn.setIcon(style.standardIcon(QStyle.SP_MediaSeekBackward))
+        self.step_back_btn.setToolTip("Previous frame  (←)   ·   Shift+← one second back")
         self.step_back_btn.clicked.connect(lambda: self._step(-1))
-        playback_row.addWidget(self.step_back_btn)
-        self.step_fwd_btn = QPushButton("Frame ▶")
+        pl.addWidget(self.step_back_btn)
+        self.step_fwd_btn = QPushButton()
+        self.step_fwd_btn.setIcon(style.standardIcon(QStyle.SP_MediaSeekForward))
+        self.step_fwd_btn.setToolTip("Next frame  (→)   ·   Shift+→ one second forward")
         self.step_fwd_btn.clicked.connect(lambda: self._step(+1))
-        playback_row.addWidget(self.step_fwd_btn)
+        pl.addWidget(self.step_fwd_btn)
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.sliderPressed.connect(self._on_slider_pressed)
         self.seek_slider.sliderReleased.connect(self._on_slider_released)
         self.seek_slider.valueChanged.connect(self._on_slider_moved)
-        playback_row.addWidget(self.seek_slider, stretch=1)
+        pl.addWidget(self.seek_slider, stretch=1)
         self.time_label = QLabel("0:00 / 0:00")
-        playback_row.addWidget(self.time_label)
-        playback_row.addWidget(QLabel("Velocidad:"))
+        self.time_label.setObjectName("timeLabel")
+        pl.addWidget(self.time_label)
+        pl.addSpacing(6)
+        speed_caption = QLabel("Speed")
+        speed_caption.setObjectName("muted")
+        pl.addWidget(speed_caption)
         self.speed_box = QComboBox()
         for sp in SPEEDS:
             self.speed_box.addItem(f"{sp:g}x", sp)
         self.speed_box.setCurrentIndex(SPEEDS.index(1.0))
         self.speed_box.currentIndexChanged.connect(
             lambda i: setattr(self, "_speed", float(self.speed_box.itemData(i))))
-        playback_row.addWidget(self.speed_box)
-        layout.addLayout(playback_row)
+        pl.addWidget(self.speed_box)
 
-        # Atajos: espacio reproduce/pausa, flechas un cuadro, Mayús+flechas
-        # un segundo. Alt+flechas siguen siendo cambiar de clip en la cola.
+        # Shortcuts: space plays/pauses, arrows one frame, Shift+arrows one
+        # second. Alt+arrows stay "change clip" in the queue.
         for keys, slot in (("Space", self._on_play_pause),
                            ("Right", lambda: self._step(+1)),
                            ("Left", lambda: self._step(-1)),
@@ -516,10 +662,113 @@ class LabWindow(QWidget):
             sc = QShortcut(QKeySequence(keys), self)
             sc.activated.connect(slot)
 
-        self._build_queue_panel(layout)
+        # --- Overlay toggles (View tab) ---------------------------------------
+        view_page = QWidget()
+        vl = QVBoxLayout(view_page)
+        vl.setContentsMargins(12, 10, 12, 10)
+        vl.setSpacing(4)
+        vl.addWidget(_caption("Draw on the video"))
+        self.chk_skeleton = QCheckBox("Skeleton")
+        self.chk_trunk = QCheckBox("Trunk vector")
+        self.chk_centroid = QCheckBox("Centroid")
+        self.chk_support = QCheckBox("Support polygon / COM")
+        for chk in (self.chk_skeleton, self.chk_trunk, self.chk_centroid, self.chk_support):
+            chk.setChecked(True)
+            vl.addWidget(chk)
+        vl.addSpacing(8)
+        vl.addWidget(_caption("Panels"))
+        self.chk_curves = QCheckBox("Curves and timeline")
+        self.chk_curves.setChecked(True)
+        self.chk_curves.toggled.connect(self._on_curves_toggled)
+        vl.addWidget(self.chk_curves)
+        vl.addSpacing(8)
+        vl.addWidget(_caption("Timeline colours"))
+        for colour, text in ((theme.STAGE_COLOURS["MONITORING"], "Monitoring"),
+                             (theme.STAGE_COLOURS["CONFIRMING"], "Stage 2 · geometry (P)"),
+                             (theme.STAGE_COLOURS["OBSERVING"], "Stage 3 · observing"),
+                             (theme.STAGE_COLOURS["COOLDOWN"], "Cooldown"),
+                             ("#3c3c3c", "Detected, low visibility"),
+                             ("#000000", "No detection"),
+                             ("#ff1744", "Trigger fired (dashed mark)")):
+            vl.addWidget(_legend_row(colour, text))
+        vl.addStretch(1)
+
+        # --- Assemble -------------------------------------------------------
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(6)
+        ll.addWidget(self.alert_banner)
+        ll.addWidget(self.video_label, stretch=1)
+        ll.addWidget(playbar)
+        ll.addWidget(self.timeline)
+
+        stage_card, sc_l = _card("Stage")
+        chip_row = QHBoxLayout()
+        chip_row.addWidget(self.stage_chip)
+        chip_row.addStretch(1)
+        sc_l.addLayout(chip_row)
+        sc_l.addWidget(self.stage_label)
+
+        verdict_card, vc_l = _card("Verdict")
+        verdict_scroll = QScrollArea()
+        verdict_scroll.setWidgetResizable(True)
+        verdict_scroll.setFrameShape(QFrame.NoFrame)
+        verdict_scroll.setWidget(self.verdict_label)
+        verdict_scroll.setMinimumHeight(70)
+        vc_l.addWidget(verdict_scroll)
+
+        self.side_tabs = QTabWidget()
+        queue_page = QWidget()
+        self._build_queue_panel(queue_page)
+        # Both side tabs scroll, so the side column never sets the window's
+        # minimum height; the video column does.
+        queue_scroll = QScrollArea()
+        queue_scroll.setWidgetResizable(True)
+        queue_scroll.setFrameShape(QFrame.NoFrame)
+        queue_scroll.setWidget(queue_page)
+        self.side_tabs.addTab(queue_scroll, "Queue")
+        view_scroll = QScrollArea()
+        view_scroll.setWidgetResizable(True)
+        view_scroll.setFrameShape(QFrame.NoFrame)
+        view_scroll.setWidget(view_page)
+        self.side_tabs.addTab(view_scroll, "View")
+
+        side = QWidget()
+        side.setMinimumWidth(320)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(8)
+        sl.addWidget(stage_card)
+        sl.addWidget(verdict_card, stretch=2)
+        sl.addWidget(self.side_tabs, stretch=3)
+
+        self.top_split = QSplitter(Qt.Horizontal)
+        self.top_split.setChildrenCollapsible(False)
+        self.top_split.addWidget(left)
+        self.top_split.addWidget(side)
+        self.top_split.setStretchFactor(0, 3)
+        self.top_split.setStretchFactor(1, 2)
+        self.top_split.setSizes([900, 460])
+
+        self.curves_panel = QWidget()
+        cl = QVBoxLayout(self.curves_panel)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.addWidget(self.curve_tabs)
+
+        self.main_split = QSplitter(Qt.Vertical)
+        self.main_split.setChildrenCollapsible(False)
+        self.main_split.addWidget(self.top_split)
+        self.main_split.addWidget(self.curves_panel)
+        self.main_split.setStretchFactor(0, 3)
+        self.main_split.setStretchFactor(1, 2)
+        self.main_split.setSizes([450, 340])
+
+        root.addWidget(self.main_split, stretch=1)
+        root.addWidget(self.status_label)
 
     # ---------------------------------------------------------------- queue --
-    def _build_queue_panel(self, layout: QVBoxLayout) -> None:
+    def _build_queue_panel(self, page: QWidget) -> None:
         """The dataset pass: a folder of clips, labelled one after another.
 
         It reuses the ordinary playback path rather than running its own
@@ -528,70 +777,95 @@ class LabWindow(QWidget):
         separate fast path would label clips nobody ever sees, and the first
         disagreement with the annotation would have no way to be examined.
         """
-        queue_row = QHBoxLayout()
-        self.queue_add_btn = QPushButton("Add Folder…")
-        self.queue_add_btn.clicked.connect(self._on_queue_add_folder)
-        queue_row.addWidget(self.queue_add_btn)
-        self.queue_start_btn = QPushButton("Start Queue")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        style = self.style()
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        self.queue_start_btn = QPushButton("Start")
+        self.queue_start_btn.setObjectName("primary")
+        self.queue_start_btn.setIcon(style.standardIcon(QStyle.SP_MediaPlay))
+        self.queue_start_btn.setToolTip("Run the whole queue, labelling every clip")
         self.queue_start_btn.clicked.connect(self._on_queue_start)
-        queue_row.addWidget(self.queue_start_btn)
-        self.queue_stop_btn = QPushButton("Stop Queue")
+        buttons.addWidget(self.queue_start_btn)
+        self.queue_stop_btn = QPushButton("Stop")
+        self.queue_stop_btn.setIcon(style.standardIcon(QStyle.SP_MediaStop))
+        self.queue_stop_btn.setToolTip("Stop after the current clip, keeping every label so far")
         self.queue_stop_btn.clicked.connect(self._on_queue_stop)
-        queue_row.addWidget(self.queue_stop_btn)
+        buttons.addWidget(self.queue_stop_btn)
         self.queue_save_btn = QPushButton("Save Reviews")
+        self.queue_save_btn.setIcon(style.standardIcon(QStyle.SP_DialogSaveButton))
+        self.queue_save_btn.setToolTip("Write a labels file with the reviewed column filled in")
         self.queue_save_btn.clicked.connect(self._on_queue_save_reviews)
-        queue_row.addWidget(self.queue_save_btn)
+        buttons.addWidget(self.queue_save_btn)
+        buttons.addStretch(1)
         self.queue_clear_btn = QPushButton("Clear")
+        self.queue_clear_btn.setObjectName("danger")
+        self.queue_clear_btn.setToolTip("Empty the queue")
         self.queue_clear_btn.clicked.connect(self._on_queue_clear)
-        queue_row.addWidget(self.queue_clear_btn)
+        buttons.addWidget(self.queue_clear_btn)
+        layout.addLayout(buttons)
+
+        progress_row = QHBoxLayout()
         self.queue_progress = QProgressBar()
         self.queue_progress.setFormat("%v / %m")
-        queue_row.addWidget(self.queue_progress, stretch=1)
+        progress_row.addWidget(self.queue_progress, stretch=1)
+        layout.addLayout(progress_row)
         self.queue_score = QLabel("")
+        self.queue_score.setWordWrap(True)
         self.queue_score.setStyleSheet("font-weight: bold;")
-        queue_row.addWidget(self.queue_score)
-        layout.addLayout(queue_row)
+        layout.addWidget(self.queue_score)
+
+        self._queue_hint = QLabel("No clips yet. Use «Add Folder…» at the top to load a "
+                                  "folder of recordings.")
+        self._queue_hint.setObjectName("muted")
+        self._queue_hint.setWordWrap(True)
+        layout.addWidget(self._queue_hint)
 
         self.queue_table = QTableWidget(0, 5)
         self.queue_table.setHorizontalHeaderLabels(
-            ["video", "verdad", "detectada", "", "revisada"])
+            ["Video", "Truth", "Detected", "", "Reviewed"])
         header = self.queue_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         for col in range(1, 5):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.queue_table.verticalHeader().setVisible(False)
-        self.queue_table.setMaximumHeight(190)
+        self.queue_table.setAlternatingRowColors(True)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
         # Double-click replays one clip on its own, outside the pass, so a
         # disagreement can be inspected frame by frame without re-running the
         # whole folder.
         self.queue_table.cellDoubleClicked.connect(self._on_queue_row_opened)
-        layout.addWidget(self.queue_table)
+        layout.addWidget(self.queue_table, stretch=1)
 
-        # Revisión: moverse entre los clips ya corridos.
+        # Review: move between the clips already run.
         #
-        # El doble clic ya abría un clip suelto, pero revisar una carpeta es
-        # comparar: las situaciones de PEF-FallDB se graban con los cuatro
-        # sujetos, y lo que explica por qué tres fallan y uno acierta casi
-        # nunca está dentro de un clip — está en la diferencia entre ellos.
-        # Volver a la tabla y buscar la fila cada vez rompe esa comparación,
-        # así que aquí van los dos botones y sus atajos.
+        # Double-click already opened a single clip, but reviewing a folder
+        # is comparing: PEF-FallDB's situations are recorded with four
+        # subjects, and what explains why three fail and one succeeds is
+        # almost never inside one clip — it is in the difference between
+        # them. Going back to the table each time breaks that comparison, so
+        # the two buttons and their shortcuts live here.
         nav = QHBoxLayout()
-        self.review_prev_btn = QPushButton("◀ Clip anterior")
+        self.review_prev_btn = QPushButton("◀ Previous")
         self.review_prev_btn.clicked.connect(lambda: self._review_step(-1))
         self.review_prev_btn.setShortcut(QKeySequence("Alt+Left"))
-        self.review_prev_btn.setToolTip("Alt+←   (o doble clic en la tabla)")
+        self.review_prev_btn.setToolTip("Alt+←   (or double-click a row)")
         nav.addWidget(self.review_prev_btn)
 
-        self.review_next_btn = QPushButton("Clip siguiente ▶")
+        self.review_next_btn = QPushButton("Next ▶")
         self.review_next_btn.clicked.connect(lambda: self._review_step(+1))
         self.review_next_btn.setShortcut(QKeySequence("Alt+Right"))
-        self.review_next_btn.setToolTip("Alt+→   (o doble clic en la tabla)")
+        self.review_next_btn.setToolTip("Alt+→   (or double-click a row)")
         nav.addWidget(self.review_next_btn)
+        layout.addLayout(nav)
 
         self.review_label = QLabel("")
-        self.review_label.setStyleSheet("color: #666;")
-        nav.addWidget(self.review_label, stretch=1)
-        layout.addLayout(nav)
+        self.review_label.setObjectName("muted")
+        self.review_label.setWordWrap(True)
+        layout.addWidget(self.review_label)
 
     # -------------------------------------------------------------- sources --
     def _on_open_video(self) -> None:
@@ -625,9 +899,9 @@ class LabWindow(QWidget):
             self._enter_frozen(cached)
             self._seek_to(0)
             self._set_status(
-                f"Congelado: {Path(path).name} — el analisis de esta sesion, sin "
-                f"recalcular y sin escribir registros. Espacio para reproducir; "
-                f"\"Re-analizar desde 0\" para una pasada nueva.")
+                f"Frozen: {Path(path).name} — this session's analysis, not "
+                f"recomputed and writing no records. Space to play; "
+                f"\"Re-analyze\" for a new pass.")
             self._update_controls()
             return
         self._start_session(Path(path).stem, metadata={
@@ -638,7 +912,7 @@ class LabWindow(QWidget):
         })
         self._recorder = PassRecorder(path, self._cfg_key, self.source.fps)
         self.playing = True
-        self.play_btn.setText("Pause")
+        self._set_play_state(True)
         self.timer.start(0)  # self-scheduling loop takes over from here
         self._set_status(
             f"Video: {Path(path).name} — {self.source.frame_count} frames "
@@ -661,7 +935,7 @@ class LabWindow(QWidget):
         self._recorder = None
         self._frozen = analysis
         self.playing = False
-        self.play_btn.setText("Play")
+        self._set_play_state(False)
         self._clear_curves()
         marked: set[int] = set()
         for index in sorted(analysis.frames):
@@ -703,12 +977,12 @@ class LabWindow(QWidget):
                 com_px=res.com_px,
                 support_hull_px=res.support_hull_px,
                 com_outside=_p_side(res.quantities.get("P_offset")),
-                hud_lines=["[CONGELADO] sin recalcular"] + list(res.hud_lines),
+                hud_lines=["[FROZEN] not recomputed"] + list(res.hud_lines),
             ))
             n = len(self._frozen.events)
             self.stage_label.setText(
-                f"[CONGELADO]  etapa en este cuadro: {res.stage}   |   eventos: {n}")
-            self.stage_label.setStyleSheet("font-weight: bold; color: #4fc3f7;")
+                f"[FROZEN]  stage on this frame: {res.stage}   |   events: {n}")
+            self._set_stage_chip(res.stage, frozen=True)
         self._move_cursors(timestamp)
 
     def _on_toggle_camera(self) -> None:
@@ -727,7 +1001,7 @@ class LabWindow(QWidget):
             "source_fps_declared": self.source.fps,
         })
         self.playing = True
-        self.camera_btn.setText("Stop Camera")
+        self.camera_btn.setText(CAMERA_STOP)
         self.timer.start(0)  # self-scheduling loop; pace comes from the source
         self._set_status(
             f"Live camera {self.camera_spin.value()} — logging to {self.logger.path.name}"
@@ -763,7 +1037,7 @@ class LabWindow(QWidget):
             flush_each_row=True)
         self.frame_index = 0
         self._clear_curves()
-        self.verdict_label.setText("Veredicto: — (analizando)")
+        self.verdict_label.setText("— analyzing…")
 
     def _log_event(self, ev) -> None:
         """Write one resolved event. Called when its verdict lands, not when
@@ -969,10 +1243,10 @@ class LabWindow(QWidget):
         falls = [r for r in scored if r["clase_verdad"] != "NoFall"]
         fall_hits = sum(1 for r in falls if r["clase_verdad"] == r["clase_detectada"])
         b = binary_metrics(scored)
-        parts = [f"4 clases {hits}/{len(scored)} ({100.0 * hits / len(scored):.0f}%)"]
+        parts = [f"4-class {hits}/{len(scored)} ({100.0 * hits / len(scored):.0f}%)"]
         if falls:
-            parts.append(f"caidas exactas {fall_hits}/{len(falls)}")
-        for key, name in (("sensibilidad", "sens"), ("especificidad", "espec")):
+            parts.append(f"exact falls {fall_hits}/{len(falls)}")
+        for key, name in (("sensibilidad", "sens"), ("especificidad", "spec")):
             v = b.get(key, float("nan"))
             if v == v:                              # no NaN
                 parts.append(f"{name} {100.0 * v:.0f}%")
@@ -1032,12 +1306,12 @@ class LabWindow(QWidget):
             return
         if self._review_index is None:
             self.review_label.setText(
-                f"{len(self._queue)} clips en la cola — "
-                f"Alt+← / Alt+→ para recorrerlos")
+                f"{len(self._queue)} clips queued — "
+                f"Alt+← / Alt+→ to browse them")
             return
         nombre = self._queue[self._review_index].name
         self.review_label.setText(
-            f"clip {self._review_index + 1} de {len(self._queue)}   ·   {nombre}")
+            f"clip {self._review_index + 1} of {len(self._queue)}   ·   {nombre}")
 
     def _close_label_record(self, reason: str) -> None:
         """Finish the labels file, folding in any human corrections."""
@@ -1111,8 +1385,8 @@ class LabWindow(QWidget):
         self._frozen = None
         self._recorder = None
         self._finalise_records("Source closed.")
-        self.camera_btn.setText("Start Camera")
-        self.play_btn.setText("Play")
+        self.camera_btn.setText(CAMERA_START)
+        self._set_play_state(False)
         self.seek_slider.setRange(0, 0)
         self._update_controls()
 
@@ -1121,7 +1395,7 @@ class LabWindow(QWidget):
         if self.source is None or self.source.is_live:
             return
         self.playing = not self.playing
-        self.play_btn.setText("Pause" if self.playing else "Play")
+        self._set_play_state(self.playing)
         if self.playing and self._frozen is not None:
             # Al final del clip, reproducir vuelve a empezar.
             if self.frame_index >= self.source.frame_count - 1:
@@ -1142,7 +1416,7 @@ class LabWindow(QWidget):
         if self.source is None or self.source.is_live:
             return
         self.playing = False
-        self.play_btn.setText("Play")
+        self._set_play_state(False)
         last = max(0, self.source.frame_count - 1)
         self._seek_to(min(last, max(0, self.frame_index + delta)))
 
@@ -1168,7 +1442,7 @@ class LabWindow(QWidget):
     def _on_slider_pressed(self) -> None:
         self._user_scrubbing = True
         self.playing = False
-        self.play_btn.setText("Play")
+        self._set_play_state(False)
 
     def _on_slider_released(self) -> None:
         self._user_scrubbing = False
@@ -1209,7 +1483,7 @@ class LabWindow(QWidget):
             # recalcula, nada se registra, ningún evento puede dispararse.
             if not ok:
                 self.playing = False
-                self.play_btn.setText("Play")
+                self._set_play_state(False)
                 return
             index = self.source.current_index
             self.frame_index = index
@@ -1219,7 +1493,7 @@ class LabWindow(QWidget):
         if not ok:
             if not self.source.is_live:  # end of file
                 self.playing = False
-                self.play_btn.setText("Play")
+                self._set_play_state(False)
                 # Close any event still being judged BEFORE labelling: a clip
                 # that ends with the subject on the floor has an open event,
                 # and that event is precisely the answer the label needs.
@@ -1308,8 +1582,8 @@ class LabWindow(QWidget):
         analysis = rec.finish(events=list(self.pipeline.machine.events),
                               record_path=record, label=label)
         if analysis is None:
-            self._set_status(f"No se congelo: {rec.invalid_reason or 'pasada vacia'}. "
-                             f"Se re-analizara al volver a abrirlo.")
+            self._set_status(f"Not frozen: {rec.invalid_reason or 'empty pass'}. "
+                             f"It will be re-analyzed when reopened.")
             return
         self._cache.store(analysis)
         if not self._queue_running:
@@ -1321,10 +1595,7 @@ class LabWindow(QWidget):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         image = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(image).scaled(
-            self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.video_label.setPixmap(pixmap)
+        self.video_label.show_image(QPixmap.fromImage(image))
 
     # ----------------------------------------------------------------- plots --
     def _update_plots(self, index: int, timestamp: float, result) -> None:
@@ -1403,7 +1674,7 @@ class LabWindow(QWidget):
         for w, item in self._markers:
             w.removeItem(item)
         self._markers.clear()
-        self.verdict_label.setText("Veredicto: —")
+        self.verdict_label.setText("—")
 
     def _mark(self, t: float, colour, dash: bool, width: int = 2) -> None:
         """Una marca vertical en todas las curvas y en la línea de tiempo."""
@@ -1419,16 +1690,18 @@ class LabWindow(QWidget):
     def _show_verdict(self, events) -> None:
         """El panel del veredicto: cada evento, con la regla que lo decidió."""
         if not events:
-            self.verdict_label.setText("Veredicto: sin eventos (la Etapa 1 nunca disparo)")
+            self.verdict_label.setText("No events (Stage 1 never fired).")
             return
         lines = []
         for ev in events:
             tag = ev.verdict + (f" [{ev.severity}]" if ev.severity else "")
             # Escapado: el motivo lleva '<' y '>=', que como HTML se comían
             # el texto ("T final 3 deg = 50%" en vez de "< 30 ... >= 50%").
-            lines.append(f"<b>t={ev.timestamp:.2f}s  {html.escape(tag)}</b><br>"
+            colour = _SEVERITY_PEN.get(ev.severity, theme.MUTED)
+            lines.append(f"<span style='color:{colour}'><b>t={ev.timestamp:.2f}s  "
+                         f"{html.escape(tag)}</b></span><br>"
                          f"{html.escape(ev.reason or '—')}")
-        self.verdict_label.setText("Veredicto:<br>" + "<br>".join(lines))
+        self.verdict_label.setText("<br><br>".join(lines))
 
     def _on_alert(self, alert: Alert) -> None:
         """Screen sink for the §3.5 alert: the banner, in severity colour."""
@@ -1464,7 +1737,7 @@ class LabWindow(QWidget):
         text = (f"event at t={ev.timestamp:.2f}s  ->  {ev.verdict}"
                 + (f" [{ev.severity}]" if ev.severity else "")
                 + f"   (T={ev.t_deg:.1f} deg, V={ev.v_tps:+.2f} torso/s)"
-                + (f"\nmotivo: {ev.reason}" if ev.reason else ""))
+                + (f"\nreason: {ev.reason}" if ev.reason else ""))
         self._show_banner(text, "#37474f", 13, 6_000)
 
     def _update_stage(self, result) -> None:
@@ -1491,13 +1764,30 @@ class LabWindow(QWidget):
             self._last_perf_shown = now
             self._set_status(self.pipeline.timings.summary())
         self.stage_label.setText(text)
-        self.stage_label.setStyleSheet(
-            "font-weight: bold; color: #ff5555;" if result.event is not None
-            else "font-weight: bold;")
+        self._set_stage_chip(result.stage, fired=result.event is not None)
 
     def _on_curves_toggled(self, checked: bool) -> None:
-        for w in (self.curve_tabs, self.timeline, self.verdict_label):
+        for w in (self.curves_panel, self.timeline):
             w.setVisible(checked)
+
+    def _set_play_state(self, playing: bool) -> None:
+        """Play button text and icon for the current state."""
+        self.play_btn.setText(PAUSE_TEXT if playing else PLAY_TEXT)
+        self.play_btn.setIcon(self.style().standardIcon(
+            QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay))
+
+    def _set_stage_chip(self, stage: str, fired: bool = False, frozen: bool = False) -> None:
+        """The coloured stage chip: same colours as the timeline."""
+        name = theme.STAGE_NAMES.get(stage, stage)
+        if fired:
+            key, name = "FIRED", "Stage 1 fired"
+        elif frozen:
+            key, name = "FROZEN", f"Frozen · {name}"
+        else:
+            key = stage if stage in theme.STAGE_COLOURS else "MONITORING"
+        self.stage_chip.setText(name)
+        self.stage_chip.setStyleSheet(theme.chip_style(theme.STAGE_COLOURS[key]))
+
 
     # -------------------------------------------------------------- helpers --
     def _set_status(self, message: str, error: bool = False) -> None:
@@ -1505,7 +1795,7 @@ class LabWindow(QWidget):
         self.status_label.setStyleSheet(
             # No colour on the normal case: the theme's own text colour is
             # readable in both light and dark, which a fixed green was not.
-            "color: #cc3333; font-weight: bold;" if error else ""
+            f"color: {theme.DANGER}; font-weight: bold;" if error else ""
         )
 
     def _update_controls(self) -> None:
@@ -1532,6 +1822,7 @@ class LabWindow(QWidget):
         # accidente que ya impide abrir un video con el boton de arriba.
         self.review_prev_btn.setEnabled(not running and bool(self._queue))
         self.review_next_btn.setEnabled(not running and bool(self._queue))
+        self._queue_hint.setVisible(not self._queue)
         self._update_review_label()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)

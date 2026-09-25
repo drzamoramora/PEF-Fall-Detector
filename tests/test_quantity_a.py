@@ -260,6 +260,24 @@ class TestLabCurve(unittest.TestCase):
             self.assertIn("A_head", w._series)
             self.assertIn("A_hip", w._series)
             self.assertIn(w.a_plot, w._curve_plots)
+            # Regresion 25/09: la ventana crecia con cada grafica (alto
+            # minimo 1341 px) y en el Mac los botones de abajo quedaban fuera
+            # de la pantalla. Ahora las curvas van en un area con
+            # desplazamiento y la ventana tiene que caber en una laptop.
+            from PySide6.QtWidgets import QScrollArea
+            self.assertLessEqual(w.minimumSizeHint().height(), 760)
+            self.assertLessEqual(w.minimumSizeHint().width(), 1280)
+            for i in range(w.curve_tabs.count()):
+                self.assertIsInstance(w.curve_tabs.widget(i), QScrollArea)
+            self.assertEqual(w.curve_tabs.count(), 2)
+            # Abrir video y agregar carpeta estan siempre a la vista, arriba.
+            w.resize(1280, 760)
+            w.show()
+            QApplication.processEvents()
+            for btn in (w.open_video_btn, w.queue_add_btn):
+                self.assertTrue(btn.isVisible())
+                top_left = btn.mapTo(w, btn.rect().topLeft())
+                self.assertLess(top_left.y() + btn.height(), 120)
         finally:
             w.close()
 

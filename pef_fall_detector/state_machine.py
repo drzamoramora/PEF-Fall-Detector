@@ -55,6 +55,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -179,6 +180,10 @@ class Stage2Evaluator:
 CONFIRMED_FALL = "stage3_confirmed"
 NULLIFIED = "stage3_nullified"
 UNRESOLVED = "stage3_unresolved"
+#: Fase 8.3 (cantidad A): la cabeza nunca bajo cerca del suelo y la cadera
+#: termino elevada, asi que no hubo caida. Cuenta como NoFall y no despacha
+#: alarma. Ver Stage3Evaluator.finalise.
+NOT_DOWN = "stage3_not_down"
 MILD, MODERATE, SEVERE = "mild", "moderate", "severe"
 
 
@@ -361,7 +366,13 @@ class Stage3Evaluator:
                  persistent_still_s: float = 0.5,
                  persistent_fraction: float = 0.0,
                  getup_rise_torsos: float = 0.0,
-                 getup_window_s: float = 2.0) -> None:
+                 getup_window_s: float = 2.0,
+                 a_band_floor: float = 0.0,
+                 a_band_standing: float = 0.82,
+                 a_reach_floor: float = 0.0,
+                 a_hip_raised: float = 0.22,
+                 a_reach_before_s: float = 1.0,
+                 a_reach_after_s: float = 4.0) -> None:
         if window_s <= 0.0 or threshold_w_s <= 0.0:
             raise ValueError("window_s and threshold_w_s must be > 0")
         if final_window_s <= 0.0:
@@ -393,6 +404,31 @@ class Stage3Evaluator:
         # 0 lo apaga.
         self.getup_rise_torsos = float(getup_rise_torsos)
         self.getup_window_s = float(getup_window_s)
+        # Fase 8 (cantidad A, EXPERIMENTAL): altura 3D de la cabeza contra la
+        # gravedad, dividida por la altura de pie del mismo sujeto. Solo en
+        # modo etiquetado (finalise), igual que las fases 3 y 6a.
+        #   8.2 (a_band_floor > 0): la postura final sale de A cuando esta
+        #       calibrada; <= a_band_floor en el suelo, >= a_band_standing de
+        #       pie, en medio sentado o arrodillado.
+        #   8.3 (a_reach_floor > 0): si la cabeza nunca bajo de a_reach_floor
+        #       entre a_reach_before_s antes y a_reach_after_s despues del
+        #       disparo, y la cadera termino sobre a_hip_raised, no hubo caida.
+        #       Se abstiene si A no estaba calibrada al disparar.
+        # 0 en a_band_floor / a_reach_floor apaga cada regla.
+        if a_band_floor > 0.0 and a_band_standing <= a_band_floor:
+            raise ValueError("a_band_standing must be above a_band_floor")
+        if a_reach_before_s < 0.0 or a_reach_after_s <= 0.0:
+            raise ValueError("a_reach window must be positive")
+        self.a_band_floor = float(a_band_floor)
+        self.a_band_standing = float(a_band_standing)
+        self.a_reach_floor = float(a_reach_floor)
+        self.a_hip_raised = float(a_hip_raised)
+        self.a_reach_before_s = float(a_reach_before_s)
+        self.a_reach_after_s = float(a_reach_after_s)
+        self._a_trigger_t: float | None = None
+        self._a_ready = False
+        self._a_min = float("nan")
+        self._a_tail: list[tuple[float, float, float]] = []
         #: (timestamp, hip_y_px, torso_px) of observed frames, last
         #: getup_window_s seconds only. Image y grows downward.
         self._hip: list[tuple[float, float, float]] = []
@@ -421,6 +457,67 @@ class Stage3Evaluator:
         self._n_observed = 0
         self._n_still = 0
         self._reason = ""
+        self._clear_a()
+
+    def _clear_a(self) -> None:
+        self._a_trigger_t = None
+        self._a_ready = False
+        self._a_min = float("nan")
+        self._a_tail = []
+
+    @property
+    def a_armed(self) -> bool:
+        """Whether this episode already knows its trigger time (fase 8)."""
+        return self._a_trigger_t is not None
+
+    @property
+    def a_min_window(self) -> float:
+        """Lowest A seen in [trigger - before, trigger + after]; NaN if none."""
+        return self._a_min
+
+    def arm_a(self, trigger_t: float, calibrated: bool,
+              history: Iterable[tuple[float, float, float]] = ()) -> None:
+        """Fase 8: tie this episode to its trigger, seeding the earlier samples.
+
+        ``calibrated``: whether A was calibrated on the trigger frame. If not,
+        8.3 abstains for the whole episode — a calibration that arrives later
+        comes from the subject already back on their feet (A16-S3 on the Mac
+        calibrates 2.6 s after its fall), and would read "never went down".
+        ``history``: (timestamp, a_head, a_hip) samples from before Stage 3
+        started; the ones inside the window are kept.
+        """
+        if self._started_at is None:
+            return
+        self._a_trigger_t = float(trigger_t)
+        self._a_ready = bool(calibrated)
+        # _feed_a applies the window; older samples only pass through the tail,
+        # which trims them to final_window_s.
+        for ts, a_head, a_hip in history:
+            self._feed_a(float(ts), float(a_head), float(a_hip))
+
+    def observe_a(self, timestamp: float, a_head: float, a_hip: float) -> None:
+        """Feed Quantity A and the hip ratio of one observed frame (fase 8)."""
+        if self._started_at is None or self._resolution is not None or not self.a_armed:
+            return
+        self._feed_a(float(timestamp), float(a_head), float(a_hip))
+
+    def _feed_a(self, ts: float, a_head: float, a_hip: float) -> None:
+        t0 = self._a_trigger_t
+        if (not math.isnan(a_head) and t0 is not None
+                and t0 - self.a_reach_before_s <= ts <= t0 + self.a_reach_after_s):
+            if math.isnan(self._a_min) or a_head < self._a_min:
+                self._a_min = a_head
+        self._a_tail.append((ts, a_head, a_hip))
+        cutoff = ts - self.final_window_s
+        while len(self._a_tail) > 1 and self._a_tail[0][0] < cutoff:
+            self._a_tail.pop(0)
+
+    def _a_end(self) -> tuple[float, float]:
+        """Median A and hip ratio over the final window; NaN when unmeasured."""
+        heads = sorted(a for _t, a, _h in self._a_tail if not math.isnan(a))
+        hips = sorted(h for _t, _a, h in self._a_tail if not math.isnan(h))
+        return (heads[len(heads) // 2] if heads else float("nan"),
+                hips[len(hips) // 2] if hips else float("nan"))
 
     def observe_hip(self, timestamp: float, hip_y_px: float, torso_px: float) -> None:
         """Feed the mid-hip height of one observed frame (fase 6a)."""
@@ -593,6 +690,21 @@ class Stage3Evaluator:
         """
         if self._started_at is None or self._resolution is not None:
             return
+        a_end, hip_end = self._a_end()
+        # Fase 8.3: "¿llego al suelo?". Una caida es perdida de altura contra
+        # la gravedad; si la cabeza nunca bajo de a_reach_floor de su altura de
+        # pie alrededor del disparo y la cadera termino elevada, el cuerpo no
+        # llego al piso: se sento en un mueble o se agacho. La condicion de la
+        # cadera es la que protege al desplomado contra la pared (A17-S2:
+        # cabeza 0.44, cadera 0.07). Sin A calibrada al disparar, se abstiene.
+        if (self.a_reach_floor > 0.0 and self._a_ready and not math.isnan(self._a_min)
+                and self._a_min > self.a_reach_floor
+                and not math.isnan(hip_end) and hip_end > self.a_hip_raised):
+            self._resolution = (NOT_DOWN, "")
+            self._reason = (f"A minima {self._a_min:.2f} > {self.a_reach_floor:.2f} y "
+                            f"cadera final {hip_end:.2f} > {self.a_hip_raised:.2f}: "
+                            f"no llego al suelo")
+            return
         angles = [t for _ts, t, _e, _h in self._tail if not math.isnan(t)]
         if not angles:
             self._reason = "sin esqueleto medido en el ultimo segundo"
@@ -617,6 +729,25 @@ class Stage3Evaluator:
                                 f"{rise:.2f} torsos en {self.getup_window_s:.0f} s "
                                 f"(>= {self.getup_rise_torsos:.2f}): se esta levantando")
                 return
+        # Fase 8.2: con A calibrada, la postura final sale de A, no del angulo
+        # 2D. T no distingue caer alejandose de la camara de estar de pie
+        # (A14-S4: T 28 deg, A 0.14), ni sentado contra la pared de tumbado.
+        # La subida de cadera (6a, arriba) y la persistencia (fase 3) siguen.
+        if self.a_band_floor > 0.0 and not math.isnan(a_end):
+            fin_a = f"A final {a_end:.2f} ({fin})"
+            if a_end <= self.a_band_floor:
+                self._resolution = (CONFIRMED_FALL, SEVERE)
+                self._reason = f"{fin_a} <= {self.a_band_floor:.2f}: termino en el suelo"
+            elif a_end >= self.a_band_standing:
+                self._resolution = (NULLIFIED, MILD)
+                self._reason = f"{fin_a} >= {self.a_band_standing:.2f}: de pie, se levanto"
+            else:
+                sev = self._moderate_or_persistent()
+                self._resolution = (CONFIRMED_FALL, sev)
+                self._reason = (f"{fin_a} entre {self.a_band_floor:.2f} y "
+                                f"{self.a_band_standing:.2f}: sentado o arrodillado"
+                                f"{self._persistence_text(sev)}")
+            return
         if self._is_lying(final_t, final_h):
             self._resolution = (CONFIRMED_FALL, SEVERE)
             self._reason = f"{fin} >= {self.lying_t_deg:.0f}: termino en el suelo"
@@ -743,6 +874,7 @@ class Stage3Evaluator:
     def reset(self) -> None:
         self._started_at = None
         self._hip = []
+        self._clear_a()
         self._upright_since = None
         self._legs_extended = False
         self._max_still = 0.0

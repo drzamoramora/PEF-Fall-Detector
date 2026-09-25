@@ -136,14 +136,14 @@ class TestFrozenAfterAPass(_Base):
         self.win._step_seconds(-1.0)
         self.assertEqual(self.calls[0], before_calls, "se recalculo en modo congelado")
         self.assertEqual(self.win._plot_data, before_curves, "las curvas cambiaron")
-        self.assertTrue(self.win.stage_label.text().startswith("[CONGELADO]"))
+        self.assertTrue(self.win.stage_label.text().startswith("[FROZEN]"))
         self.assertEqual(len(self.records()), 1)
 
     def test_the_stage_shown_is_the_one_the_pass_saw_on_that_frame(self) -> None:
         self.analyse(self.a)
         seen = self.win._frozen.frames[55].stage
         self.win._seek_to(55)
-        self.assertIn(f"etapa en este cuadro: {seen}", self.win.stage_label.text())
+        self.assertIn(f"stage on this frame: {seen}", self.win.stage_label.text())
 
     def test_replaying_it_recomputes_nothing_and_writes_nothing(self) -> None:
         self.analyse(self.a)
@@ -192,7 +192,7 @@ class TestNavigationDoesNotRecord(_Base):
         self.win.load_video(str(self.a))               # volver al primero
         self.assertIsNotNone(self.win._frozen)
         self.assertFalse(self.win.playing, "congelado abre en pausa")
-        self.assertIn("Congelado", self.win.status_label.text())
+        self.assertIn("Frozen", self.win.status_label.text())
         self.assertEqual(self.calls[0], calls)
         self.assertEqual(len(self.records()), records)
 
@@ -223,7 +223,7 @@ class TestNavigationDoesNotRecord(_Base):
         self.win.playing = True
         self.drive()
         self.assertIsNone(self.win._cache.get(self.a, self.win._cfg_key))
-        self.assertIn("No se congelo", self.win.status_label.text())
+        self.assertIn("Not frozen", self.win.status_label.text())
 
     def test_a_jump_that_lands_on_the_next_frame_is_still_a_jump(self) -> None:
         # Indices stay contiguous, but the pipeline was reset: the frames after
@@ -273,8 +273,8 @@ class TestQueue(_Base):
     def test_the_queue_shows_the_37_metrics(self) -> None:
         self._run_queue()
         text = self.win.queue_score.text()
-        self.assertIn("4 clases 2/2", text)
-        self.assertIn("caidas exactas 2/2", text)
+        self.assertIn("4-class 2/2", text)
+        self.assertIn("exact falls 2/2", text)
         self.assertIn("sens 100%", text)
 
     def test_the_reason_is_on_the_label_row_and_the_tooltip(self) -> None:

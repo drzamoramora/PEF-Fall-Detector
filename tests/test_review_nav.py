@@ -141,7 +141,7 @@ class TestLoQueLaRevisionNoDebeTocar(unittest.TestCase):
         self.win._review_index = 0
         self.win._update_review_label()
         texto = self.win.review_label.text()
-        self.assertIn("1 de 1", texto)
+        self.assertIn("1 of 1", texto)
         self.assertIn("A14-S1", texto)
 
     def test_sin_clip_abierto_el_contador_explica_como_empezar(self) -> None:
