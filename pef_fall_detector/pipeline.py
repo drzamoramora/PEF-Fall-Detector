@@ -50,6 +50,7 @@ from .pose_frontend import (
 )
 from .quantities import (
     ExponentialMovingAverage,
+    GravityCalibrator,
     HeightBaseline,
     ImmobilityTimer,
     VelocityEstimator,
@@ -59,6 +60,7 @@ from .quantities import (
     centroid,
     com_support_offset,
     feet_in_contact,
+    knee_angle_3d,
     shoulder_width,
     support_polygon,
     support_width,
@@ -256,6 +258,15 @@ class FramePipeline:
         # calibration — see config.yaml).
         self._height_baseline = HeightBaseline(
             time_constant_s=float(cfg.experimental.height_baseline_time_constant_s)
+        )
+        # Quantity A (EXPERIMENTAL, fase 8): head height against gravity, 3D.
+        # Logged only — no stage reads it (fase 8.1). See quantities.py.
+        qa = cfg.as_dict().get("quantity_a", {}) or {}
+        self._a_standing_t = float(qa.get("standing_T_deg", 20.0))
+        self._a_standing_knee = float(qa.get("standing_knee_deg", 150.0))
+        self._gravity = GravityCalibrator(
+            min_standing_s=float(qa.get("min_standing_s", 0.5)),
+            max_samples=int(qa.get("max_samples", 300)),
         )
         # Stage 1 (§3.5). The formulation is a config choice, not a code
         # decision — see state_machine for the measurements behind that.
@@ -507,6 +518,18 @@ class FramePipeline:
         else:
             hud_lines.append(f"R (reach): {reach:4.2f}  [EXP]")
 
+        # --- Quantity A: head height against gravity, 3D (EXPERIMENTAL) ------
+        # Fase 8.1: measured and logged, read by no stage. Its calibration is
+        # causal (only frames up to this one), so the record is what a live
+        # device would have had.
+        a_head, a_hip = self._quantity_a(pf, t_deg, reliable, timestamp)
+        quantities["A_head"] = a_head
+        quantities["A_hip"] = a_hip
+        if math.isnan(a_head):
+            hud_lines.append("A (3D)   : -- (calibrando) [EXP]")
+        else:
+            hud_lines.append(f"A (3D)   : {a_head:4.2f}  [EXP]")
+
         # --- Quantity P: COM vs. support polygon (§3.4) ---------------------
         com_px, hull_px, p_offset, p_width = self._quantity_p(pf)
         quantities["P_offset"] = p_offset
@@ -679,6 +702,25 @@ class FramePipeline:
             com_support_offset(com, hull, pf.torso_length),
             support_width(hull, pf.torso_length),
         )
+
+    def _quantity_a(self, pf: PoseFrame, t_deg: float, reliable: bool,
+                    timestamp: float) -> tuple[float, float]:
+        """Quantity A and the hip ratio for one frame (NaN when unmeasurable).
+
+        Only reliable frames with a full world skeleton are read. A frame
+        calibrates "up" only when the subject is confidently standing: trunk
+        upright in the image (T below ``standing_T_deg``) AND legs straight in
+        3D (knee angle at least ``standing_knee_deg``). The image test keeps a
+        subject lying with straight legs from calibrating "up" sideways.
+        """
+        world = pf.world_landmarks
+        if not (reliable and pf.detected and getattr(world, "shape", None) == (33, 3)):
+            return float("nan"), float("nan")
+        knee = knee_angle_3d(world)
+        standing = (not math.isnan(t_deg) and t_deg < self._a_standing_t
+                    and not math.isnan(knee) and knee >= self._a_standing_knee)
+        self._gravity.observe(timestamp, world, standing)
+        return self._gravity.head_ratio(world), self._gravity.hip_ratio(world)
 
     def _quantity_h(self, pf: PoseFrame, dt: float, state: str | None
                     ) -> tuple[float, float, float]:

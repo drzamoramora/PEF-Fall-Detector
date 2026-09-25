@@ -367,8 +367,22 @@ class LabWindow(QWidget):
         hline(self.d_plot, eps, f"\u03b5 {eps:.2f}", "orange", at=0.15)
         curve(self.d_plot, "I_displacement", (165, 214, 167))
 
-        experimental = grid_of((self.h_plot, self.hraw_plot, self.ext_plot,
-                                self.r_plot, self.vh_plot, self.d_plot))
+        # A (fase 8): altura 3D de la cabeza contra la gravedad, 1 = de pie.
+        # Cian la cabeza, violeta punteada la cadera. Las líneas son las
+        # bandas medidas en entrenamiento; en 8.1 ninguna etapa las usa.
+        qa = self.cfg.as_dict().get("quantity_a", {}) or {}
+        self.a_plot = plot("A \u2014 altura 3D de la cabeza (de pie = 1) [EXP]", -0.3, 1.3)
+        for key, label, colour, at in (
+                ("band_standing", "de pie", (67, 160, 71), 0.15),
+                ("band_floor", "en el suelo", (229, 57, 53), 0.45)):
+            if key in qa:
+                hline(self.a_plot, float(qa[key]), f"{label} {float(qa[key]):.2f}", colour, at=at)
+        curve(self.a_plot, "A_head", (0, 229, 255))
+        curve(self.a_plot, "A_hip", (186, 104, 200), dash=True)
+
+        experimental = grid_of((self.a_plot, self.h_plot, self.hraw_plot,
+                                self.ext_plot, self.r_plot, self.vh_plot,
+                                self.d_plot))
 
         self.curve_tabs = QTabWidget()
         self.curve_tabs.addTab(paper, "Paper (\u00a73.4\u20133.5)")
@@ -388,8 +402,9 @@ class LabWindow(QWidget):
         # pantalla, y con pestañas ocultas eso daba rangos sin sentido. El
         # rango de tiempo se fija a mano en todas al redibujar.
         self._curve_plots = (self.t_plot, self.v_plot, self.s_plot, self.p_plot,
-                             self.i_plot, self.q_plot, self.h_plot, self.hraw_plot,
-                             self.ext_plot, self.r_plot, self.vh_plot, self.d_plot)
+                             self.i_plot, self.q_plot, self.a_plot, self.h_plot,
+                             self.hraw_plot, self.ext_plot, self.r_plot, self.vh_plot,
+                             self.d_plot)
         self._cursors = []
         for w in self._curve_plots:
             c = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("w", width=1))

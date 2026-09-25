@@ -103,7 +103,55 @@ EXPERIMENTAL_QUANTITIES = frozenset({
                           # apart from a fall — T/V/P/I/H all read posture,
                           # this is the only one that reads the hands. Logged
                           # only; not wired into any §3.5 stage yet.
+    "A_head",             # Quantity A (fase 8, not in the paper, in tension
+                          # with §3.2): head height above the ankles along
+                          # gravity, from the 3D world landmarks, over the
+                          # same subject's standing height. ~1 standing, ~0
+                          # on the floor. NaN until calibrated. Logged only.
+    "A_hip",              # the same for the hips (sitting on a sofa vs on
+                          # the floor). Logged only.
 })
+
+
+#: Per-frame skeleton record (EXPERIMENTAL, research mode only).
+#:
+#: Every one of the 33 MediaPipe landmarks, in image pixels (x, y, and the
+#: z MediaPipe estimates on the same pixel scale) with its visibility, plus
+#: the 33 metric world landmarks (meters, hip-centred) of the same inference.
+#: The decision pipeline reads none of this; it exists so that a candidate
+#: measurement can be evaluated on every clip, on every platform, without
+#: re-running MediaPipe. Written to its own file, never into the frame
+#: record, and only when ``logging.save_landmarks`` is true: §3.6 promises
+#: that the deployed device stores no landmark coordinates.
+LANDMARK_FIELDS: list[str] = (
+    ["frame_index", "timestamp_s", "detected"]
+    + [f"lm{i:02d}_{c}" for i in range(33) for c in ("x", "y", "z", "v")]
+    + [f"w{i:02d}_{c}" for i in range(33) for c in ("x", "y", "z")]
+)
+
+
+def landmark_row(pf) -> dict[str, Any]:
+    """The :data:`LANDMARK_FIELDS` row for one PoseFrame (blank if undetected)."""
+    row: dict[str, Any] = {
+        "frame_index": pf.frame_index,
+        "timestamp_s": f"{pf.timestamp:.4f}",
+        "detected": int(pf.detected),
+    }
+    if not pf.detected or len(pf.landmarks) != 33:
+        return row
+    for i in range(33):
+        x, y, z = pf.landmarks[i][:3]
+        row[f"lm{i:02d}_x"] = f"{x:.2f}"
+        row[f"lm{i:02d}_y"] = f"{y:.2f}"
+        row[f"lm{i:02d}_z"] = f"{z:.2f}"
+        row[f"lm{i:02d}_v"] = f"{pf.visibility[i]:.3f}"
+    if len(pf.world_landmarks) == 33:
+        for i in range(33):
+            wx, wy, wz = pf.world_landmarks[i][:3]
+            row[f"w{i:02d}_x"] = f"{wx:.4f}"
+            row[f"w{i:02d}_y"] = f"{wy:.4f}"
+            row[f"w{i:02d}_z"] = f"{wz:.4f}"
+    return row
 
 
 def csv_column(name: str) -> str:
@@ -154,6 +202,8 @@ PHASE2_FIELDS = PHASE1_FIELDS + [
     csv_column("H_raw"),
     csv_column("H_baseline"),
     csv_column("reach_proximity"),
+    csv_column("A_head"),
+    csv_column("A_hip"),
     "stage",              # §3.5 funnel position: MONITORING/CONFIRMING/COOLDOWN
     "stage1_fired",       # 1 on the exact frame the kinematic trigger fired
     "reliable",           # 1 = detection + core visibility above threshold;

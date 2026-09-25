@@ -46,6 +46,11 @@ pose: # [Phase 1] MediaPipe Pose front-end (§3.2)
 
 logging: # [Phase 1] per-frame audit CSV (§3.5 auditability)
   output_dir: "logs" # created next to the working directory if missing
+  # EXPERIMENTAL, solo investigacion: los 33 puntos del esqueleto por cuadro
+  # (imagen y 3D) en <clip>-landmarks-<fecha>.csv. Ninguna decision los lee;
+  # sirven para evaluar medidas nuevas sin volver a correr MediaPipe. En el
+  # dispositivo desplegado va en false: el §3.6 promete no guardar landmarks.
+  save_landmarks: true
 
 stage1: # [Phase 2-3] kinematic trigger (T + V), §3.4/§3.5
   threshold_T_deg: 45.0 # trunk inclination angle to arouse suspicion
@@ -323,6 +328,24 @@ stage3: # [Phase 5] immobility confirmation (I), §3.4/§3.5
     # (reclined against a wall, NotRecovered: 63.4 / 57.8 %) from every
     # other fall ending below 60 deg (0-35.3 %). Chosen on all 128 clips,
     # not on the calibration split, with only two positives. 0 disables.
+
+quantity_a: # EXPERIMENTAL (fase 8): A = altura de la cabeza sobre los tobillos
+  # en la direccion de la gravedad (puntos 3D de mundo de MediaPipe), dividida
+  # por la altura del mismo sujeto de pie. ~1 de pie, ~0.3-0.7 sentado o
+  # arrodillado, ~0 en el suelo. En tension con el §3.2, que excluye la
+  # profundidad monocular: por eso se mide antes de decidir nada.
+  # Fase 8.1: SOLO se registra (A_head_EXP, A_hip_EXP); ninguna etapa la lee.
+  #
+  # Calibracion ("arriba" y altura de pie) con el propio sujeto parado:
+  standing_T_deg: 20.0     # tronco erguido en la imagen
+  standing_knee_deg: 150.0 # y piernas rectas en 3D (180 = rectas)
+  min_standing_s: 0.5      # tiempo de pie antes de dar A (antes: NaN)
+  max_samples: 300         # cuadros de pie que se recuerdan (~10 s)
+  # Umbrales medidos en entrenamiento (25/09, notas/ANALISIS-82-90.md).
+  # En 8.1 solo se dibujan en PEF-Lab; las fases 8.2-8.3 los usarian.
+  band_floor: 0.26         # bajo esto: en el suelo (NotRecovered)
+  band_standing: 0.82      # sobre esto: de pie (Recovered)
+  floor_reached: 0.28      # "llego al suelo" cerca del disparo
 
 experimental: # signals NOT in §3.4/§3.5. See quantities.py's
   # module docstring for Quantity H's rationale,

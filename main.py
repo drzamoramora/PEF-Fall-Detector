@@ -29,7 +29,12 @@ import sys
 from pathlib import Path
 
 from pef_fall_detector.alerts import console_sink
-from pef_fall_detector.audit_log import EVENT_FIELDS, AuditLogger
+from pef_fall_detector.audit_log import (
+    EVENT_FIELDS,
+    LANDMARK_FIELDS,
+    AuditLogger,
+    landmark_row,
+)
 from pef_fall_detector.config import load_config
 from pef_fall_detector.pipeline import FramePipeline
 from pef_fall_detector.quantities import trunk_band
@@ -86,6 +91,18 @@ def run_headless(args: argparse.Namespace) -> int:
                   "record_kind": "stage1_events",
                   "config": cfg.as_dict()},
     )
+    # EXPERIMENTAL, research mode only: the full skeleton of every frame, in
+    # its own file (see audit_log.LANDMARK_FIELDS). Off unless the config asks
+    # for it — §3.6 promises a deployed device stores no landmark coordinates.
+    landmarks = None
+    if cfg.logging.as_dict().get("save_landmarks", False):
+        landmarks = AuditLogger(
+            cfg.logging.output_dir, Path(args.video).stem + "-landmarks",
+            fields=LANDMARK_FIELDS,
+            metadata={"source": str(Path(args.video).resolve()),
+                      "record_kind": "landmarks",
+                      "config": cfg.as_dict()},
+        )
     detected_frames = 0
     reliable_frames = 0
     index = 0
@@ -97,6 +114,8 @@ def run_headless(args: argparse.Namespace) -> int:
         last_timestamp = timestamp
         result = pipeline.process(frame, index, timestamp)
         logger.log_pose_frame(result.pose, extra=result.csv_extra())
+        if landmarks is not None:
+            landmarks.log(landmark_row(result.pose))
 
         if result.pose.detected:
             detected_frames += 1
@@ -125,6 +144,8 @@ def run_headless(args: argparse.Namespace) -> int:
     pipeline.close()
     source.release()
     logger.close()
+    if landmarks is not None:
+        landmarks.close()
     # Written only now, not as each event fired: Stage 2's verdict lands
     # several frames after the event is raised, so a row streamed at firing
     # time would record 'stage1_only' for every event regardless of outcome.
@@ -222,6 +243,8 @@ def run_headless(args: argparse.Namespace) -> int:
     print(f"Audit CSV : {logger.path}")
     if n_events:
         print(f"Events    : {events.path}")
+    if landmarks is not None:
+        print(f"Landmarks : {landmarks.path}")
     print(f"Run meta  : {logger.path.with_suffix('.meta.json').name} "
           f"(source, fps and the full configuration that produced this record)")
     return 0
