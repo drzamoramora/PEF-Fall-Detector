@@ -157,6 +157,7 @@ def run_headless(args: argparse.Namespace) -> int:
             "T_deg": f"{ev.t_deg:.2f}",
             "V_tps": f"{ev.v_tps:.3f}",
             "formulation": ev.formulation,
+            "trigger_source": ev.trigger_source,
             "verdict": ev.verdict,
             "severity": ev.severity,
             "max_immobility_s": ("" if math.isnan(ev.max_immobility_s)

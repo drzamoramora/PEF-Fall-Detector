@@ -223,6 +223,9 @@ EVENT_FIELDS = [
     "T_deg",
     "V_tps",
     "formulation",
+    "trigger_source",       # which Stage-1 condition raised the event: the
+                            # formulation's name, or an EXPERIMENTAL fallback,
+                            # "H" (H+V) or "A" (A drop, phase 8.4).
     "verdict",
     "severity",             # §3.3 tag: mild / moderate / severe. Defined by
                             # RECOVERY, not by impact. Empty if Stage 3 never ran.
