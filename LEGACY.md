@@ -1,6 +1,6 @@
 # Legacy snapshot — before the repository cleanup
 
-**Branch:** `legacy-pre-cleanup` · **Tag:** `v0.1.0-legacy` · **Base commit:** `2cdd99b` (branch `82-90`, 25 Sep 2026)
+**Branch:** `legacy-pre-cleanup` · **Tags:** `v0.1.1-legacy` (this state, phase 8.4) · `v0.1.0-legacy` (`7cc8ec5`, phase 8.3) · **Base commit:** `38c8df7` (branch `82-90`, 26 Sep 2026)
 
 This branch freezes the code exactly as it was before the September 2026
 cleanup. It is kept for reference and reproducibility: every result reported
@@ -10,25 +10,32 @@ branch.
 ## What this snapshot contains
 
 - The full detection funnel as used for the 82→90 work:
-  - Stage 1: score trigger (T/45 + V/−1.5 ≥ 2.6) over a 0.8 s peak window, with the experimental H fallback;
+  - Stage 1: score trigger (T/45 + V/−1.5 ≥ 2.6) over a 0.8 s peak window, with two experimental fallbacks:
+    - H + V (Quantity H);
+    - the A drop (phase 8.4): the head falls from ≥ 0.7 to ≤ 0.3 of its standing height within 1.5 s while V < −1.5 on the same frame;
   - Stage 2: support-polygon check (P);
   - Stage 3 in labelling mode: final posture, persistent immobility (phase 3), hip get-up rule (phase 6a);
   - tracker re-acquisition and no cooldown after a Stage 2 rejection (phase 4);
   - Quantity A (3D head height against gravity): severity bands (phase 8.2) and the "reached the floor" check with a 0.31 cut and abstention when A was not calibrated at the trigger (phase 8.3).
+- Every event records which Stage-1 condition raised it (`trigger_source`: score, H or A).
 - PEF-Lab GUI with the redesigned layout (English UI).
-- 562 unit tests (1 skipped).
+- 594 unit tests (1 skipped).
 
 ## Results of this snapshot
 
 PEF-FallDB, 128 clips, labelling mode, same code and `config.yaml` on both platforms.
 
-| | cloud (x86) | Mac (ARM, GUI) |
+| | cloud (x86) | Mac (ARM) |
 |---|---|---|
-| accuracy (4 classes) | 114/128 (89.1 %) | 109/128 (85.2 %) |
-| train / test (partition by actor) | 80/88 · 34/40 | 79/88 · 30/40 |
-| falls detected (any class) | 69/72 | 64/72 |
+| accuracy (4 classes) | 115/128 (89.8 %) | 110/128 (85.9 %) |
+| train / test (partition by actor) | 81/88 · 34/40 | 80/88 · 30/40 |
+| falls detected (any class) | 70/72 | 66/72 |
 | specificity, clip label | 49/56 | 49/56 |
 | specificity, dispatched alarm | 52/56 | 52/56 |
+
+`v0.1.0-legacy` (phase 8.3) gave 114/128 in the cloud and 109/128 on the Mac.
+Phase 8.4 adds A3-S2 on both platforms and, on the Mac, detects A14-S1 (with the
+wrong severity), without any new false alarm.
 
 The two platforms differ because MediaPipe's inference differs between x86 and
 ARM (see `notas/POSIBLES-CAMBIOS-DEL-DRAFT.md`, point C8). Official numbers
@@ -62,7 +69,7 @@ Status is updated once, when the cleanup is finished.
 ## How to use it
 
 ```
-git checkout legacy-pre-cleanup      # or: git checkout v0.1.0-legacy
+git checkout legacy-pre-cleanup      # or: git checkout v0.1.1-legacy (v0.1.0-legacy: phase 8.3)
 python -m unittest discover -s tests
 python main.py                       # PEF-Lab GUI
 ```

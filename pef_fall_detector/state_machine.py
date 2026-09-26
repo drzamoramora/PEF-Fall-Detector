@@ -66,6 +66,12 @@ SEQUENTIAL = "sequential"       # V fires, T confirms within a later window
 V_ONLY = "v_only"               # V alone; the single-threshold ablation
 FORMULATIONS = (SCORE, SIMULTANEOUS, SEQUENTIAL, V_ONLY)
 
+#: Stage1Trigger.last_source / TriggerEvent.trigger_source when one of the two
+#: EXPERIMENTAL fallbacks fired instead of the formulation (whose own name is
+#: used otherwise): H + V (Quantity H) and the A drop (phase 8.4).
+H_FALLBACK = "H"
+A_FALLBACK = "A"
+
 
 class Stage(Enum):
     """Where an observation sits in the §3.5 funnel."""
@@ -927,6 +933,11 @@ class TriggerEvent:
     #: fallback (Stage1Trigger.threshold_h_ratio) or T/V's own formulation
     #: was responsible.
     h_ratio: float = float("nan")
+    #: Which Stage-1 condition raised the event: the formulation's name
+    #: (``score``...), :data:`H_FALLBACK` or :data:`A_FALLBACK`. The quantity
+    #: values above say what the frame looked like; this says which rule
+    #: read them as a fall, so the record needs no re-derivation.
+    trigger_source: str = ""
     #: Why the verdict is what it is: the rule that decided, with the numbers
     #: it read. §3.5 promises that "a downstream reviewer can reconstruct the
     #: decision"; without this the reviewer has to re-derive which branch of
@@ -1063,6 +1074,36 @@ class Stage1Trigger:
             posture trajectory answers by itself. ``<= 0.0`` disables the
             requirement and the fallback reverts to the bare instantaneous
             check above.
+        threshold_a_high / threshold_a_low / a_window_s: EXPERIMENTAL
+            (phase 8.4), not in §3.4/§3.5. A third, separate condition, OR'd
+            like the H fallback and never mixed into the T/V arithmetic:
+            Quantity A (head height against gravity, ``quantities.
+            GravityCalibrator``) reaches ``threshold_a_low`` or less while a
+            reading at/above ``threshold_a_high`` exists in the last
+            ``a_window_s`` seconds, AND the body is still descending fast on
+            that same frame (V below ``threshold_v_tps``). Held ``hold_s``,
+            with its own latch.
+
+            It covers the falls the score cannot see: a collapse with the
+            trunk vertical (sitting or kneeling fall) keeps T near 0, so the
+            score stays low although the head drops to floor level. Measured
+            on PEF-FallDB (notas/TRASPASO-SESION.md, 8.4): A3-S2 has its head
+            at 9 % of standing height and a score peak of 2.3.
+
+            Why V is read on the SAME frame, not over the peak window the
+            H fallback uses: what separates a fall from lying down on purpose
+            is how the body ARRIVES near the floor. A fall is still
+            accelerated by gravity when it gets there; a controlled descent
+            brakes before (pre-impact vertical velocity, Bourke et al. 2008,
+            Med. Eng. Phys. 30:937-946). Measured when the head reaches 0.3:
+            V from -0.53 to +0.66 in the lying-down clips (B11-S1, B11-S2,
+            B12-S2), -2.8 in A3-S2. With the peak window, B12-S2 (fast kneel,
+            then a slow lie-down) raises a false alarm.
+
+            A is NaN until the subject has been seen standing, so this
+            condition cannot fire before calibration. ``threshold_a_high
+            <= 0`` disables it, the same "off by an impossible threshold"
+            convention as ``threshold_h_ratio``.
     """
 
     def __init__(
@@ -1078,6 +1119,9 @@ class Stage1Trigger:
         threshold_h_ratio: float = 0.0,
         threshold_h_erect: float = 0.0,
         h_sequence_window_s: float = 2.0,
+        threshold_a_high: float = 0.0,
+        threshold_a_low: float = 0.3,
+        a_window_s: float = 1.5,
     ) -> None:
         if formulation not in FORMULATIONS:
             raise ValueError(
@@ -1101,6 +1145,13 @@ class Stage1Trigger:
             # non-negative threshold would make "V < threshold" true for a
             # subject standing still, firing continuously.
             raise ValueError("threshold_v_tps must be negative (downward)")
+        if threshold_a_high > 0.0:
+            if threshold_a_low >= threshold_a_high:
+                # A drop needs somewhere to drop from: with low >= high a
+                # subject simply standing at A = 1.0 would satisfy both ends.
+                raise ValueError("threshold_a_low must be below threshold_a_high")
+            if a_window_s <= 0.0:
+                raise ValueError("a_window_s must be > 0")
         self.formulation = formulation
         self.threshold_t_deg = float(threshold_t_deg)
         self.threshold_v_tps = float(threshold_v_tps)
@@ -1134,14 +1185,32 @@ class Stage1Trigger:
         #: erect-sequence requirement is active. A deque, same shape as
         #: PeakWindow's own history, trimmed to h_sequence_window_s.
         self._h_history: deque[tuple[float, float]] = deque()
+        self.threshold_a_high = float(threshold_a_high)
+        self.threshold_a_low = float(threshold_a_low)
+        self.a_window_s = float(a_window_s)
+        #: Trailing (timestamp, A) readings for the A-drop condition, only
+        #: measured ones (NaN = not calibrated or not measurable), trimmed to
+        #: a_window_s. A third latch, independent of the other two for the
+        #: same reason ``_held_h`` is.
+        self._a_history: deque[tuple[float, float]] = deque()
+        self._a_condition_since: float | None = None
+        self._a_fired = False
+        #: Which condition raised the LAST firing: the formulation's name,
+        #: :data:`H_FALLBACK` or :data:`A_FALLBACK`; empty on frames that did
+        #: not fire. Read by the state machine on the same frame and stored
+        #: in the event, so the record says which rule raised it.
+        self.last_source = ""
 
     def update(self, timestamp: float, t_deg: float, v_tps: float,
-               h_ratio: float = float("nan")) -> bool:
-        """Feed one frame's T, V and (optionally) H; True on the frame that fires.
+               h_ratio: float = float("nan"),
+               a_head: float = float("nan")) -> bool:
+        """Feed one frame's T, V and (optionally) H and A; True on the frame that fires.
 
-        ``h_ratio`` only feeds the OR'd fallback described on
-        ``threshold_h_ratio`` above; every formulation's own T/V arithmetic
-        is untouched; see :meth:`_evaluate_formulation`.
+        ``h_ratio`` and ``a_head`` only feed the OR'd fallbacks described on
+        ``threshold_h_ratio`` and ``threshold_a_high`` above; every
+        formulation's own T/V arithmetic is untouched; see
+        :meth:`_evaluate_formulation`. ``last_source`` names the condition
+        that fired (the formulation first, then H, then A).
         """
         fired, v_hit = self._evaluate_formulation(timestamp, t_deg, v_tps)
         # Evaluated unconditionally, NOT short-circuited into the h_hit
@@ -1156,7 +1225,63 @@ class Stage1Trigger:
                  and h_ratio <= self.threshold_h_ratio
                  and recently_erect)
         fallback_fired = self._held_h(timestamp, h_hit and v_hit)
-        return fired or fallback_fired
+        # The RAW v_tps of this frame, not v_hit: the peak window's minimum
+        # exists only inside _evaluate_formulation, and the A condition must
+        # read V on the frame the head arrives (see threshold_a_high above).
+        # Each condition keeps its own state, so the order of the three
+        # evaluations does not matter.
+        a_fired = self._a_drop(timestamp, a_head, v_tps)
+        if fired:
+            self.last_source = self.formulation
+        elif fallback_fired:
+            self.last_source = H_FALLBACK
+        elif a_fired:
+            self.last_source = A_FALLBACK
+        else:
+            self.last_source = ""
+        return fired or fallback_fired or a_fired
+
+    def _a_drop(self, timestamp: float, a_head: float, v_tps: float) -> bool:
+        """The A-drop condition of phase 8.4, held; True on the frame it fires.
+
+        Called on every frame the trigger sees, in every stage of the
+        machine, so the history and the latch stay coherent while an event
+        is being judged (same reason as the other two conditions). Disabled
+        entirely, history included, when ``threshold_a_high <= 0``.
+        """
+        if self.threshold_a_high <= 0.0:
+            return False
+        if not math.isnan(a_head):
+            self._a_history.append((timestamp, a_head))
+        # Inclusive window: a reading exactly a_window_s old still counts.
+        # The tolerance absorbs the rounding of frame_index / fps, so the
+        # boundary frame does not come and go with floating point.
+        cutoff = timestamp - self.a_window_s - 1e-9
+        while self._a_history and self._a_history[0][0] < cutoff:
+            self._a_history.popleft()
+        # The isnan guards are defensive, as in _evaluate_formulation: IEEE
+        # comparisons are already False for NaN, and removing them changes
+        # nothing today (verified by mutation).
+        condition = (not math.isnan(a_head) and a_head <= self.threshold_a_low
+                     and not math.isnan(v_tps) and v_tps < self.threshold_v_tps
+                     and any(a >= self.threshold_a_high for _ts, a in self._a_history))
+        return self._held_a(timestamp, condition)
+
+    def _held_a(self, timestamp: float, condition: bool) -> bool:
+        """Same edge-triggered hold as :meth:`_held_h`, for the A-drop condition."""
+        if not condition:
+            self._a_condition_since = None
+            self._a_fired = False
+            return False
+        if self._a_fired:
+            return False
+        if self._a_condition_since is None:
+            self._a_condition_since = timestamp
+        if timestamp - self._a_condition_since >= self.hold_s:
+            self._a_condition_since = None
+            self._a_fired = True
+            return True
+        return False
 
     def _recently_erect(self, timestamp: float, h_ratio: float) -> bool:
         """Whether H confirmed the subject standing within the last window.
@@ -1341,6 +1466,12 @@ class Stage1Trigger:
         self._h_condition_since = None
         self._h_fired = False
         self._h_history.clear()
+        # The A readings belong to the body seen before the break; after a
+        # re-acquisition they may be another person's (same as H above).
+        self._a_history.clear()
+        self._a_condition_since = None
+        self._a_fired = False
+        self.last_source = ""
         self.last_firing_provisional = False
         self.last_score = float("nan")
         if self._peaks is not None:
@@ -1411,7 +1542,8 @@ class FallStateMachine:
                p_offset: float = float("nan"),
                i_still_s: float = float("nan"),
                extension_ratio: float = float("nan"),
-               h_ratio: float = float("nan")) -> TriggerEvent | None:
+               h_ratio: float = float("nan"),
+               a_head: float = float("nan")) -> TriggerEvent | None:
         """Advance the machine one frame; returns a NEW event, or None.
 
         Only the frame on which Stage 1 fires returns an event. Later frames
@@ -1423,13 +1555,17 @@ class FallStateMachine:
         :class:`Stage3Evaluator`'s recovery check; NaN (the default) reduces
         both to their pre-H behaviour exactly. See ``quantities.py``'s module
         docstring for what it is proposed to cover.
+
+        ``a_head``: Quantity A (EXPERIMENTAL, phase 8.4), threaded through
+        to :class:`Stage1Trigger`'s A-drop condition only. NaN (the default)
+        can never satisfy it, so omitting it reproduces 8.3 exactly.
         """
         self.just_resolved = None
         if self.descent is not None:
             self.descent.update(timestamp, v_tps)
         if self.stage is Stage.OBSERVING:
             self._advance_observing(timestamp, t_deg, i_still_s, extension_ratio, h_ratio)
-            self.trigger.update(timestamp, t_deg, v_tps, h_ratio)
+            self.trigger.update(timestamp, t_deg, v_tps, h_ratio, a_head)
             # Sin promocion aqui, a proposito: en OBSERVING el sujeto ya esta
             # en el suelo y T ronda 180, que por si solo da 4.0 de puntaje.
             # Promover ahi ascenderia a pleno a CUALQUIER evento provisional
@@ -1445,7 +1581,7 @@ class FallStateMachine:
             # The trigger keeps seeing frames so its own hold state stays
             # coherent, but a second firing cannot start while one event is
             # still being judged.
-            self.trigger.update(timestamp, t_deg, v_tps, h_ratio)
+            self.trigger.update(timestamp, t_deg, v_tps, h_ratio, a_head)
             self._promote_if_strong()
             return None
 
@@ -1456,13 +1592,13 @@ class FallStateMachine:
                 self.stage = Stage.MONITORING
                 self._resolved_at = None
             else:
-                self.trigger.update(timestamp, t_deg, v_tps, h_ratio)
+                self.trigger.update(timestamp, t_deg, v_tps, h_ratio, a_head)
                 return None
 
         if self.stage is not Stage.MONITORING:
             return None
 
-        if not self.trigger.update(timestamp, t_deg, v_tps, h_ratio):
+        if not self.trigger.update(timestamp, t_deg, v_tps, h_ratio, a_head):
             return None
 
         event = TriggerEvent(
@@ -1473,6 +1609,7 @@ class FallStateMachine:
             formulation=self.trigger.formulation,
             provisional=self.trigger.last_firing_provisional,
             h_ratio=h_ratio,
+            trigger_source=self.trigger.last_source,
         )
         self.events.append(event)
 

@@ -279,6 +279,12 @@ class FramePipeline:
         a_hip_raised = float(qa.get("hip_raised", 0.22))
         a_before = float(qa.get("reach_before_s", 1.0))
         a_after = float(qa.get("reach_after_s", 4.0))
+        # Phase 8.4: A as an additional Stage-1 condition (Stage1Trigger's
+        # A drop). Off, the trigger never reads A and 8.3 is reproduced.
+        use_a_trigger = bool(qa.get("trigger_from_a", False))
+        a_trigger_high = float(qa.get("trigger_high", 0.7)) if use_a_trigger else 0.0
+        a_trigger_low = float(qa.get("trigger_low", 0.3))
+        a_trigger_window = float(qa.get("trigger_window_s", 1.5))
         #: (timestamp, A_head, A_hip) of the last few seconds, so Stage 3 can
         #: read the second BEFORE the trigger, which it was not yet watching.
         self._a_history: deque[tuple[float, float, float]] = deque()
@@ -302,6 +308,9 @@ class FramePipeline:
                 threshold_h_erect=float(cfg.experimental.trigger_H_erect),
                 h_sequence_window_s=float(
                     cfg.experimental.trigger_H_sequence_window_s),
+                threshold_a_high=a_trigger_high,
+                threshold_a_low=a_trigger_low,
+                a_window_s=a_trigger_window,
             ),
             Stage2Evaluator(
                 window_s=float(cfg.stage2.com_eval_window_s),
@@ -587,7 +596,8 @@ class FramePipeline:
         if reliable:
             event = self.machine.update(pf.frame_index, timestamp,
                                         t_deg, v_tps, p_offset,
-                                        i_seconds, extension_ratio, h_ratio)
+                                        i_seconds, extension_ratio, h_ratio,
+                                        a_head)
             # Fase 6a: la altura de la cadera, para leer un levantarse en
             # curso al final (Stage3Evaluator.getup_rise).
             if (self.machine.stage is Stage.OBSERVING and self.machine.stage3 is not None

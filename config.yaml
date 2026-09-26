@@ -360,6 +360,18 @@ quantity_a: # EXPERIMENTAL (fase 8): A = altura de la cabeza sobre los tobillos
   hip_raised: 0.22         # la cadera final debe estar elevada (protege A17-S2)
   reach_before_s: 1.0
   reach_after_s: 4.0
+  # Phase 8.4: A as an additional Stage-1 trigger (besides the score and H).
+  # Fires when the head reaches trigger_low having been at trigger_high or
+  # above within the last trigger_window_s, while the body is still descending
+  # fast on that same frame (V < stage1.threshold_V), held
+  # stage1.trigger_hold_s. Only with A calibrated (NaN before). Catches falls
+  # with the trunk vertical (A3-S2); the V condition keeps lying down on
+  # purpose out (B11-S2, B12-S2). See Stage1Trigger and
+  # notas/TRASPASO-SESION.md (8.4).
+  trigger_from_a: true
+  trigger_high: 0.7
+  trigger_low: 0.3
+  trigger_window_s: 1.5
 
 experimental: # signals NOT in §3.4/§3.5. See quantities.py's
   # module docstring for Quantity H's rationale,
