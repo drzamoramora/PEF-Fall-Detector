@@ -70,7 +70,6 @@ from .quantities import (
     wrist_ankle_proximity,
 )
 from .state_machine import (
-    DescentTracker,
     FallStateMachine,
     Stage,
     Stage1Trigger,
@@ -301,8 +300,6 @@ class FramePipeline:
                 hold_s=float(cfg.stage1.trigger_hold_s),
                 confirm_window_s=float(cfg.stage1.confirm_window_s),
                 threshold_score=float(cfg.stage1.trigger_score),
-                threshold_score_provisional=float(
-                    cfg.stage1.trigger_score_provisional),
                 peak_window_s=float(cfg.stage1.trigger_peak_window_s),
                 threshold_h_ratio=float(cfg.experimental.trigger_H_ratio),
                 threshold_h_erect=float(cfg.experimental.trigger_H_erect),
@@ -345,11 +342,6 @@ class FramePipeline:
             cooldown_s=float(cfg.stage3.cooldown_seconds),
             cooldown_after_rejection=bool(
                 cfg.stage3.as_dict().get("cooldown_after_rejection", True)),
-            descent=DescentTracker(
-                floor_tps=float(cfg.stage2.descent_floor_tps),
-                window_s=float(cfg.stage2.descent_window_s)),
-            min_depth_tps=float(cfg.stage2.descent_min_depth_tps),
-            min_sustained_s=float(cfg.stage2.descent_min_sustained_s),
         )
         # The §3.5 output seam. No sink is attached by default: PEF-Lab adds
         # a screen banner, the headless runner a console line, and Phase 7

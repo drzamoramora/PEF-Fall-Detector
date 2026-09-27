@@ -60,7 +60,6 @@ TEST_CFG = {
         "trunk_reference_window_s": 1.0,
         "confirm_window_s": 1.0,
         "trigger_peak_window_s": 0.0,
-        "trigger_score_provisional": 0.0,
     },
     "state_display": {
         "transition_v_tps": 0.7,
@@ -79,10 +78,6 @@ TEST_CFG = {
         "com_outside_fraction": 0.5,
         "com_min_samples": 3,
         "min_foot_visibility": 0.5,
-        "descent_floor_tps": -1.0,
-        "descent_window_s": 2.0,
-        "descent_min_depth_tps": -1.3,
-        "descent_min_sustained_s": 0.40,
         "contact_band_torso": 0.15,
     },
     "stage3": {

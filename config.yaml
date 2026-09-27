@@ -18,7 +18,7 @@ pose: # [Phase 1] MediaPipe Pose front-end (§3.2)
   # las 4 sin el aciertan 0/4: el cuello de botella no es la logica del §3.4
   # ni del §3.5, es la percepcion que las alimenta.
   # CUIDADO: cambiar esto cambia los landmarks, y con ellos TODO lo calibrado
-  # encima — trigger_score, los bordes de la banda, las bandas de severidad
+  # encima — trigger_score, las bandas de severidad
   # 30/60. Ninguno de esos numeros sigue siendo valido hasta recalibrar.
   # Cuesta velocidad de inferencia, que toca el §3.6.
   # NOTA OPERATIVA: model_complexity 2 NO se puede correr en el contenedor de
@@ -109,35 +109,6 @@ stage1: # [Phase 2-3] kinematic trigger (T + V), §3.4/§3.5
     # baja a 76.4% con 91.1%; a 3.0, 72.2% / 92.9%.
     # Quien despliegue en un contexto donde perder
     # una caida sea inaceptable debe bajarlo.
-  # Banda del disparador: el borde inferior, por debajo del umbral pleno.
-  # Medido sobre PEF-FallDB, la proporcion de caidas crece de forma monotona
-  # con el puntaje, sin inversiones:
-  #     < 1.8      5.3 % caidas      2.6 - 3.5   57.7 %
-  #   1.8 - 2.2    7.1 %             > 3.5       90.9 %
-  #   2.2 - 2.6   35.7 %
-  # O sea que el puntaje se comporta como una confianza y no como un
-  # interruptor, y eso es lo que hace legitimo tratarlo por tramos.
-  # Un puntaje en la banda levanta un evento PROVISIONAL: entra al embudo
-  # igual que cualquier otro, pero solo puede terminar en alarma si la
-  # inmovilidad lo confirma (stage3_confirmed). Si resuelve por postura, o no
-  # resuelve, queda en 'provisional_unconfirmed' y se lee como NoFall.
-  # Esto no inventa mecanismo: el §3.5 ya describe un embudo donde la
-  # sospecha se confirma o se descarta, y el §3.4 ya condiciona la
-  # confirmacion a que I supere W. La banda solo le exige a la evidencia mas
-  # debil la prueba mas fuerte que el paper ya define.
-  # 0.0 desactiva la banda -> corte unico, que es la ablacion del §3.7.
-  # MEDIDO Y APAGADO. Con la banda en 2.2, sobre los 128 clips:
-  #   banda con el defecto de la marca   83/128 = 64.8 %  (sens 59.7 %)
-  #   banda con la promocion arreglada   91/120 = 75.8 %  (sens 80.6 %)
-  #   sin banda                         100/128 = 78.1 %  (sens 81.9 %)
-  # La banda arreglada quedo neutra-negativa: rechazo 17 eventos, de los
-  # cuales 7 eran ADL (bien) y 10 eran caidas (mal). La exigencia de
-  # inmovilidad no separa ADL de caida, separa a quien se queda quieto de
-  # quien no — y varias caidas reales se mueven despues.
-  # El mecanismo queda implementado y probado por si Stage 2 consigue algun
-  # dia un discriminador de verdad (ver el criterio de descenso). Hasta
-  # entonces, 0.0.
-  trigger_score_provisional: 0.0
 
   # Guarda de plausibilidad del tronco (§3.2). El §3.4 descarta T bajo
   # 0.001 px, umbral que ninguna pose real alcanza: en el clip A14 el tronco
@@ -246,33 +217,6 @@ stage2: # [Phase 4] geometric verification (P), §3.4/§3.5
     3 # fewer measurable frames than this -> verdict
     # 'inconclusive', never 'rejected'. Occluded
     # feet must not read as "no fall".
-  # Descenso controlado vs caida (§3.4). El §3.5 le da a esta etapa el trabajo
-  # de rechazar "a controlled sit-down in which COM stays within the support
-  # polygon", pero medido sobre PEF-FallDB esa premisa es falsa: los ADL que
-  # disparan ponen el COM FUERA del apoyo en el 100 % de los cuadros medibles,
-  # porque sentarse traslada el peso al mueble. Lo que si separa es la
-  # magnitud del descenso, que es como el §3.4 describe V: "a sit-down event
-  # produces a monotonic negative V over a longer window, and a fall produces
-  # a large-magnitude negative V within a short window".
-  # Se rechaza solo si el descenso fue POCO PROFUNDO **y** BREVE: un descenso
-  # corto puede ser violento (sincope) y uno lento puede ser una caida; solo
-  # fallar en ambas a la vez indica control.
-  # DESACTIVADO 03/09 tras medirlo de punta a punta. Ver el intento fallido en
-  # notas/TRASPASO-DRAFT.md: calibrado dio "pierde 1 caida de 40", medido dio
-  # "pierde 4", porque la calibracion midio el descenso sobre el CLIP ENTERO y
-  # el codigo lo evalua sobre una ventana movil que cierra 0.33 s despues del
-  # disparo. En varias caidas el descenso fuerte ocurre despues de ese cierre.
-  # Sobre los 128: gano 3 NoFall y perdio 4 caidas. Especificidad 75 -> 94 %,
-  # sensibilidad 71 -> 67 %. Para un detector de caidas ese intercambio va en
-  # la direccion equivocada: una alarma falsa molesta, una caida perdida es
-  # alguien en el suelo sin auxilio.
-  # La separacion medida (0.82 s en caidas contra 0.32 s en ADL) es real; lo
-  # que esta mal es donde se evalua. Reactivar solo tras re-calibrar con la
-  # MISMA ventana que usa el codigo.
-  descent_min_depth_tps: 0.0 # 0 desactiva el rechazo por descenso
-  descent_floor_tps: -1.0
-  descent_window_s: 2.0
-  descent_min_sustained_s: 0.40
   min_foot_visibility: 0.5 # below this, feet are occluded -> P inconclusive
   contact_band_torso:
     0.15 # §3.4 builds the support polygon from the foot
@@ -399,7 +343,7 @@ experimental: # signals NOT in §3.4/§3.5. See quantities.py's
   # against the dataset before trusting a fall
   # count or a false-alarm count produced with
   # these on — same discipline already applied to
-  # trigger_score and descent_min_depth_tps.
+  # trigger_score.
   height_baseline_time_constant_s:
     2.0
     # Quantity H: EMA time constant for the personal

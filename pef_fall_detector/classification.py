@@ -105,7 +105,7 @@ def class_for_event(verdict: str, severity: str,
 
     Everything that never reached the immobility confirmation —
     ``stage1_only``, ``stage2_confirmed``, ``stage2_inconclusive``,
-    ``stage3_unresolved``, ``provisional_unconfirmed`` — is decided by
+    ``stage3_unresolved`` — is decided by
     ``unresolved_as``, and the default is **NoFall because that is what §3.4
     says**:
 

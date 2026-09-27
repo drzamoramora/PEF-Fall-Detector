@@ -37,8 +37,9 @@ regardless of the trunk. That is an argument for the subject-plausibility
 guard, not for capping the terms: capping would be a new departure from the
 paper, and the point of this formulation is to remove one.
 
-All four are implemented and selected from ``config.yaml``, which also
-supplies the ablation §3.7 requires — "the three-stage logic is replaced
+All four are selected from ``config.yaml``; ``simultaneous`` and
+``sequential``, kept only for the ablations, live in :mod:`.ablations`. The
+configuration also supplies the ablation §3.7 requires — "the three-stage logic is replaced
 with a single-threshold pipeline and the precision drop is reported" —
 instead of it needing separate throwaway scripts. Reproduce the table with
 ``python notas/replay_disparador.py``.
@@ -59,11 +60,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
+from .ablations import SEQUENTIAL, SIMULTANEOUS, Sequential, simultaneous
+
 #: Trigger formulations. See the module docstring for why there are four.
 SCORE = "score"                 # T and V combined into one instantaneous score
-SIMULTANEOUS = "simultaneous"   # T and V above threshold in the same frame
-SEQUENTIAL = "sequential"       # V fires, T confirms within a later window
 V_ONLY = "v_only"               # V alone; the single-threshold ablation
+# SIMULTANEOUS and SEQUENTIAL (ablations only) are imported from .ablations.
 FORMULATIONS = (SCORE, SIMULTANEOUS, SEQUENTIAL, V_ONLY)
 
 #: Stage1Trigger.last_source / TriggerEvent.trigger_source when one of the two
@@ -191,83 +193,6 @@ UNRESOLVED = "stage3_unresolved"
 #: alarma. Ver Stage3Evaluator.finalise.
 NOT_DOWN = "stage3_not_down"
 MILD, MODERATE, SEVERE = "mild", "moderate", "severe"
-
-
-class DescentTracker:
-    """Qué tan profundo y qué tan sostenido fue el descenso (§3.4).
-
-    POR QUÉ EXISTE. El §3.5 le da a la Etapa 2 el trabajo de separar una caída
-    de *"a controlled sit-down in which COM stays within the support polygon"*,
-    y le da P como única herramienta. Medido sobre PEF-FallDB, esa premisa es
-    falsa: en los ADL que producen falso positivo, la Etapa 2 midió P sobre 11
-    cuadros y encontró el centro de masa **fuera** del polígono de apoyo en el
-    100 % de ellos. No es un fallo de medición — es que sentarse en un sofá
-    saca el COM de sobre los pies, porque el peso pasa al mueble. La geometría
-    dice "caída" con razón, y P sola no puede resolverlo.
-
-    QUÉ SÍ SEPARA, y el §3.4 ya lo dice: *"a sit-down event produces a
-    monotonic negative V over a longer window, and a fall produces a
-    large-magnitude negative V within a short window."* La distinción es de
-    MAGNITUD. Medido sobre los 40 clips de calibración que dispararon:
-
-        caídas          V_min mediana -3.00, tiempo bajo -1 tps  0.77 s
-        falsos positivos V_min  -1.16 y -1.39, tiempo           0.17 y 0.20 s
-
-    Se exigen las DOS condiciones para rechazar — poco profundo Y breve — no
-    una. Un descenso puede ser corto y aun así violento (una caída de síncope),
-    y puede ser lento y aun así ser una caída. Sólo cuando falla en las dos a la
-    vez se trata de un descenso controlado.
-
-    LO QUE NO RESUELVE. Un clip de calibración (B05-S1) llega a V_min = -3.13
-    con el COM fuera del apoyo: por profundidad, duración y geometría es
-    indistinguible de una caída. Probablemente alguien dejándose caer en un
-    sofá. Ninguna de las cuatro cantidades del §3.4 lo separa, y este criterio
-    lo deja pasar a propósito en lugar de apretarse hasta perder caídas reales.
-    """
-
-    def __init__(self, floor_tps: float = -1.0, window_s: float = 2.0) -> None:
-        if floor_tps >= 0.0:
-            raise ValueError("floor_tps debe ser negativo (V negativa = hacia abajo)")
-        if window_s <= 0.0:
-            raise ValueError("window_s debe ser > 0")
-        self.floor_tps = float(floor_tps)
-        self.window_s = float(window_s)
-        self._samples: list[tuple[float, float]] = []
-
-    def update(self, timestamp: float, v_tps: float) -> None:
-        if math.isnan(v_tps):
-            return
-        self._samples.append((float(timestamp), float(v_tps)))
-        cutoff = float(timestamp) - self.window_s
-        while self._samples and self._samples[0][0] < cutoff:
-            self._samples.pop(0)
-
-    @property
-    def deepest(self) -> float:
-        """V más negativa vista en la ventana. 0.0 si no hay muestras."""
-        return min((v for _ts, v in self._samples), default=0.0)
-
-    @property
-    def sustained_s(self) -> float:
-        """Racha más larga con V por debajo del piso, en segundos."""
-        best = 0.0
-        run: float | None = None
-        for ts, v in self._samples:
-            if v < self.floor_tps:
-                if run is None:
-                    run = ts
-                best = max(best, ts - run)
-            else:
-                run = None
-        return best
-
-    def is_controlled(self, min_depth_tps: float, min_sustained_s: float) -> bool:
-        """Poco profundo Y breve: un descenso controlado, no una caída."""
-        return (self.deepest > min_depth_tps
-                and self.sustained_s < min_sustained_s)
-
-    def reset(self) -> None:
-        self._samples.clear()
 
 
 class Stage3Evaluator:
@@ -922,11 +847,6 @@ class TriggerEvent:
     #: remained down (severe). Empty until Stage 3 has run.
     severity: str = ""
     max_immobility_s: float = float("nan")
-    #: Disparo de la banda inferior: la evidencia de la Etapa 1 alcanzo para
-    #: sospechar pero no para el umbral pleno. Un evento provisional solo
-    #: puede terminar en alarma si la inmovilidad lo confirma; ver
-    #: :class:`Stage1Trigger` y :meth:`FallStateMachine._resolve`.
-    provisional: bool = False
     #: Quantity H (EXPERIMENTAL, not in §3.4) at the firing frame, kept for
     #: the same auditability reason as t_deg/v_tps — including when it was
     #: NOT what fired the event, so a reviewer can see whether the H+V
@@ -1014,8 +934,8 @@ class Stage1Trigger:
     """The kinematic trigger of §3.5, in the selected formulation.
 
     Holds the state the formulations need: how long the condition has been
-    continuously true, and (for ``sequential``) whether a V event is armed
-    and waiting for T to confirm.
+    continuously true, and (for the ``sequential`` ablation, in
+    :mod:`.ablations`) whether a V event is armed and waiting for T.
 
     Args:
         formulation: one of :data:`FORMULATIONS`.
@@ -1029,11 +949,6 @@ class Stage1Trigger:
         threshold_score: for ``score`` only, the value the combined score
             must reach. 2.0 means "both quantities exactly at their own
             threshold"; above that, the two together must be more extreme.
-        threshold_score_provisional: borde inferior de la banda, para
-            ``score``. Entre este valor y ``threshold_score`` el disparador
-            sigue disparando, pero marca el evento como **provisional**.
-            0.0 desactiva la banda y el disparador vuelve a ser un corte
-            unico, que es la ablacion del §3.7.
         peak_window_s: how far back T and V may each be taken from. **0.0
             is the literal reading of §3.5** — both quantities from the same
             frame — and reproduces this class's behaviour before the
@@ -1051,8 +966,8 @@ class Stage1Trigger:
             falsely low angle and every formulation above can miss the fall
             outright. ``<= 0.0`` disables it — H is always positive when
             defined, so no real reading can satisfy the condition, the same
-            "off by an impossible threshold" convention as
-            ``stage2.descent_min_depth_tps``.
+            "off by an impossible threshold" convention used across
+            ``config.yaml``.
         threshold_h_erect / h_sequence_window_s: EXPERIMENTAL. When
             ``threshold_h_erect > 0``, the H+V fallback above additionally
             requires H to have read at/above ``threshold_h_erect`` (subject
@@ -1114,7 +1029,6 @@ class Stage1Trigger:
         hold_s: float = 0.1,
         confirm_window_s: float = 1.0,
         threshold_score: float = 2.2,
-        threshold_score_provisional: float = 0.0,
         peak_window_s: float = 0.0,
         threshold_h_ratio: float = 0.0,
         threshold_h_erect: float = 0.0,
@@ -1132,14 +1046,6 @@ class Stage1Trigger:
             raise ValueError("hold_s must be >= 0")
         if peak_window_s < 0.0:
             raise ValueError("peak_window_s must be >= 0")
-        if threshold_score_provisional < 0.0:
-            raise ValueError("threshold_score_provisional must be >= 0")
-        if threshold_score_provisional > threshold_score:
-            # Al reves la banda no existe: todo disparo sera provisional y el
-            # umbral pleno no se alcanzaria nunca. Falla ruidosamente en vez
-            # de producir un sistema que nunca confirma nada.
-            raise ValueError(
-                "threshold_score_provisional must not exceed threshold_score")
         if threshold_v_tps >= 0.0:
             # §3.5 requires the trigger to fire while V is negative. A
             # non-negative threshold would make "V < threshold" true for a
@@ -1158,20 +1064,15 @@ class Stage1Trigger:
         self.hold_s = float(hold_s)
         self.confirm_window_s = float(confirm_window_s)
         self.threshold_score = float(threshold_score)
-        self.threshold_score_provisional = float(threshold_score_provisional)
-        #: Si el ULTIMO disparo vino de la banda inferior. Lo lee la maquina
-        #: de estados en el mismo cuadro; no es historia, es el tramo de la
-        #: senal que acaba de cruzar.
-        self.last_firing_provisional = False
         #: Puntaje de ESTE cuadro, o NaN si la formulacion no calcula uno o
-        #: el cuadro no era evaluable. Lo lee la maquina de estados para
-        #: promover un evento que nacio en la banda y despues se fortalecio.
+        #: el cuadro no era evaluable. El pipeline lo registra (columna
+        #: ``trigger_score``): es lo que el disparo comparo de verdad.
         self.last_score = float("nan")
         self.peak_window_s = float(peak_window_s)
         self._peaks = PeakWindow(peak_window_s) if peak_window_s > 0.0 else None
         self._condition_since: float | None = None
-        self._armed_at: float | None = None
         self._fired = False
+        self._sequential = Sequential(confirm_window_s)
         self.threshold_h_ratio = float(threshold_h_ratio)
         #: Latch state for the H+V fallback, kept SEPARATE from
         #: ``_condition_since``/``_fired`` above so the fallback's own
@@ -1370,41 +1271,15 @@ class Stage1Trigger:
                 return self._held(timestamp, False), v_hit
             score = (t_deg / self.threshold_t_deg) + (v_tps / self.threshold_v_tps)
             self.last_score = score
-            # La banda, cuando esta configurada. El enganche y el pestillo
-            # trabajan sobre el borde INFERIOR: la condicion de sospecha es
-            # una sola y dura lo que dura, y el tramo solo decide de que
-            # clase es el evento que sale. Usar dos enganches separados haria
-            # que una senal cruzando de gris a plena reiniciara su propio
-            # tiempo de sostenimiento y perdiera el evento.
-            piso = self.threshold_score_provisional or self.threshold_score
-            disparo = self._held(timestamp, score >= piso)
-            if disparo:
-                # El tramo se lee en el cuadro del disparo, que con la ventana
-                # de pico activa ya es un maximo sobre esa ventana y no un
-                # instante suelto.
-                self.last_firing_provisional = score < self.threshold_score
-            return disparo, v_hit
+            return self._held(timestamp, score >= self.threshold_score), v_hit
 
-        if self.formulation == SIMULTANEOUS:
-            return self._held(timestamp, t_hit and v_hit), v_hit
         if self.formulation == V_ONLY:
             return self._held(timestamp, v_hit), v_hit
 
-        # SEQUENTIAL: V sustained arms the event, then T confirms it inside
-        # the window. Measured on real falls, the peaks of T and V are offset
-        # by 0.03 s to 1.8 s, which is why requiring them in the same frame
-        # loses events that both quantities clearly witnessed.
-        if self._held(timestamp, v_hit):
-            self._armed_at = timestamp
-        if self._armed_at is None:
-            return False, v_hit
-        if timestamp - self._armed_at > self.confirm_window_s:
-            self._armed_at = None
-            return False, v_hit
-        if t_hit:
-            self._armed_at = None
-            return True, v_hit
-        return False, v_hit
+        # The two readings kept only for the §3.7 ablations (ablations.py).
+        if self.formulation == SIMULTANEOUS:
+            return simultaneous(self._held, timestamp, t_hit, v_hit), v_hit
+        return self._sequential.step(self._held, timestamp, t_hit, v_hit), v_hit
 
     def _held(self, timestamp: float, condition: bool) -> bool:
         """True on the frame where ``condition`` completes its hold time.
@@ -1456,12 +1331,12 @@ class Stage1Trigger:
     def reset(self) -> None:
         """Drop all pending state (subject lost, seek, discontinuity).
 
-        Matters most for ``sequential``: an armed V event must not survive a
-        break in observation and be confirmed by a T measured on what may be
-        a different body, or a different point in the timeline.
+        Matters most for the ``sequential`` ablation: an armed V event must
+        not survive a break in observation and be confirmed by a T measured on
+        what may be a different body, or a different point in the timeline.
         """
         self._condition_since = None
-        self._armed_at = None
+        self._sequential.reset()
         self._fired = False
         self._h_condition_since = None
         self._h_fired = False
@@ -1472,7 +1347,6 @@ class Stage1Trigger:
         self._a_condition_since = None
         self._a_fired = False
         self.last_source = ""
-        self.last_firing_provisional = False
         self.last_score = float("nan")
         if self._peaks is not None:
             self._peaks.reset()
@@ -1504,16 +1378,8 @@ class FallStateMachine:
                  stage2: "Stage2Evaluator | None" = None,
                  stage3: "Stage3Evaluator | None" = None,
                  cooldown_s: float = 3.0,
-                 cooldown_after_rejection: bool = True,
-                 descent: "DescentTracker | None" = None,
-                 min_depth_tps: float = -1.3,
-                 min_sustained_s: float = 0.40) -> None:
+                 cooldown_after_rejection: bool = True) -> None:
         self.trigger = trigger
-        #: Alimentado en CADA cuadro, tambien antes del disparo: el descenso
-        #: que hay que juzgar empieza antes de que la Etapa 1 se entere.
-        self.descent = descent
-        self.min_depth_tps = float(min_depth_tps)
-        self.min_sustained_s = float(min_sustained_s)
         self.stage2 = stage2
         self.stage3 = stage3
         self.cooldown_s = float(cooldown_s)
@@ -1561,18 +1427,9 @@ class FallStateMachine:
         can never satisfy it, so omitting it reproduces 8.3 exactly.
         """
         self.just_resolved = None
-        if self.descent is not None:
-            self.descent.update(timestamp, v_tps)
         if self.stage is Stage.OBSERVING:
             self._advance_observing(timestamp, t_deg, i_still_s, extension_ratio, h_ratio)
             self.trigger.update(timestamp, t_deg, v_tps, h_ratio, a_head)
-            # Sin promocion aqui, a proposito: en OBSERVING el sujeto ya esta
-            # en el suelo y T ronda 180, que por si solo da 4.0 de puntaje.
-            # Promover ahi ascenderia a pleno a CUALQUIER evento provisional
-            # por el mero hecho de estar acostado, que es el mismo agujero
-            # que la regla evita al no mirar "stage3_confirmed". La
-            # promocion pertenece a la ventana en que la evidencia del
-            # DISPARO se esta formando, no a la que observa el desenlace.
             return None
 
         if self.stage is Stage.CONFIRMING:
@@ -1582,7 +1439,6 @@ class FallStateMachine:
             # coherent, but a second firing cannot start while one event is
             # still being judged.
             self.trigger.update(timestamp, t_deg, v_tps, h_ratio, a_head)
-            self._promote_if_strong()
             return None
 
         if self.stage is Stage.COOLDOWN:
@@ -1607,7 +1463,6 @@ class FallStateMachine:
             t_deg=t_deg,
             v_tps=v_tps,
             formulation=self.trigger.formulation,
-            provisional=self.trigger.last_firing_provisional,
             h_ratio=h_ratio,
             trigger_source=self.trigger.last_source,
         )
@@ -1635,21 +1490,8 @@ class FallStateMachine:
         if not self.stage2.ready(timestamp):
             return
         verdict = self.stage2.verdict()
-        # El §3.5 encarga a la Etapa 2 separar una caida de un descenso
-        # controlado. P sola no puede: medido, los ADL que disparan ponen el
-        # COM fuera del apoyo en el 100 % de los cuadros medibles, porque
-        # sentarse traslada el peso al mueble. El descenso si separa, y el
-        # §3.4 ya lo dice al describir V. Ver DescentTracker.
-        # min_depth_tps >= 0 desactiva el rechazo: V negativa es hacia abajo,
-        # asi que "mas superficial que 0" no lo cumple ningun descenso real.
-        # Ver config.yaml y notas/TRASPASO-DRAFT.md para por que esta apagado.
-        by_descent = (self.descent is not None and self.min_depth_tps < 0.0
-                      and self.descent.is_controlled(self.min_depth_tps,
-                                                     self.min_sustained_s))
-        if by_descent:
-            verdict = REJECTED
         if self._pending is not None:
-            self._pending.reason = self._stage2_text(verdict, by_descent)
+            self._pending.reason = self._stage2_text(verdict)
             self._pending.verdict = verdict
             self._pending.p_outside_fraction = self.stage2.outside_fraction_seen
             self._pending.p_samples = self.stage2.samples
@@ -1666,11 +1508,9 @@ class FallStateMachine:
         self.stage3.observe(timestamp, t_deg, i_still_s, extension_ratio, h_ratio)
         self.stage = Stage.OBSERVING
 
-    def _stage2_text(self, verdict: str, by_descent: bool) -> str:
+    def _stage2_text(self, verdict: str) -> str:
         """Stage 2's outcome in words. Stage 3 overwrites it if it runs."""
         n = self.stage2.samples
-        if by_descent:
-            return "Etapa 2: descenso controlado (no es una caida)"
         if verdict == INCONCLUSIVE:
             return (f"Etapa 2: pies no medibles ({n} muestras de P "
                     f"< {self.stage2.min_samples})")
@@ -1765,71 +1605,8 @@ class FallStateMachine:
         self._resolve(timestamp)
         return closed
 
-    #: Veredicto de un evento provisional que no llego a confirmarse por
-    #: inmovilidad. No es ``stage2_rejected`` —ninguna etapa dictamino que no
-    #: hubo derribo— ni ``stage3_unresolved`` —el embudo si termino—: es que
-    #: la evidencia de la Etapa 1 nunca alcanzo el umbral pleno y nada
-    #: posterior la respaldo.
-    PROVISIONAL_UNCONFIRMED = "provisional_unconfirmed"
-
-    def _promote_if_strong(self) -> None:
-        """Un evento que nacio debil y despues se fortalecio deja de ser debil.
-
-        POR QUE HACE FALTA. El enganche corre sobre el borde INFERIOR de la
-        banda, asi que el evento se levanta cuando el puntaje lleva
-        ``hold_s`` por encima de 2.2 — que en una caida real ocurre mientras
-        el puntaje todavia esta subiendo. Medido en A04-S1: cruza 2.2 en
-        t=2.60, dispara en t=2.70, cruza 2.6 en t=2.73 y llega a 3.32. Sin
-        esta promocion ese evento queda marcado provisional para siempre por
-        trece centesimas, y la marca termina dependiendo de una carrera entre
-        el reloj del enganche y la pendiente de la señal en vez de la fuerza
-        de la evidencia.
-
-        SOLO EN CONFIRMING. En OBSERVING el sujeto ya esta en el suelo y T
-        ronda 180, que da 4.0 por si solo: promover ahi ascenderia cualquier
-        evento provisional por el mero hecho de estar acostado. La ventana de
-        promocion es aquella en que la evidencia del DISPARO todavia se
-        forma.
-
-        El puntaje se lee del disparador, que se sigue alimentando en cada
-        cuadro mientras el evento se juzga — no se recalcula aqui, para que
-        haya un solo sitio donde la formulacion viva.
-        """
-        if self._pending is None or not self._pending.provisional:
-            return
-        score = getattr(self.trigger, "last_score", float("nan"))
-        if not math.isnan(score) and score >= self.trigger.threshold_score:
-            self._pending.provisional = False
-
     def _resolve(self, timestamp: float, event: TriggerEvent | None = None) -> None:
         resuelto = event if event is not None else self._pending
-        # La banda inferior entra al embudo, pero no sale sola. El §3.4
-        # condiciona la confirmacion a que I supere W —"if I exceeds a
-        # confirmation threshold W, the event is classified as a confirmed
-        # fall"— y a un evento que ya venia debil se le exige exactamente esa
-        # evidencia, no una mas barata. Un evento pleno sigue resolviendose
-        # como hasta ahora.
-        #
-        # La prueba es I >= W medido, NO el veredicto "stage3_confirmed". Los
-        # dos coinciden en linea, pero en modo etiquetado (defer_to_end) la
-        # Etapa 3 resuelve por la POSTURA final, asi que ahi
-        # "stage3_confirmed" significa "termino en el suelo" y no "estuvo
-        # inmovil". Con esa lectura la banda admitiria a cualquiera que
-        # termine tumbado —incluida la persona que se acuesta en la cama, que
-        # es justo el falso positivo que hay que frenar—. Preguntar por I
-        # directamente dice lo mismo en los dos modos.
-        if resuelto is not None and resuelto.provisional:
-            w = self.stage3.threshold_w_s if self.stage3 is not None else None
-            inmovil = (w is not None
-                       and not math.isnan(resuelto.max_immobility_s)
-                       and resuelto.max_immobility_s >= w)
-            if not inmovil:
-                resuelto.verdict = self.PROVISIONAL_UNCONFIRMED
-                resuelto.severity = ""
-                i_max = resuelto.max_immobility_s
-                resuelto.reason = (
-                    "disparo provisional (banda gris) sin quietud >= W: I max "
-                    + ("no medida" if math.isnan(i_max) else f"{i_max:.1f} s"))
         self.just_resolved = resuelto
         self._pending = None
         if (not self.cooldown_after_rejection and resuelto is not None
@@ -1865,9 +1642,6 @@ class FallStateMachine:
             self.stage2.reset()
         if self.stage3 is not None:
             self.stage3.reset()
-        # El tracker NO se limpia aqui: describe el movimiento del cuerpo, no
-        # el estado del embudo, y una laguna corta de deteccion no borra el
-        # descenso que ya ocurrio.
         self._pending = None
         self.stage = Stage.MONITORING
         self._resolved_at = None

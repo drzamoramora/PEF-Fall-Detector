@@ -117,17 +117,16 @@ class TestMachineReasons(unittest.TestCase):
         m.stage2.start(0.0)
         for p in (0.4, 0.4, -0.2, -0.3):          # 2 of 4 outside
             m.stage2.observe(p)
-        self.assertIn("50% >= 50%", m._stage2_text(CONFIRMED, False))
-        self.assertIn("descenso controlado", m._stage2_text(REJECTED, True))
+        self.assertIn("50% >= 50%", m._stage2_text(CONFIRMED))
         m.stage2.reset()
         m.stage2.start(0.0)
         for p in (0.4, -0.2, -0.3, -0.1):         # 1 of 4 outside
             m.stage2.observe(p)
-        self.assertIn("25% < 50% (4 muestras)", m._stage2_text(REJECTED, False))
+        self.assertIn("25% < 50% (4 muestras)", m._stage2_text(REJECTED))
         m.stage2.reset()
         m.stage2.start(0.0)
         m.stage2.observe(0.4)
-        self.assertIn("pies no medibles (1 muestras", m._stage2_text(INCONCLUSIVE, False))
+        self.assertIn("pies no medibles (1 muestras", m._stage2_text(INCONCLUSIVE))
 
     def test_abandoned_event_says_so_and_keeps_what_it_had(self) -> None:
         m = self._machine()

@@ -465,9 +465,6 @@ class LabWindow(QWidget):
         hline(self.s_plot, float(self.cfg.stage1.trigger_score),
               f"fires ≥ {float(self.cfg.stage1.trigger_score):.1f}", (229, 57, 53),
               dash=False, width=2)
-        provisional = float(getattr(self.cfg.stage1, "trigger_score_provisional", 0.0) or 0.0)
-        if provisional > 0.0:
-            hline(self.s_plot, provisional, f"band {provisional:.1f}", (255, 152, 0), at=0.5)
         self.s_curve = curve(self.s_plot, "trigger_score", (255, 255, 255))
 
         # Quantity P. Zero is the whole decision line: the sign says inside

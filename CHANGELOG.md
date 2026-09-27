@@ -13,6 +13,22 @@ every per-frame value), checked with `tools/replay.py` and
 x86 and Mac ARM). One branch per block (`cleanup-b0` … `cleanup-b9`), each
 starting from the previous one, and one development version per block.
 
+### 0.2.0.dev1 — B1: dead code out (branch `cleanup-b1`)
+
+- Removed the provisional trigger band (`stage1.trigger_score_provisional`,
+  the `provisional` event flag, its promotion and the
+  `provisional_unconfirmed` verdict) and the controlled-descent rejection
+  of Stage 2 (`DescentTracker`, `stage2.descent_*`), with their tests
+  (`test_zona_gris.py`, `test_descent.py`). Both were switched off in
+  `config.yaml`. Why they were switched off, with the measurements, is kept
+  in `notas/DESCARTADOS.md`.
+- `simultaneous` and `sequential` moved to `pef_fall_detector/ablations.py`.
+  They are still chosen with `stage1.trigger_formulation`, for the §3.7
+  ablations; `score` and `v_only` stay in `state_machine.py`.
+- Verified: replays of the phase-8.4 landmarks with 0.2.0.dev0 and with this
+  version are identical on both platforms (128/128 clips). The only
+  configuration difference is the five keys removed.
+
 ### 0.2.0.dev0 — B0: verification base (branch `cleanup-b0`)
 
 - `tools/replay.py`: replays a recorded run from its 33-landmark record
