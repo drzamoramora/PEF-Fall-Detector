@@ -17,7 +17,8 @@ otherwise produce a CSV that looks complete and is not.
 thresholds produced it, at what frame rate it was captured, or with which
 version of the code — and those are precisely the facts a calibration has
 to cite. A ``.meta.json`` sidecar carries them, so any record can be traced
-back to the exact configuration that generated it.
+back to the exact configuration that generated it, and to the code: the
+release (``code_version``) and the git commit (``git_commit``, ``git_dirty``).
 
 **It lands where it is expected.** A relative output folder is resolved
 against the repository root, not against whatever directory the program was
@@ -30,13 +31,72 @@ source and closing it without recording anything leaves no trace.
 from __future__ import annotations
 
 import csv
+import functools
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .config import REPO_ROOT
+
+
+@functools.lru_cache(maxsize=1)
+def git_provenance() -> dict[str, Any]:
+    """The git commit the code runs from, and whether the code differs from it.
+
+    ``code_version`` says which release a record came from; this says which
+    exact code, including whether it was uncommitted work (``git_dirty``).
+    Both are None when the code is not a git checkout of its own (a copied
+    package, a machine without git): a record says "unknown" rather than
+    borrow the commit of some enclosing repository. Read once per process,
+    since the code already loaded cannot change while it runs. What counts
+    as "dirty" is :func:`_code_differs`.
+    """
+    def git(*args: str) -> str:
+        # --no-optional-locks: reading the state must never take the index
+        # lock that the author's own git command may be holding.
+        return subprocess.run(["git", "--no-optional-locks", *args], cwd=REPO_ROOT,
+                              capture_output=True, text=True, timeout=5,
+                              check=True).stdout
+
+    unknown = {"git_commit": None, "git_dirty": None}
+    try:
+        if Path(git("rev-parse", "--show-toplevel").strip()).resolve() != REPO_ROOT.resolve():
+            return unknown
+        commit = git("rev-parse", "HEAD").strip()
+        # Not stripped: in porcelain output a leading space is part of the
+        # status code of the first entry.
+        dirty = _code_differs(git("status", "--porcelain", "-z", "--untracked-files=all"))
+    except (OSError, subprocess.SubprocessError):
+        return unknown
+    return {"git_commit": commit, "git_dirty": dirty}
+
+
+def _code_differs(porcelain: str) -> bool:
+    """Whether ``git status --porcelain -z`` says the running code is not HEAD.
+
+    Any change to a tracked file counts. An untracked file counts only when it
+    is code the detector runs: a ``.py`` file inside the package (imported the
+    moment something names it, committed or not; B4 splits ``state_machine``
+    into new modules), or an untracked ``main.py`` / ``config.yaml``. New
+    notes, tools, tests or a Finder ``.DS_Store`` do not change what the
+    detector decides, so they leave a record clean.
+    """
+    for entry in porcelain.split("\0"):
+        if not entry:
+            continue
+        status, path = entry[:2], entry[3:]
+        if status != "??":
+            # Any tracked change, a rename included, answers at once; so the
+            # old path that -z lists after a rename is never read as an entry.
+            return True
+        if (path.startswith("pef_fall_detector/") and path.endswith(".py")) \
+                or path in ("main.py", "config.yaml"):
+            return True
+    return False
+
 
 #: Phase-1 schema — pose front-end and Step-0 normalization.
 PHASE1_FIELDS = [
@@ -255,7 +315,8 @@ class AuditLogger:
         metadata: facts about the run — source, frame rate, frame size, and
             ideally a snapshot of the configuration — written to
             ``<record>.meta.json`` when the first row is recorded. The
-            schema, the code version and a timestamp are added automatically.
+            schema, the code version, the git commit and a timestamp are
+            added automatically.
         flush_each_row: push every row to the operating system as it is
             written, instead of letting Python's buffer fill first. Off by
             default because a per-frame record writes tens of rows a second
@@ -366,6 +427,7 @@ class AuditLogger:
             schema=self.fields,
             rows=self.rows_written,
             code_version=__version__,
+            **git_provenance(),
             written_at=datetime.now().isoformat(timespec="seconds"),
         )
         side = self.path.with_suffix(".meta.json")

@@ -47,7 +47,7 @@ esto es el mapa.
 - Rama `legacy-pre-cleanup`: la foto antes de la limpieza, con `LEGACY.md`.
   - Etiqueta `v0.1.0-legacy` (`7cc8ec5` = `2cdd99b` + `LEGACY.md`): el estado de la 8.3.
   - Etiqueta `v0.1.1-legacy` (26/09): el estado de la 8.4, con `LEGACY.md` actualizado.
-- Push pendiente (lo hace el autor): `git push origin 82-90 legacy-pre-cleanup --tags`.
+- Push hecho (verificado el 26/09): en `origin` están `82-90` = `38c8df7`, `legacy-pre-cleanup` = `6eb3e70` y las etiquetas `v0.1.0-legacy` y `v0.1.1-legacy`.
 - Solo queda `.DS_Store` sin rastrear.
 
 ### Resultados de la 8.4 (PEF-FallDB, 128 clips, modo etiquetado)
@@ -183,7 +183,7 @@ Límites que ya se saben:
 
 ## 6. Pendientes, en orden
 
-1. Push (autor): `git push origin 82-90 legacy-pre-cleanup --tags`.
+1. ~~Push~~: hecho (26/09).
 2. Actualizar `POSIBLES-CAMBIOS-DEL-DRAFT.md`: las cifras de la 8.2 a la 8.4, el disparo por A con su sustento (Bourke et al. 2008; Wu 2000) y el conteo corregido de H. El paper lo escribe el autor.
 3. Guardar `rep84.py` (replay) y la corrida de la nube de la 8.4 en `respaldo-nube/` (pedir permiso).
 4. Congelar la configuración antes de la evaluación final y reportar entrenamiento y prueba por separado (C31).
@@ -213,6 +213,18 @@ Decisiones de las 36 preguntas:
 | B9 | `pyproject.toml` (`pef-lab`, `pef-run`); dependencias núcleo/GUI/desarrollo + lock generado en el Mac; `.gitignore` completo; `notas/archivo/` + `notas/README.md`; archivar `replay_disparador` y `verificar_mediciones`; README reescrito en inglés |
 
 Al terminar, actualizar `LEGACY.md` en `legacy-pre-cleanup` con lo realmente hecho.
+
+### B0 (26/09, rama `cleanup-b0`, sin commit todavía)
+
+- Hecho: `tools/replay.py`, `tools/compare_runs.py`, `tools/metrics.py` y `tools/_records.py`; `git_commit` y `git_dirty` en cada `.meta.json`; versión `0.2.0.dev0`; `CHANGELOG.md`; `tests/test_tools.py`.
+- Verificado:
+  - lote real del Mac `logs/cli-b0` contra `logs/cli-a84`: 128/128 clips idénticos en cuadros, eventos y 33 puntos (byte a byte); en los `.meta.json` solo cambian versión, commit, `git_dirty`, fecha y `output_dir`;
+  - replay de los 33 puntos con el código de `38c8df7` y con el de B0: idéntico en el Mac y en la nube (`corridas/nube-8.4.tar.xz`), 110 y 115/128.
+- Agregado después de la revisión:
+  - `git_dirty` cuenta también los `.py` nuevos sin `git add` dentro de `pef_fall_detector/` (importa en B4);
+  - `compare_runs.py --landmarks` compara los 33 puntos (para corridas reales) y avisa de cualquier valor de configuración distinto entre las corridas (importa en B2).
+- Queda para después: portar `diag81` y agregar a `metrics.py` porcentajes, intervalos de Wilson y FP por hora (C32).
+- Para verificar un bloque: `python tools/compare_runs.py logs/cli-a84 logs/<nuevo> --landmarks` con un lote real, o dos replays con `tools/replay.py --repo`.
 
 Claude Code en la nube puede hacer el código y las pruebas unitarias, pero no tiene los videos. La verificación de los 128 clips la corre el autor en su Mac, contra una corrida de referencia hecha antes de empezar.
 
