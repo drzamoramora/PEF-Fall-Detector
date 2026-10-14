@@ -179,6 +179,12 @@ class QueuePanel(QWidget):
         self.progress.setValue(row + 1)
         self.score.setText(score)
 
+    def set_reviewed(self, row: int, cls: str) -> None:
+        """Fill the human column (a run opened with its reviews)."""
+        box = self.table.cellWidget(row, 4)
+        if box is not None:
+            box.setCurrentText(cls)
+
     def reviewed(self, row: int) -> str | None:
         """The human column of one row; None if the row has no box."""
         box = self.table.cellWidget(row, 4)

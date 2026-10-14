@@ -235,17 +235,28 @@ Claude Code en la nube puede hacer el código y las pruebas unitarias, pero no t
 - B9: hecho (pyproject, dependencias, `.gitignore`, `notas/archivo/`, README); falta generar `requirements.txt` con `pip freeze` en el Mac.
 - Falta: commitear B2–B9, un lote real del Mac contra `logs/cli-a84` con el mapa de B5, y actualizar `LEGACY.md` en `legacy-pre-cleanup` (después de los commits: cambiar de rama con trabajo sin commit lo pondría en riesgo).
 
-## 8. Cómo correr y verificar (desde B9)
+### Estado de los registros (14/10, rama `registros`, 0.3.0.dev0)
 
-- Instalar: ver el README (`pip install -r requirements.txt` y `pip install -e ".[gui,dev]" --no-deps`).
-- Pruebas: `python -m unittest discover -s tests` (las de PEF-Lab se omiten sin PySide6). Estilo: `python -m ruff check .`.
-- GUI: `pef-lab` (o `python main.py`).
+- R0–R7 hechos sin correr clips: formato nuevo (carpeta por corrida, `run.json`, huellas, landmarks exactos npz + csv, hash por cuadro, tiempos), `metrics.csv/.txt`, CLI (`--clips`, `--resume`, `--compare-to`, ETA, códigos de salida, `pef-compare/metrics/replay/export`), GUI (Results, Open Run…, nombre de la corrida, Export Figure, reviews en la corrida).
+- Verificado en el Mac (14/10): pruebas y GUI bien; lote completo idéntico a `logs-historicos/cli-a84`; replay exacto; `pef-export --check` idéntico; `--clips` y `--resume` funcionan; `tests/data/e2e` regenerado en el formato nuevo. `presence` se dejó de grabar (MediaPipe la deja en 0).
+- Referencias nuevas: Mac `logs/2026-10-14_0411-macos-arm64-recordings` (110/128) y nube x86 `logs/2026-10-14_0413-linux-x86_64-recordings` (115/128, idéntica a `nube-8.4`).
+- Diagnóstico x86/ARM hecho: la diferencia viene casi toda del decodificador de video (ver `DIAGNOSTICO-X86-ARM.md`); siguiente paso, la prueba YUV (idea 5 de `IDEAS.md`).
+
+## 8. Cómo correr y verificar (desde 0.3.0.dev0, registros esquema 2)
+
+- Instalar: ver el README (`pip install -r requirements.txt` y `pip install -e ".[gui,dev]" --no-deps`; después de agregar comandos nuevos, volver a correr `pip install -e ".[gui,dev]" --no-deps` para que existan).
+- Pruebas: `python -m unittest discover -s tests -t .` (las de PEF-Lab se omiten sin PySide6). Estilo: `python -m ruff check .`.
+- GUI: `pef-lab` (o `python main.py`). Botones nuevos: *Open Run…*, pestaña *Results*, *Export Figure*.
 - Lote en el Mac (el modo por defecto, despliegue, no escribe nada; el lote necesita `--mode research`):
-  `pef-run --folder ../recordings --mode research --output-dir logs/X --quiet`
-- Métricas: `python tools/metrics.py logs/X [logs/Y]`.
-- Comparar dos corridas: `python tools/compare_runs.py logs/A logs/B --landmarks`. Contra una corrida anterior a 0.2.0.dev5 (por ejemplo `logs/cli-a84`): agregar `--map tools/maps/b5.json`.
-- Replay sin MediaPipe: `python tools/replay.py logs/X /tmp/salida [--repo OTRO-CHECKOUT]`.
-- Diagnóstico de A (`diag81.py`) y los demás scripts de la nube: siguen en `respaldo-nube/scripts/`, sin portar.
+  `pef-run --folder ../recordings --mode research --quiet`
+  → crea `logs/<fecha>_<hora>-<plataforma>-recordings/` con `run.json`, `dataset-labels.csv`, `metrics.csv`, `metrics.txt`, `clips/` y `landmarks/` (npz y csv).
+- Opciones: `--clips A01-S1,B12-S2`, `--compare-to logs/REFERENCIA`, `--resume logs/CORRIDA`. Código de salida: 0 bien, 1 algún clip falló, 2 la comparación encontró diferencias.
+- Métricas: `pef-metrics logs/X [logs/Y]` (`--write` las guarda en la corrida).
+- Comparar dos corridas: `pef-compare logs/A logs/B --landmarks`. Lee los dos formatos; contra una corrida anterior a 0.2.0.dev5 (por ejemplo `../logs-historicos/cli-a84`) aplica `tools/maps/b5.json` solo.
+- Replay sin MediaPipe: `pef-replay logs/X /tmp/salida [--repo OTRO-CHECKOUT]`. Desde una corrida del esquema 2 es exacto.
+- Landmarks: `pef-export logs/X --check` comprueba que el CSV y el npz tienen los mismos números.
+- Las corridas viejas (formato suelto) están en `Paper Fall/logs-historicos/` (ver su `LEEME.md`); la referencia es `cli-a84`.
+- Diagnóstico de A (`diag81.py`) y los demás scripts de la nube: siguen en `Paper Fall/respaldos/respaldo-nube/scripts/`, sin portar.
 
 ## 9. Notas
 

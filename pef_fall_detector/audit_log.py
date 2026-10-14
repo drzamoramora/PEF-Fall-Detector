@@ -174,21 +174,34 @@ EXPERIMENTAL_QUANTITIES = frozenset({
 })
 
 
-#: Per-frame skeleton record (EXPERIMENTAL, research mode only).
+#: Per-frame skeleton record, as text (EXPERIMENTAL, research mode only).
 #:
 #: Every one of the 33 MediaPipe landmarks, in image pixels (x, y, and the
 #: z MediaPipe estimates on the same pixel scale) with its visibility, plus
 #: the 33 metric world landmarks (meters, hip-centred) of the same inference.
-#: The decision pipeline reads none of this; it exists so that a candidate
-#: measurement can be evaluated on every clip, on every platform, without
-#: re-running MediaPipe. Written to its own file, never into the frame
+#: The decision pipeline reads none of this; it exists so that
+#: a candidate measurement can be evaluated on every clip, on every platform,
+#: without re-running MediaPipe. Written to its own file, never into the frame
 #: record, and only in research mode (``records.RunRecords``): §3.6 promises
 #: that the deployed device stores no landmark coordinates.
+#:
+#: Exact since records schema 2 (0.3.0.dev0): every value is written with
+#: ``repr``, the shortest text that reads back as the same float, so the CSV
+#: and the binary ``landmarks/npz`` hold the same numbers. Schema 1 rounded
+#: them (0.01 px, 0.001, 0.1 mm). MediaPipe's presence score is not recorded:
+#: the ``mp.solutions.pose`` API pinned here leaves it at 0 for every landmark
+#: (measured on the 128 clips, 14/10/2026), so it carried no information.
 LANDMARK_FIELDS: list[str] = (
     ["frame_index", "timestamp_s", "detected"]
     + [f"lm{i:02d}_{c}" for i in range(33) for c in ("x", "y", "z", "v")]
     + [f"w{i:02d}_{c}" for i in range(33) for c in ("x", "y", "z")]
 )
+
+
+def _exact(value) -> str:
+    """The shortest text that reads back as the same float; blank for NaN."""
+    value = float(value)
+    return "" if value != value else repr(value)
 
 
 def landmark_row(pf) -> dict[str, Any]:
@@ -202,16 +215,16 @@ def landmark_row(pf) -> dict[str, Any]:
         return row
     for i in range(33):
         x, y, z = pf.landmarks[i][:3]
-        row[f"lm{i:02d}_x"] = f"{x:.2f}"
-        row[f"lm{i:02d}_y"] = f"{y:.2f}"
-        row[f"lm{i:02d}_z"] = f"{z:.2f}"
-        row[f"lm{i:02d}_v"] = f"{pf.visibility[i]:.3f}"
+        row[f"lm{i:02d}_x"] = _exact(x)
+        row[f"lm{i:02d}_y"] = _exact(y)
+        row[f"lm{i:02d}_z"] = _exact(z)
+        row[f"lm{i:02d}_v"] = _exact(pf.visibility[i])
     if len(pf.world_landmarks) == 33:
         for i in range(33):
             wx, wy, wz = pf.world_landmarks[i][:3]
-            row[f"w{i:02d}_x"] = f"{wx:.4f}"
-            row[f"w{i:02d}_y"] = f"{wy:.4f}"
-            row[f"w{i:02d}_z"] = f"{wz:.4f}"
+            row[f"w{i:02d}_x"] = _exact(wx)
+            row[f"w{i:02d}_y"] = _exact(wy)
+            row[f"w{i:02d}_z"] = _exact(wz)
     return row
 
 
@@ -272,6 +285,26 @@ PHASE2_FIELDS = PHASE1_FIELDS + [
 ]
 
 
+#: Records schema 2 (0.3.0.dev0): what a frame's record adds to PHASE2_FIELDS.
+#:
+#: ``frame_sha1``: the first 16 hex digits of the SHA-1 of the decoded image
+#: MediaPipe received. Two computers that disagree on a frame's landmarks
+#: either decoded different images (the hashes differ: the video decoder) or
+#: ran the same image through the model differently (the hashes agree: the
+#: inference). Without it the two causes cannot be told apart.
+PROVENANCE_FIELDS = ["frame_sha1"]
+
+#: The computer's side of a frame: milliseconds spent reading it from the
+#: source, in MediaPipe and in our own analysis, and once per second the CPU
+#: use (100 = one core busy) and the peak memory of the process. They measure
+#: the machine, not the scene: two runs never agree on them, and the
+#: comparison tools never read them.
+PERFORMANCE_FIELDS = ["decode_ms", "pose_ms", "analysis_ms", "cpu_pct", "peak_rss_mb"]
+
+#: The frame record of a schema-2 run (``clips/<clip>/frames.csv``).
+FRAME_FIELDS = PHASE2_FIELDS + PROVENANCE_FIELDS + PERFORMANCE_FIELDS
+
+
 #: Event-record schema (§3.5). One row per Stage-1 firing, as opposed to the
 #: per-frame CSV: an alarm is reconstructed from a handful of events, not by
 #: scanning thousands of frames. It carries the quantity values that caused
@@ -329,6 +362,14 @@ class AuditLogger:
             ended without a clean close left a 0-byte event file that had, in
             fact, recorded a confirmed fall. A flush is one ``write`` syscall
             — not an ``fsync`` — so the cost on a handful of rows is nil.
+        filename: an exact file name inside ``output_dir``, instead of
+            ``<source>-<stamp>.csv`` (records schema 2, ``run_folder``). An
+            existing file of that name is refused, never overwritten.
+        sidecar: write the ``.meta.json`` (schema 1). Schema 2 keeps those
+            facts once per run in ``run.json`` and once per clip in
+            ``clip.json``, so its records go without.
+        append: with ``filename``, add rows to the file if it exists (a
+            resumed run's labels), provided its columns are the same.
     """
 
     def __init__(
@@ -338,6 +379,9 @@ class AuditLogger:
         fields: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         flush_each_row: bool = False,
+        filename: str | None = None,
+        sidecar: bool = True,
+        append: bool = False,
     ) -> None:
         self.fields = fields or PHASE2_FIELDS
         self._metadata = dict(metadata or {})
@@ -346,9 +390,15 @@ class AuditLogger:
         if not out.is_absolute():
             out = REPO_ROOT / out
         self._output_dir = out
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in source_name)
-        self.path = out / f"{safe}-{stamp}.csv"
+        self._exact_name = filename is not None
+        self._sidecar = bool(sidecar)
+        self._append = bool(append) and filename is not None
+        if filename is not None:
+            self.path = out / filename
+        else:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in source_name)
+            self.path = out / f"{safe}-{stamp}.csv"
         self._fh = None
         self._writer: csv.DictWriter | None = None
         self._closed = False
@@ -365,6 +415,22 @@ class AuditLogger:
         nothing already on disk is ever overwritten.
         """
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        if self._append and self.path.exists():
+            # A resumed run adds its rows to the file it started; only a file
+            # with the very same columns, so a row never lands under the
+            # wrong header.
+            with open(self.path, newline="", encoding="utf-8") as fh:
+                header = next(csv.reader(fh), [])
+            if header != self.fields:
+                raise ValueError(f"cannot append to {self.path}: its columns differ")
+            self._fh = open(self.path, "a", newline="", encoding="utf-8")
+            self._writer = csv.DictWriter(self._fh, fieldnames=self.fields,
+                                          extrasaction="raise")
+            return
+        if self._exact_name and self.path.exists():
+            # A schema-2 record lives in its clip's own folder under a fixed
+            # name: finding one there means a run is being written twice.
+            raise FileExistsError(f"record already exists: {self.path}")
         if self.path.exists():
             stem, n = self.path.stem, 2
             while (candidate := self.path.with_name(f"{stem}-{n}.csv")).exists():
@@ -442,7 +508,8 @@ class AuditLogger:
         self._fh.close()
         self._fh = None
         self._writer = None
-        self._write_metadata()
+        if self._sidecar:
+            self._write_metadata()
 
     def __enter__(self) -> "AuditLogger":
         return self

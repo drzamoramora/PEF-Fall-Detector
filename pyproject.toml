@@ -46,7 +46,12 @@ dev = [
 
 [project.scripts]
 pef-lab = "main:main"      # PEF-Lab (GUI); same options as python main.py
-pef-run = "main:run"       # headless: --video FILE or --folder DIR
+pef-run = "main:run"       # headless: --video FILE, --folder DIR or --resume RUN
+# The tools/ scripts, for runs already recorded (pef_fall_detector/cli.py).
+pef-compare = "pef_fall_detector.cli:compare_main"   # two runs, clip by clip
+pef-metrics = "pef_fall_detector.cli:metrics_main"   # a run's numbers
+pef-replay = "pef_fall_detector.cli:replay_main"     # a run through the code, no MediaPipe
+pef-export = "pef_fall_detector.cli:export_main"     # landmarks npz -> csv, or --check
 
 [tool.setuptools]
 py-modules = ["main"]

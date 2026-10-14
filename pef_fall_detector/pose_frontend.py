@@ -121,6 +121,13 @@ class PoseFrame:
     reacquired: bool = False
     world_landmarks: np.ndarray = field(default_factory=lambda: np.empty((0, 3)))
     world_torso_length: float | None = None
+    #: MediaPipe's own output, before de-normalisation: (33, 3) float32,
+    #: x and y in [0, 1] of the image, z on x's scale. ``landmarks`` is this
+    #: times (width, height, width). Kept so the landmark record can be exact
+    #: (landmark_arrays). Empty when not detected, or for a frame not built by
+    #: the front end.
+    landmarks_norm: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32))
 
     def normalize(self, distance_px: float) -> float:
         """Express a pixel distance in torso lengths (Step-0 normalization).
@@ -214,6 +221,10 @@ class PoseFrontend:
         # De-normalize to pixel space (see module docstring for rationale).
         landmarks = np.array([[lm.x * width, lm.y * height, lm.z * width] for lm in raw])
         visibility = np.array([lm.visibility for lm in raw])
+        # The same numbers before de-normalising, for the exact landmark
+        # record. float32 is what MediaPipe computed in: converting its Python
+        # floats back loses nothing.
+        landmarks_norm = np.array([[lm.x, lm.y, lm.z] for lm in raw], dtype=np.float32)
 
         mid_hip, mid_shoulder, torso_length = compute_step0(landmarks)
         core_visibility = float(visibility[list(CORE_LANDMARKS)].min())
@@ -253,6 +264,7 @@ class PoseFrontend:
             reacquired=reacquired,
             world_landmarks=world_landmarks,
             world_torso_length=world_torso_length,
+            landmarks_norm=landmarks_norm,
         )
 
     def _watch_tracker(self, timestamp: float, core_visibility: float) -> None:

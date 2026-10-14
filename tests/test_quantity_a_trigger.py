@@ -432,7 +432,7 @@ class TestRecords(unittest.TestCase):
                     main.run_headless(args)
             finally:
                 main.load_config, main.VideoFileSource, main.FramePipeline = saved
-            path = sorted(Path(tmp).glob("*-events-*.csv"))[0]
+            path = sorted(Path(tmp).glob("*/clips/*/events.csv"))[0]
             with path.open(newline="") as fh:
                 rows = list(csv.DictReader(fh))
         self.assertEqual([r["trigger_source"] for r in rows], [A_FALLBACK])
@@ -451,7 +451,7 @@ class TestRecords(unittest.TestCase):
                                    pipeline=SimpleNamespace(machine=SimpleNamespace(events=[ev])))
             LabWindow._log_event(fake, ev)
             records.close([ev])
-            with next(Path(tmp).glob("clip-events*.csv")).open(newline="") as fh:
+            with (Path(tmp) / "clips" / "clip" / "events.csv").open(newline="") as fh:
                 rows = list(csv.DictReader(fh))
         self.assertEqual(rows[0]["trigger_source"], A_FALLBACK)
 

@@ -16,16 +16,27 @@ loop, frozen review and the queue pass; what it shows lives beside it:
 Video-mode controls: Play/Pause, single-frame step (◀ / ▶), and a seek bar —
 falls last 10–15 frames, so being able to stop on the exact frame where a
 stage fired is the whole point of this tool.
+
+Records schema 2 (0.3.0.dev0): every pass writes into a run folder
+(``run_folder``), as ``main.py`` does. A clip opened on its own or the camera
+is a run of its own; a queue pass is one run with all its clips, its labels
+and its metrics, shown in the Results tab. "Open Run…" loads a run recorded
+earlier (here or with ``pef-run``) and shows any of its clips frozen, rebuilt
+from its landmarks without MediaPipe; "Save Reviews" then adds the human
+column to that run. The status line names the run being written, and
+"Export Figure" saves the video and the curves as a PNG into its folder.
 """
 
 from __future__ import annotations
 
+import csv
 import html
 import math
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 from PySide6.QtCore import Qt, QTimer
@@ -37,6 +48,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -48,14 +60,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import pose_frontend, run_metrics
 from ..alerts import Alert
 from ..audit_log import AuditLogger
-from ..config import PARTITION_PATH, Config
-from ..dataset import LABEL_FIELDS, format_confusion, label_row, video_files
-from ..evaluation import pass_summary
+from ..config import Config
+from ..dataset import LABEL_FIELDS, VIDEO_SUFFIXES, format_confusion, label_row, video_files
 from ..overlay import draw_overlay
 from ..pipeline import FramePipeline
 from ..records import RunRecords
+from ..run_folder import (
+    CAMERA,
+    DATASET,
+    LABELS_FILE,
+    REVIEWED_LABELS_FILE,
+    VIDEO,
+    RunFolder,
+    file_sha256,
+)
 from ..sources import CameraSource, FrameSource, VideoFileSource
 from . import theme
 from .plots import SEVERITY_PEN, PlotPanel
@@ -124,6 +145,17 @@ class LabWindow(QWidget):
         self._queue_index = 0
         self._queue_running = False
         self._label_logger: AuditLogger | None = None
+        # Run folders (records schema 2). ``_session_run``: the run of a clip
+        # opened on its own or of the camera, closed with its source.
+        # ``_queue_run``: the run of the queue pass in progress. ``_last_run``:
+        # the run the Results tab, "Save Reviews" and "Export Figure" refer to
+        # (the last queue pass, or the run opened with "Open Run…").
+        self._session_run: RunFolder | None = None
+        self._queue_run: RunFolder | None = None
+        self._last_run: RunFolder | None = None
+        #: A run opened with "Open Run…": its records by clip stem and its config.
+        self._opened_run: SimpleNamespace | None = None
+        self._clip_sha = ""
         # Frozen analysis (see review_cache.py): what a full pass computed,
         # to review without recomputing or writing records.
         self._cache = ReviewCache()
@@ -203,6 +235,12 @@ class LabWindow(QWidget):
         self.queue_add_btn.setToolTip("Load a folder of clips into the queue (see the Queue tab)")
         self.queue_add_btn.clicked.connect(self._on_queue_add_folder)
         hl.addWidget(self.queue_add_btn)
+        self.open_run_btn = QPushButton("Open Run…")
+        self.open_run_btn.setIcon(style.standardIcon(QStyle.SP_FileDialogContentsView))
+        self.open_run_btn.setToolTip("Review a run recorded earlier: its clips frozen, "
+                                     "rebuilt from its landmarks, and its metrics")
+        self.open_run_btn.clicked.connect(self._on_open_run)
+        hl.addWidget(self.open_run_btn)
         hl.addWidget(separator())
         hl.addWidget(QLabel("Camera"))
         self.camera_spin = QSpinBox()
@@ -306,6 +344,12 @@ class LabWindow(QWidget):
         self.speed_box.currentIndexChanged.connect(
             lambda i: setattr(self, "_speed", float(self.speed_box.itemData(i))))
         pl.addWidget(self.speed_box)
+        self.export_btn = QPushButton("Export Figure")
+        self.export_btn.setIcon(style.standardIcon(QStyle.SP_DialogSaveButton))
+        self.export_btn.setToolTip("Save the video and the curves, as they are on screen, "
+                                   "as a PNG in the run's figures/ folder")
+        self.export_btn.clicked.connect(self.export_figure)
+        pl.addWidget(self.export_btn)
 
         # Shortcuts: space plays/pauses, arrows one frame, Shift+arrows one
         # second. Alt+arrows stay "change clip" in the queue.
@@ -368,6 +412,18 @@ class LabWindow(QWidget):
         view_scroll.setFrameShape(QFrame.NoFrame)
         view_scroll.setWidget(self.view_panel)
         self.side_tabs.addTab(view_scroll, "View")
+        # Every number of the last queue pass or of the opened run
+        # (run_metrics): the same text as metrics.txt.
+        self.results_text = QPlainTextEdit()
+        self.results_text.setReadOnly(True)
+        self.results_text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.results_text.setObjectName("results")
+        self.results_text.setStyleSheet("font-family: Menlo, Consolas, 'DejaVu Sans Mono', "
+                                        "monospace; font-size: 11px;")
+        self.results_text.setPlaceholderText(
+            "The metrics of a queue pass appear here when it ends, "
+            "and those of a run opened with «Open Run…».")
+        self.side_tabs.addTab(self.results_text, "Results")
 
         side = QWidget()
         side.setMinimumWidth(320)
@@ -400,7 +456,15 @@ class LabWindow(QWidget):
         self.main_split.setSizes([450, 340])
 
         root.addWidget(self.main_split, stretch=1)
-        root.addWidget(self.status_label)
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.addWidget(self.status_label, stretch=1)
+        # Which run the records go to: what a screenshot needs to say.
+        self.run_label = QLabel("")
+        self.run_label.setObjectName("muted")
+        self.run_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        footer.addWidget(self.run_label)
+        root.addLayout(footer)
 
     # -------------------------------------------------------------- sources --
     def _on_open_video(self) -> None:
@@ -428,22 +492,28 @@ class LabWindow(QWidget):
         self._current_path = str(path)
         self.seek_slider.setRange(0, max(0, self.source.frame_count - 1))
         cached = None if reanalyze else self._cache.get(path, self._cfg_key)
+        from_run = None if reanalyze or cached is not None else self._opened_analysis(path)
         if reanalyze:
             self._cache.drop(path, self._cfg_key)
-        if cached is not None:
-            self._enter_frozen(cached)
+        if cached is not None or from_run is not None:
+            self._enter_frozen(cached or from_run)
             self._seek_to(0)
+            where = ("this session's analysis" if cached is not None
+                     else f"rebuilt from the landmarks of {self._opened_run.path.name}")
             self._set_status(
-                f"Frozen: {Path(path).name} — this session's analysis, not "
-                f"recomputed and writing no records. Space to play; "
-                f"\"Re-analyze\" for a new pass.")
+                f"Frozen: {Path(path).name} — {where}, not recomputed and writing no "
+                f"records. Space to play; \"Re-analyze\" for a new pass.")
             self._update_controls()
             return
-        self._start_session(Path(path).stem, metadata={
-            "source": str(Path(path).resolve()),
+        self._clip_sha = file_sha256(path)
+        self._start_session(Path(path).stem, kind=VIDEO, seen_at=str(Path(path).resolve().parent),
+                            metadata={
+            "source": Path(path).name,
             "source_kind": "video",
             "source_fps_declared": self.source.fps,
             "frame_count": self.source.frame_count,
+            "video_sha256": self._clip_sha,
+            "decoder_backend": self.source.backend,
         })
         self._recorder = PassRecorder(path, self._cfg_key, self.source.fps)
         self.playing = True
@@ -451,7 +521,7 @@ class LabWindow(QWidget):
         self.timer.start(0)  # self-scheduling loop takes over from here
         self._set_status(
             f"Video: {Path(path).name} — {self.source.frame_count} frames "
-            f"@ {self.source.fps:.1f} fps (declared). Logging to {self.records.path.name}"
+            f"@ {self.source.fps:.1f} fps (declared). Recording into {self.records.run.path.name}"
         )
         self._update_controls()
 
@@ -510,7 +580,8 @@ class LabWindow(QWidget):
         except OSError as exc:
             self._set_status(str(exc), error=True)
             return
-        self._start_session(f"camera{self.camera_spin.value()}", metadata={
+        self._clip_sha = ""
+        self._start_session(f"camera{self.camera_spin.value()}", kind=CAMERA, metadata={
             "source": f"camera index {self.camera_spin.value()}",
             "source_kind": "live camera",
             "source_fps_declared": self.source.fps,
@@ -519,12 +590,18 @@ class LabWindow(QWidget):
         self.camera_btn.setText(CAMERA_STOP)
         self.timer.start(0)  # self-scheduling loop; pace comes from the source
         self._set_status(
-            f"Live camera {self.camera_spin.value()} — logging to {self.records.path.name}"
+            f"Live camera {self.camera_spin.value()} — recording into "
+            f"{self.records.run.path.name}"
         )
         self._update_controls()
 
-    def _start_session(self, source_name: str, metadata: dict | None = None) -> None:
-        """Create the processing pipeline and the audit logger for a new source."""
+    def _start_session(self, source_name: str, metadata: dict | None = None,
+                       kind: str = VIDEO, seen_at: str = "") -> None:
+        """Create the processing pipeline and the records for a new source.
+
+        In a queue pass the clip's records go into the queue's run; otherwise
+        the source opens a run of its own, closed with it.
+        """
         # A recorded clip is labelled from how the episode ENDED (§3.3); a
         # live camera has no end, so it keeps the greedy resolution the
         # §3.6 device needs. The flag is the difference between the two.
@@ -535,15 +612,20 @@ class LabWindow(QWidget):
         self._logged_frames = 0
         self._reliable_frames = 0
         self.pipeline.source_name = source_name
+        self.pipeline.hash_frames = True
         self.pipeline.alerts.add_sink(self._on_alert)
         self.alert_banner.setVisible(False)
-        meta = dict(metadata or {})
-        meta["config"] = self.cfg.as_dict()
         # PEF-Lab is the laboratory, not the deployed device: it always
         # records everything (research mode), whatever logging.mode says.
         # logging.mode governs main.py, which is what runs on the Pi (§3.6).
-        self.records = RunRecords(self.cfg.logging.output_dir, source_name,
-                                  metadata=meta, research=True)
+        run = self._queue_run
+        if run is None:
+            run = RunFolder.new(self.cfg.logging.output_dir, source_name, kind=kind,
+                                seen_at=seen_at, config=self.cfg.as_dict(), command="PEF-Lab")
+            self._session_run = run
+        self.records = RunRecords(run, source_name, metadata=dict(metadata or {}),
+                                  research=True)
+        self._show_run(run)
         self._run_events = self.pipeline.machine.events
         self.frame_index = 0
         self.plots.clear()
@@ -580,12 +662,17 @@ class LabWindow(QWidget):
         self._queue_running = True
         self._queue_index = 0
         self._queue_rows = []
-        self._label_logger = AuditLogger(
-            self.cfg.logging.output_dir, "dataset-labels",
-            fields=LABEL_FIELDS,
-            metadata={"record_kind": "clip_labels", "clips": len(self._queue),
-                      "config": self.cfg.as_dict()},
-            flush_each_row=True)
+        self._opened_run = None              # a new pass is not a review of an old run
+        folders = {Path(p).resolve().parent for p in self._queue}
+        folder = folders.pop() if len(folders) == 1 else None
+        self._queue_run = RunFolder.new(
+            self.cfg.logging.output_dir, folder.name if folder else "queue", kind=DATASET,
+            seen_at=str(folder) if folder else "", config=self.cfg.as_dict(),
+            command="PEF-Lab queue")
+        self._label_logger = AuditLogger(self._queue_run.path, "dataset-labels",
+                                         fields=LABEL_FIELDS, filename=LABELS_FILE,
+                                         sidecar=False, flush_each_row=True)
+        self._show_run(self._queue_run)
         self._queue_advance()
 
     def _on_queue_stop(self) -> None:
@@ -612,22 +699,27 @@ class LabWindow(QWidget):
         A separate file, not an edit of the one the pass produced: the run's
         own output is a record of what the system decided, and rewriting it
         in place would destroy the only evidence of the disagreement being
-        corrected. Each save is timestamped, so the sequence of review passes
-        stays readable.
+        corrected. It goes into the run the labels belong to (the last queue
+        pass, or the run opened with "Open Run…"); each save is a new file
+        (``dataset-labels-reviewed.csv``, ``-2``, ...), so the sequence of
+        review passes stays readable, and ``metrics-reviewed`` follows the last.
         """
-        if self._queue_running or not self._queue_rows:
+        if self._queue_running or not self._queue_rows or self._last_run is None:
             return
-        self._label_logger = AuditLogger(
-            self.cfg.logging.output_dir, "dataset-labels-reviewed",
-            fields=LABEL_FIELDS,
-            metadata={"record_kind": "clip_labels_reviewed",
-                      "clips": len(self._queue_rows),
-                      "config": self.cfg.as_dict()},
-            flush_each_row=True)
+        run = self._last_run
+        name, n = REVIEWED_LABELS_FILE, 2
+        while (run.path / name).exists():
+            name, n = f"{Path(REVIEWED_LABELS_FILE).stem}-{n}.csv", n + 1
+        logger = AuditLogger(run.path, "dataset-labels-reviewed", fields=LABEL_FIELDS,
+                             filename=name, sidecar=False, flush_each_row=True)
         for row, record in enumerate(self._queue_rows):
             record["reviewed_class"] = self.queue_panel.reviewed(row) or ""
-            self._label_logger.log(record)
-        self._close_label_record("Reviews saved.")
+            logger.log({k: record.get(k, "") for k in LABEL_FIELDS})
+        logger.close()
+        text = run_metrics.for_run(run, self._queue_rows, reviewed=True)
+        self._show_results(text)
+        self._set_status(f"Reviews saved -> {run.path.name}/{name} "
+                         f"(and metrics-reviewed.txt)")
 
     def _queue_advance(self) -> None:
         """Open the next clip, or finish the pass."""
@@ -657,7 +749,8 @@ class LabWindow(QWidget):
         total = (self.source.frame_count / self.source.fps
                  if self.source is not None and self.source.fps else 0.0)
         row = label_row(path, self.pipeline.machine.events, self._logged_frames,
-                        self._reliable_frames, total, datetime.now())
+                        self._reliable_frames, total, datetime.now(),
+                        dispatch=self.cfg.alerts.dispatch_verdicts, video_sha256=self._clip_sha)
         detected, truth = row["detected_class"], row["true_class"]
         if self._label_logger is not None:
             self._label_logger.log(row)
@@ -730,23 +823,34 @@ class LabWindow(QWidget):
             f"clip {self._review_index + 1} of {len(self._queue)}   ·   {name}")
 
     def _close_label_record(self, reason: str) -> None:
-        """Finish the labels file, folding in any human corrections."""
+        """Finish the labels file, folding in any human corrections, and the run.
+
+        The run's metrics (``metrics.csv``, ``metrics.txt``) are written and
+        shown in the Results tab, and printed as ``pef-run`` prints them.
+        """
         if self._label_logger is None:
             return
         for row, record in enumerate(self._queue_rows):
             reviewed = self.queue_panel.reviewed(row)
             if reviewed:
                 record["reviewed_class"] = reviewed
-        path = self._label_logger.path
         self._label_logger.close()
         self._label_logger = None
+        run, self._queue_run = self._queue_run, None
         summary = format_confusion(self._queue_rows)
-        print("\n" + pass_summary(self._queue_rows, PARTITION_PATH))
-        print(f"\n-> {path}")
         first = summary.splitlines()[-1]
-        self._set_status(f"{reason} {len(self._queue_rows)} clips — {first} -> {path.name}")
+        if run is None:
+            return
+        finished = reason == "Queue finished."
+        run.close("finished" if finished else "stopped")
+        self._last_run = run
+        text = run_metrics.for_run(run, self._queue_rows)
+        print("\n" + text)
+        print(f"-> {run.path}")
+        self._show_results(text)
+        self._set_status(f"{reason} {len(self._queue_rows)} clips — {first} -> {run.path.name}")
 
-    def _finalise_records(self, reason: str) -> None:
+    def _finalise_records(self, reason: str, complete: bool = False) -> None:
         """Close the records and write their metadata sidecars.
 
         Separate from :meth:`_close_source` because the two events are not the
@@ -765,15 +869,24 @@ class LabWindow(QWidget):
         out of its record.
         """
         if self.records is None:
+            self._close_session_run(complete)
             return
         path, rows = self.records.path, self.records.frames_written
-        self.records.close(self._run_events)
+        self.records.close(self._run_events, complete=complete)
         events = self.records.events_written
         self.records = None
+        self._close_session_run(complete)
         if path is not None:
             self._set_status(f"{reason} {rows} frames, {events} events -> {path}")
         else:
             self._set_status(reason)
+
+    def _close_session_run(self, complete: bool) -> None:
+        """Close the run of a clip opened on its own, or of the camera."""
+        run, self._session_run = self._session_run, None
+        if run is not None:
+            run.close("finished" if complete else "stopped")
+            self._last_run = run
 
     def _close_source(self) -> None:
         self.timer.stop()
@@ -879,7 +992,9 @@ class LabWindow(QWidget):
                 scrubbing would append a duplicate, out-of-order row that
                 any later analysis would count twice.
         """
+        t_read = time.perf_counter()
         ok, frame, timestamp = self.source.read()
+        decode_ms = 1000.0 * (time.perf_counter() - t_read)
         if self._frozen is not None:
             # Frozen review: what the pass saw is shown. Nothing is
             # recomputed, nothing recorded, no event can fire.
@@ -910,7 +1025,7 @@ class LabWindow(QWidget):
                 # to disk now rather than waiting for a Close that may never
                 # come. The source stays open: reviewing is the whole point of
                 # stopping here, and reviewed frames are not logged anyway.
-                self._finalise_records("End of video.")
+                self._finalise_records("End of video.", complete=True)
                 self._freeze_finished_pass(label, record)
                 if self._queue_running:
                     self._queue_index += 1
@@ -929,7 +1044,7 @@ class LabWindow(QWidget):
         result = self.pipeline.process(frame, index, timestamp)
 
         if log and self.records is not None:
-            self.records.frame(result)
+            self.records.frame(result, decode_ms=decode_ms)
             self._logged_frames += 1
             self._reliable_frames += int(bool(result.reliable))
         if self._recorder is not None:
@@ -1078,7 +1193,9 @@ class LabWindow(QWidget):
         now = time.monotonic()
         if self.pipeline is not None and now - self._last_perf_shown > 1.0:
             self._last_perf_shown = now
-            self._set_status(self.pipeline.timings.summary())
+            run = self.records.run if self.records is not None else None
+            prefix = f"{run.path.name}  ·  " if run is not None else ""
+            self._set_status(prefix + self.pipeline.timings.summary())
         self.stage_label.setText(text)
         self._set_stage_chip(result.stage, fired=result.event is not None)
 
@@ -1105,6 +1222,149 @@ class LabWindow(QWidget):
         self.stage_chip.setStyleSheet(theme.chip_style(theme.STAGE_COLOURS[key]))
 
 
+    # --------------------------------------------------------- runs on disk --
+    def _show_run(self, run: RunFolder | None) -> None:
+        """The run named at the bottom right: what a screenshot needs to say."""
+        if run is None:
+            self.run_label.setText("")
+            return
+        self.run_label.setText(f"Run: {run.path.name}")
+        self.run_label.setToolTip(str(run.path))
+
+    def _show_results(self, text: str) -> None:
+        self.results_text.setPlainText(text)
+        self.side_tabs.setCurrentWidget(self.results_text)
+
+    def _on_open_run(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Run folder (the one with run.json)", str(self.cfg.logging.output_dir))
+        if folder:
+            self.open_run(folder)
+
+    def open_run(self, folder: str | Path, videos: str | Path | None = None) -> bool:
+        """Load a recorded run to review it: its clips, labels and metrics.
+
+        Each clip opens frozen, rebuilt from the run's landmarks with the
+        run's own configuration, without MediaPipe (records schema 2 keeps
+        them exact, so it is the run as it was). The videos are looked for
+        where the run saw them; ``videos`` (or a dialog) when they moved.
+        """
+        from ..cli import tool
+        folder = Path(folder)
+        info = RunFolder.read_info(folder)
+        if not info:
+            self._set_status(f"{folder.name} is not a run folder (no run.json).", error=True)
+            return False
+        clips, _ = tool("_records").find_runs(folder)
+        if not clips:
+            self._set_status(f"{folder.name} has no clips.", error=True)
+            return False
+        if videos is None:
+            seen = (info.get("dataset") or {}).get("seen_at") or ""
+            videos = seen if seen and Path(seen).is_dir() else None
+        if videos is None:
+            videos = QFileDialog.getExistingDirectory(
+                self, f"Where are the videos of {folder.name}?")
+            if not videos:
+                self._set_status("Open Run: the run's videos are needed to show it.",
+                                 error=True)
+                return False
+        by_stem = {rec.stem: rec for rec in clips.values()}
+        paths, missing = [], []
+        for stem in sorted(by_stem):
+            found = [Path(videos) / f"{stem}{ext}" for ext in VIDEO_SUFFIXES]
+            found = [p for p in found if p.exists()]
+            (paths.append(found[0]) if found else missing.append(stem))
+        self._close_source()
+        rows = _read_rows(folder / LABELS_FILE)
+        by_video = {Path(r.get("video", "")).stem: r for r in rows}
+        self._queue = paths
+        self._review_index = None
+        self.queue_panel.clear()
+        self.queue_panel.add_clips(paths)
+        self._queue_rows = []
+        for i, path in enumerate(paths):
+            row = by_video.get(path.stem)
+            if row is None:
+                continue
+            self._queue_rows.append(row)
+            self.queue_panel.show_result(i, row.get("detected_class", ""),
+                                         row.get("true_class", ""),
+                                         metrics_text(self._queue_rows))
+            if row.get("reviewed_class"):
+                self.queue_panel.set_reviewed(i, row["reviewed_class"])
+        cfg = Config(info.get("config") or self.cfg.as_dict(),
+                     source=f"the configuration of {folder.name}")
+        self._opened_run = SimpleNamespace(path=folder, info=info, clips=by_stem, cfg=cfg,
+                                           cfg_key=config_key(cfg.as_dict()))
+        self._last_run = RunFolder(folder)
+        self._show_run(self._last_run)
+        txt = folder / run_metrics.METRICS_TXT
+        if txt.exists():
+            self._show_results(txt.read_text(encoding="utf-8"))
+        elif rows:
+            table = run_metrics.compute(rows, info.get("partition") or {})
+            self._show_results(run_metrics.format_text(table, rows, folder.name))
+        self._update_controls()
+        note = f"; videos not found for {len(missing)}: {', '.join(missing[:5])}" if missing else ""
+        self._set_status(f"Opened run {folder.name}: {len(paths)} clips, double-click one "
+                         f"to review it frozen{note}", error=bool(missing))
+        return True
+
+    def _opened_analysis(self, path) -> ClipAnalysis | None:
+        """The opened run's analysis of this clip, rebuilt from its landmarks."""
+        run = self._opened_run
+        if run is None:
+            return None
+        rec = run.clips.get(Path(path).stem)
+        if rec is None:
+            return None
+        cached = self._cache.get(path, run.cfg_key)
+        if cached is not None:
+            return cached
+        from ..cli import tool
+        replay = tool("replay")
+        cfg = run.cfg
+        stats = replay.ReplayStats()
+        frames = list(replay.rebuild_frames(
+            SimpleNamespace(pose_frontend=pose_frontend), rec,
+            float(cfg.pose.visibility_threshold), float(cfg.pose.reacquire_after_s), stats))
+        if not frames:
+            return None
+        pipeline = FramePipeline(cfg, labelling=True)
+        recorder = PassRecorder(path, run.cfg_key, float(rec.metadata()["source_fps_declared"]))
+        for pf in frames:
+            recorder.record(pf.frame_index, pipeline.analyze(pf))
+        pipeline.finalise(frames[-1].timestamp)
+        row = next((r for r in self._queue_rows
+                    if Path(r.get("video", "")).stem == Path(path).stem), None)
+        analysis = recorder.finish(events=list(pipeline.machine.events),
+                                   record_path=str(rec.frames), label=row)
+        pipeline.close()
+        if analysis is not None:
+            self._cache.store(analysis)
+        return analysis
+
+    def export_figure(self) -> Path | None:
+        """Save the video and the curves, as on screen, into the run's figures/."""
+        run = (self.records.run if self.records is not None else None) or self._last_run
+        base = run.path if run is not None else Path(self.cfg.logging.output_dir)
+        if not base.is_absolute():
+            from ..config import REPO_ROOT
+            base = REPO_ROOT / base
+        folder = base / "figures"
+        folder.mkdir(parents=True, exist_ok=True)
+        clip = Path(self._current_path).stem if self._current_path else "pef-lab"
+        stem = f"{clip}-f{self.frame_index:05d}"
+        path, n = folder / f"{stem}.png", 2
+        while path.exists():
+            path, n = folder / f"{stem}-{n}.png", n + 1
+        if not self.main_split.grab().save(str(path), "PNG"):
+            self._set_status(f"Could not write {path}", error=True)
+            return None
+        self._set_status(f"Figure -> {path}")
+        return path
+
     # -------------------------------------------------------------- helpers --
     def _set_status(self, message: str, error: bool = False) -> None:
         self.status_label.setText(message)
@@ -1129,6 +1389,7 @@ class LabWindow(QWidget):
         self.camera_btn.setEnabled(not running)
         self.close_btn.setEnabled(not running)
         self.queue_add_btn.setEnabled(not running)
+        self.open_run_btn.setEnabled(not running)
         self.queue_panel.clear_btn.setEnabled(not running and bool(self._queue))
         self.queue_panel.save_btn.setEnabled(not running and bool(self._queue_rows))
         self.queue_panel.start_btn.setEnabled(not running and bool(self._queue))
@@ -1149,6 +1410,13 @@ class LabWindow(QWidget):
         """
         self._close_source()
         super().closeEvent(event)
+
+
+def _read_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
 
 
 def run_gui(cfg: Config, video: str | None = None, camera: int | None = None) -> None:

@@ -17,6 +17,8 @@ las afirmaciones de método: qué se midió, con qué código y qué se descart�
 | `DESCARTADOS.md` | Mecanismos medidos y retirados del código (banda provisional, rechazo por descenso). |
 | `CONFIG-HISTORIA.md` | Por qué cada valor de `config.yaml` es el que es. |
 | `CODIGO-HISTORIA.md` | Las historias que contaban los comentarios del código antes de pasarlo a inglés. |
+| `DIAGNOSTICO-X86-ARM.md` | Por qué la Mac da 110/128 y la nube x86 115/128: el decodificador de video (14/10). |
+| `IDEAS.md` | Ideas todavía no aprobadas ni en el plan, con sus pros y contras, y las descartadas con su motivo. |
 
 ## archivo/
 

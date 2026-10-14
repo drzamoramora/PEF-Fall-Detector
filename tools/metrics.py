@@ -15,9 +15,15 @@ Works the same on a real run and on a replay (``replay.py``):
 With a second folder: the label agreement between the two runs, and the clips
 whose label differs.
 
+Then, with code that has it (0.3.0.dev0 on), the full table of
+``pef_fall_detector.run_metrics``: every metric by partition, the reading by
+alarm, and the per-frame cost when the run recorded it. ``--write`` saves it
+as ``metrics.csv`` and ``metrics.txt`` into a schema-2 run folder,
+recomputed from its records.
+
 Usage::
 
-    python tools/metrics.py LOGS [LOGS_B] [--partition FILE] [--repo PATH]
+    python tools/metrics.py LOGS [LOGS_B] [--partition FILE] [--repo PATH] [--write]
 """
 
 from __future__ import annotations
@@ -25,13 +31,12 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
-import json
 import sys
 from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _records import find_runs  # noqa: E402
+from _records import CLIPS_DIR, FRAMES_FILE, SCHEMA_RUN_FOLDER, find_runs, schema_of  # noqa: E402
 
 TOOLS_REPO = Path(__file__).resolve().parents[1]
 DEFAULT_PARTITION = TOOLS_REPO / "config" / "partition.yaml"
@@ -53,12 +58,15 @@ def load_run(folder: str | Path, pkg) -> dict[str, dict]:
         if rec.events is not None:
             with open(rec.events, newline="", encoding="utf-8") as fh:
                 rows = list(csv.DictReader(fh))
-        dispatch = ("stage3_confirmed",)
-        if rec.meta.exists():
-            cfg = json.loads(rec.meta.read_text(encoding="utf-8")).get("config", {})
-            dispatch = tuple(cfg.get("alerts", {}).get("dispatch_verdicts", dispatch))
+        cfg = rec.metadata().get("config", {})
+        dispatch = tuple(cfg.get("alerts", {}).get("dispatch_verdicts", ("stage3_confirmed",)))
         label = pkg.classification.classify_clip([_Event(r) for r in rows])
+        meta = rec.metadata()
+        fps = float(meta.get("source_fps_declared") or 0.0)
+        frames = int(meta.get("frame_count") or meta.get("rows") or 0)
         out[clip] = {
+            "stem": rec.stem,
+            "duration_s": frames / fps if fps else 0.0,
             "truth": pkg.dataset.truth_from_name(rec.stem),
             "pred": label[0] if isinstance(label, tuple) else label,
             "events": rows,
@@ -107,6 +115,37 @@ def report(name: str, clips: dict[str, dict], split: dict[str, str], falls,
         print(f"    {clip:8s} truth {truth:18s} detected {pred}")
 
 
+def label_rows(clips: dict[str, dict]) -> list[dict]:
+    """What dataset-labels.csv would say, rebuilt from the records."""
+    return [{"video": v["stem"], "true_class": v["truth"], "detected_class": v["pred"],
+             "duration_s": f"{v['duration_s']:.2f}", "events": len(v["events"]),
+             "alarm": int(v["alarm"]),
+             "trigger_sources": ";".join(r.get("trigger_source") or "?" for r in v["events"])}
+            for v in clips.values()]
+
+
+def full_table(folder: str | Path, clips: dict[str, dict], split: dict[str, str],
+               write: bool = False) -> None:
+    """The run_metrics table of a run, printed (and saved with ``write``)."""
+    try:
+        run_metrics = importlib.import_module("pef_fall_detector.run_metrics")
+    except ModuleNotFoundError:
+        return                                  # code before 0.3.0.dev0
+    rows = label_rows(clips)
+    perf = {}
+    if schema_of(folder) == SCHEMA_RUN_FOLDER:
+        perf = run_metrics.performance(sorted(Path(folder).glob(f"{CLIPS_DIR}/*/{FRAMES_FILE}")))
+    table = run_metrics.compute(rows, split, perf)
+    text = run_metrics.format_text(table, rows, f"{Path(folder).name} (from its records)")
+    print("\n" + text)
+    if write:
+        if schema_of(folder) != SCHEMA_RUN_FOLDER:
+            print("--write: only into a schema-2 run folder")
+            return
+        csv_path, txt_path = run_metrics.write(folder, table, text)
+        print(f"-> {csv_path}\n-> {txt_path}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("logs", help="run folder")
@@ -114,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--partition", default=str(DEFAULT_PARTITION), help="train/test by actor")
     ap.add_argument("--repo", default=str(TOOLS_REPO),
                     help="checkout whose classification labels the clips (default: this one)")
+    ap.add_argument("--write", action="store_true",
+                    help="save metrics.csv and metrics.txt into the (schema-2) run folder")
     args = ap.parse_args(argv)
     repo = str(Path(args.repo).resolve())
     if repo not in sys.path:
@@ -125,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     a = load_run(args.logs, pkg)
     rec = pkg.classification.RECOVERED
     report(args.logs, a, split, falls, rec)
+    full_table(args.logs, a, split, write=args.write)
     if args.logs_b:
         b = load_run(args.logs_b, pkg)
         report(args.logs_b, b, split, falls, rec)

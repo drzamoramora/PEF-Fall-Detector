@@ -76,6 +76,18 @@ class VideoFileSource(FrameSource):
         return self._fps
 
     @property
+    def backend(self) -> str:
+        """The OpenCV backend decoding the file (``FFMPEG``, ``AVFOUNDATION``...).
+
+        Recorded per clip: when two computers read different images from
+        the same file, the decoder is the first suspect.
+        """
+        try:
+            return self._cap.getBackendName()
+        except cv2.error:
+            return ""
+
+    @property
     def duration_seconds(self) -> float:
         """Duration implied by the declared FPS and the frame count."""
         return self.frame_count / self._fps if self._fps else 0.0

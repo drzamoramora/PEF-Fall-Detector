@@ -109,6 +109,13 @@ class FrameResult:
     event: object | None = None
     resolved_event: object | None = None
     hud_lines: list[str] = field(default_factory=list)
+    #: First 16 hex digits of the SHA-1 of the decoded image (records schema
+    #: 2), when the pipeline was asked to hash (``FramePipeline.hash_frames``).
+    frame_sha1: str = ""
+    #: Milliseconds of this frame: ``pose_ms`` (MediaPipe) and
+    #: ``analysis_ms`` (everything after it). Empty for a frame analysed from
+    #: recorded landmarks (a replay), where nothing was measured.
+    timing_ms: dict[str, float] = field(default_factory=dict)
 
     def csv_extra(self) -> dict[str, str]:
         """Values formatted for the audit CSV (NaN -> empty cell).
@@ -124,6 +131,10 @@ class FrameResult:
             for name, value in self.quantities.items()
             if not math.isnan(value)
         }
+        if self.frame_sha1:
+            extra["frame_sha1"] = self.frame_sha1
+        for name, ms in self.timing_ms.items():
+            extra[name] = f"{ms:.2f}"
         extra["reliable"] = "1" if self.reliable else "0"
         extra["stage"] = self.stage
         extra["stage1_fired"] = "1" if self.event is not None else "0"

@@ -74,7 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = pkg.config.load_config()
     runs, _extra = find_runs(args.logs)
     wanted = args.clips.split(",")
-    missing = [c for c in wanted if c not in runs or runs[c].landmarks is None]
+    missing = [c for c in wanted if c not in runs
+               or (runs[c].landmarks is None and runs[c].landmarks_npz is None)]
     if missing:
         ap.error(f"no frames or landmark record for: {', '.join(missing)}")
     out = Path(args.out)
@@ -82,10 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.rmtree(out)
     out.mkdir(parents=True)
     for clip in wanted:
-        rec = runs[clip]
-        for path in (rec.frames, rec.meta, rec.landmarks, rec.landmarks.with_suffix(".meta.json")):
-            if path.exists():
-                shutil.copy2(path, out / path.name)
+        _copy_clip(runs[clip], out)
     copied, _ = find_runs(out)
     expected = {
         "built_from": str(Path(args.logs).resolve()),
@@ -101,6 +99,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{clip:9s} {d['label']:20s} {evs}")
     print(f"-> {out}")
     return 0
+
+
+def _copy_clip(rec, out: Path) -> None:
+    """One clip's frames, landmarks and metadata, in the layout of its run."""
+    if rec.run_dir is None:                     # schema 1: loose files
+        for path in (rec.frames, rec.meta, rec.landmarks,
+                     rec.landmarks.with_suffix(".meta.json")):
+            if path is not None and path.exists():
+                shutil.copy2(path, out / path.name)
+        return
+    run = rec.run_dir                           # schema 2: the run folder's layout
+    for path in (run / "run.json", rec.frames, rec.meta, rec.landmarks, rec.landmarks_npz):
+        if path is None or not path.exists():
+            continue
+        dst = out / path.relative_to(run)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dst)
 
 
 def _version() -> str:

@@ -1,8 +1,53 @@
 # Changelog
 
-Versions of PEF-Fall-Detector. Every record's sidecar (`*.meta.json`)
-carries `code_version`, and since 0.2.0.dev0 the git commit it ran from
-(`git_commit`, `git_dirty`), so any result can be traced to an entry here.
+Versions of PEF-Fall-Detector. Every run carries `code_version` and the git
+commit it ran from (`git_commit`, `git_dirty`): in `run.json` since
+0.3.0.dev0, in each record's `*.meta.json` sidecar before. Any result can be
+traced to an entry here.
+
+## 0.3.0 — records schema 2 (in progress, branch `registros`)
+
+### 0.3.0.dev0 — a folder per run, exact landmarks, every metric
+
+How a run is recorded changes; what the detector decides does not.
+
+- **A folder per run** (`run_folder.py`): `logs/<date>_<time>-<platform>-<dataset>/`,
+  never reused. `run.json` once per run: code version and commit, platform
+  (OS, CPU, Python), the versions of MediaPipe, OpenCV, numpy and protobuf and
+  OpenCV's video decoder, the dataset by content (SHA-256 of every clip and of
+  the set), configuration, partition and column schemas. Per clip,
+  `clips/<clip>/clip.json` (fps, frame count, the video's SHA-256, the decoder
+  backend, whether the pass reached the end), `frames.csv` and `events.csv`.
+  No more `.meta.json` sidecars.
+- **Exact landmarks**: `landmarks/npz/<clip>.npz`, MediaPipe's float32 numbers
+  as returned (normalised image coordinates, visibility, world), and
+  `landmarks/csv/<clip>.csv`, the same values as text (`repr`). A replay from
+  a schema-2 run reproduces it to the last digit. MediaPipe's presence score
+  was recorded in the first runs and dropped: the pinned `mp.solutions.pose`
+  API leaves it at 0 (the comparison tool ignores those columns).
+- **Frame records** (`audit_log.FRAME_FIELDS`): `frame_sha1`, the hash of the
+  decoded image (decoder or inference, when two platforms disagree), and
+  `decode_ms`, `pose_ms`, `analysis_ms`, `cpu_pct`, `peak_rss_mb`.
+- **Labels**: `alarm`, `trigger_sources` and `video_sha256` columns.
+- **Metrics** (`run_metrics.py`): `metrics.csv` (one row per number) and
+  `metrics.txt` at the end of every labelled run, from the CLI and from
+  PEF-Lab's queue: classification, fall or not by label and by alarm, events,
+  per-frame cost; all clips, train and test, Wilson intervals.
+- **`pef-run`**: `--clips`, `--resume RUN`, `--compare-to RUN`, the time left
+  per clip, a clip that fails no longer stops the batch, exit status 0 / 1 / 2.
+  `--output-dir` is now where run folders are created.
+- **Commands** for the tools: `pef-compare`, `pef-metrics`, `pef-replay` and
+  `pef-export` (npz to CSV, or `--check` that both agree).
+- **Tools read both layouts**: a schema-1 run (`logs-historicos/`) compares
+  with a schema-2 one (columns only the new layout has are listed, not counted;
+  landmarks match within the old rounding; timings are never compared), and
+  `tools/maps/b5.json` is applied on its own across the B5 translation.
+- **PEF-Lab**: run folders; a Results tab with the metrics; *Open Run…* to
+  review a recorded run frozen, rebuilt from its landmarks without MediaPipe;
+  *Save Reviews* into that run, with `metrics-reviewed`; the run's name in the
+  status line; *Export Figure* into the run's `figures/`.
+- The end-to-end data (`tests/data/e2e`) must be rebuilt from a schema-2 run
+  (`tools/e2e_fixture.py`); until then the test skips.
 
 ## 0.2.0 — repository cleanup (in progress)
 

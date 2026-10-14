@@ -16,4 +16,4 @@ Package layout (mirrors the paper's architecture, §3.1):
     gui            PEF-Lab: PySide6 visualization workbench
 """
 
-__version__ = "0.2.0.dev9"
+__version__ = "0.3.0.dev0"

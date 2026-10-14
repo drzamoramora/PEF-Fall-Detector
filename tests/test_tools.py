@@ -1,6 +1,7 @@
 """The analysis tools in ``tools/``, and the provenance every record carries.
 
-* ``_records.find_runs``: which files belong to which clip and run;
+* ``_records.find_runs``: which files belong to which clip and run, in both
+  record layouts (schema 1, loose; schema 2, one folder per run);
 * ``replay.py``: rebuilding frames from the landmark record and running them
   through the detector must reproduce a run exactly when the landmarks are
   exact (they are here: every synthetic coordinate is representable at the
@@ -115,6 +116,49 @@ def _rewrite(path: Path, edit) -> None:
         writer = csv.DictWriter(fh, fieldnames=header)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _as_schema2(v1: Path, run: Path, code_version: str = "0.2.0", extra_frame_cols=None,
+                presence: bool = True) -> Path:
+    """A schema-1 run rewritten in the schema-2 layout, values untouched.
+
+    Adds what schema 2 records and schema 1 never did: per-frame columns
+    (``extra_frame_cols``: name -> value); with ``presence``, the always-zero
+    presence columns of the first 0.3.0.dev0 runs, which comparisons ignore.
+    """
+    presence_cols = [f"lm{i:02d}_p" for i in range(33)]
+
+    def add_frame_cols(header, rows):
+        return header + list(extra_frame_cols), [{**r, **extra_frame_cols} for r in rows]
+
+    def add_presence(header, rows):
+        header = header + [c for c in presence_cols if c not in header]
+        return header, [{**r, **dict.fromkeys(presence_cols, "0.99")} for r in rows]
+
+    clips, _ = _records.find_runs(v1)
+    first = next(iter(clips.values())).metadata()
+    (run / "clips").mkdir(parents=True)
+    (run / "landmarks" / "csv").mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps(
+        {"schema_version": 2, "code_version": code_version, "config": first["config"],
+         "source_fps_declared": -1.0}), encoding="utf-8")
+    for rec in clips.values():
+        d = run / "clips" / rec.stem
+        d.mkdir()
+        meta = rec.metadata()
+        (d / "clip.json").write_text(json.dumps(
+            {"source_fps_declared": meta["source_fps_declared"], "rows": meta["rows"]}),
+            encoding="utf-8")
+        shutil.copy2(rec.frames, d / "frames.csv")
+        if extra_frame_cols:
+            _rewrite(d / "frames.csv", add_frame_cols)
+        if rec.events is not None:
+            shutil.copy2(rec.events, d / "events.csv")
+        marks = run / "landmarks" / "csv" / f"{rec.stem}.csv"
+        shutil.copy2(rec.landmarks, marks)
+        if presence:
+            _rewrite(marks, add_presence)
+    return run
 
 
 def _quiet(fn, *args, **kw):
@@ -465,6 +509,264 @@ class TestCompareRuns(unittest.TestCase):
     def test_exit_status(self) -> None:
         code, _ = _quiet(compare_runs.main, [str(self.ref), str(self._copy("exit"))])
         self.assertEqual(code, 0)
+
+
+class TestSchemaTwo(unittest.TestCase):
+    """The run-folder layout, read and compared next to the loose one."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.v1 = Path(cls.tmp.name) / "v1"
+        _write_run(cls.v1, _frames(), _cfg())
+        _write_run(cls.v1, _frames(60, collapse=False), _cfg(), stem="B98-S2-NoFall")
+        # A schema-1 landmark record had no presence columns.
+        for rec in _records.find_runs(cls.v1)[0].values():
+            _rewrite(rec.landmarks, lambda h, rows: (
+                [c for c in h if not c.endswith("_p")],
+                [{k: v for k, v in r.items() if not k.endswith("_p")} for r in rows]))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.tmp.cleanup()
+
+    def _v2(self, name: str, **kw) -> Path:
+        dst = Path(self.tmp.name) / name
+        shutil.rmtree(dst, ignore_errors=True)
+        return _as_schema2(self.v1, dst, **kw)
+
+    def test_find_runs_reads_a_run_folder(self) -> None:
+        run = self._v2("find")
+        (run / "landmarks" / "npz").mkdir()
+        (run / "landmarks" / "npz" / f"{STEM}.npz").touch()
+        (run / "clips" / "not-a-clip").mkdir()               # no frames.csv: ignored
+        clips, extra = _records.find_runs(run)
+        self.assertEqual(sorted(clips), ["A99-S1", "B98-S2"])
+        self.assertEqual(extra, {})
+        a = clips["A99-S1"]
+        self.assertEqual((a.schema, a.stem, a.stamp), (_records.SCHEMA_RUN_FOLDER, STEM, ""))
+        self.assertEqual(a.frames, run / "clips" / STEM / "frames.csv")
+        self.assertEqual(a.meta, run / "clips" / STEM / "clip.json")
+        self.assertEqual(a.landmarks, run / "landmarks" / "csv" / f"{STEM}.csv")
+        self.assertEqual(a.landmarks_npz, run / "landmarks" / "npz" / f"{STEM}.npz")
+        self.assertIsNone(clips["B98-S2"].landmarks_npz)
+        self.assertIsNone(clips["B98-S2"].events)            # a clip with no event
+        self.assertEqual(_records.schema_of(run), _records.SCHEMA_RUN_FOLDER)
+        self.assertEqual(_records.schema_of(self.v1), _records.SCHEMA_LOOSE)
+
+    def test_metadata_merges_the_run_and_the_clip(self) -> None:
+        a = _records.find_runs(self._v2("meta"))[0]["A99-S1"]
+        meta = a.metadata()
+        self.assertEqual(meta["source_fps_declared"], FPS)   # the clip's, over the run's
+        self.assertEqual(meta["code_version"], "0.2.0")      # the run's
+        self.assertIn("stage1", meta["config"])
+        v1 = _records.find_runs(self.v1)[0]["A99-S1"].metadata()
+        self.assertEqual(v1["source_fps_declared"], FPS)
+
+    def test_a_run_folder_compares_with_the_loose_run_it_came_from(self) -> None:
+        run = self._v2("same", extra_frame_cols={"frame_sha1": "ab12", "pose_ms": "27.31"})
+        same, text = _quiet(compare_runs.compare, self.v1, run, landmarks=True)
+        self.assertTrue(same, text)
+        self.assertIn("only in the newer schema, not compared: frame_sha1\n", text)
+        self.assertNotIn("lm00_p", text)                    # presence: never compared
+        self.assertNotIn("pose_ms", text)                   # volatile: never compared
+        same, text = _quiet(compare_runs.compare, run, self.v1, landmarks=True)
+        self.assertTrue(same, text)                         # either way round
+
+    def test_across_schemas_landmarks_match_within_the_old_rounding(self) -> None:
+        def shift(by):
+            def edit(header, rows):
+                rows[10]["lm00_x"] = f"{float(rows[10]['lm00_x']) + by:.6f}"
+                return header, rows
+            return edit
+        run = self._v2("within")
+        marks = _records.find_runs(run)[0]["A99-S1"].landmarks
+        _rewrite(marks, shift(0.0049))
+        same, text = _quiet(compare_runs.compare, self.v1, run, landmarks=True)
+        self.assertTrue(same, text)
+        _rewrite(marks, shift(0.002))                        # 0.0069 from the original
+        same, text = _quiet(compare_runs.compare, self.v1, run, landmarks=True)
+        self.assertFalse(same)
+        self.assertIn("frame_index 10 lm00_x", text)
+
+    def test_two_run_folders_compare_exactly(self) -> None:
+        a = self._v2("exact-a", extra_frame_cols={"pose_ms": "10.00"})
+        b = self._v2("exact-b", extra_frame_cols={"pose_ms": "99.00"})
+        same, text = _quiet(compare_runs.compare, a, b, landmarks=True)
+        self.assertTrue(same, text)                          # timings differ: not compared
+        marks = _records.find_runs(b)[0]["A99-S1"].landmarks
+
+        def edit(header, rows):
+            rows[10]["lm00_x"] = f"{float(rows[10]['lm00_x']) + 0.001:.6f}"
+            return header, rows
+        _rewrite(marks, edit)
+        same, text = _quiet(compare_runs.compare, a, b, landmarks=True)
+        self.assertFalse(same)                               # no rounding to forgive
+
+    def test_a_column_the_newer_run_lost_is_a_difference(self) -> None:
+        run = self._v2("lost")
+        frames = _records.find_runs(run)[0]["A99-S1"].frames
+        _rewrite(frames, lambda h, rows: ([c for c in h if c != "T_deg"],
+                                          [{k: v for k, v in r.items() if k != "T_deg"}
+                                           for r in rows]))
+        same, text = _quiet(compare_runs.compare, self.v1, run)
+        self.assertFalse(same)
+        self.assertIn("columns only in A: T_deg", text)
+
+    def test_the_b5_map_is_chosen_only_across_the_translation(self) -> None:
+        old = {"x": _records.find_runs(self.v1)[0]["A99-S1"]}
+        meta = old["x"].meta
+        saved = meta.read_text()
+        try:
+            data = json.loads(saved)
+            for version, expected in (("0.1.0", "b5.json"), ("0.2.0.dev4", "b5.json"),
+                                      ("0.2.0.dev5", None), ("0.2.0.dev9", None)):
+                data["code_version"] = version
+                meta.write_text(json.dumps(data))
+                new = _records.find_runs(self._v2(f"map-{version}"))[0]
+                got = compare_runs.default_map(old, new)
+                self.assertEqual(got.name if got else None, expected, version)
+                self.assertIsNone(compare_runs.default_map(old, old), version)
+        finally:
+            meta.write_text(saved)
+
+    def test_version_order(self) -> None:
+        key = _records.version_key
+        self.assertLess(key("0.1.0"), key("0.2.0.dev0"))
+        self.assertLess(key("0.2.0.dev4"), key("0.2.0.dev5"))
+        self.assertLess(key("0.2.0.dev9"), key("0.2.0.dev10"))
+        self.assertLess(key("0.2.0.dev10"), key("0.2.0"))
+
+    def test_metrics_read_a_run_folder_like_a_loose_run(self) -> None:
+        run = self._v2("metrics")
+        split = Path(self.tmp.name) / "split.yaml"
+        split.write_text("test:\n  - A99\ntrain:\n  - B98\n", encoding="utf-8")
+        _, loose = _quiet(metrics.main, [str(self.v1), "--partition", str(split)])
+        _, folder = _quiet(metrics.main, [str(run), "--partition", str(split)])
+
+        def body(text):     # without the lines that name the folder
+            return [line for line in text.splitlines()[1:] if "(from its records)" not in line]
+        self.assertEqual(body(loose), body(folder))
+        self.assertIn("Accuracy, 4 classes", folder)
+
+    def test_a_replay_of_a_run_folder_reproduces_it(self) -> None:
+        run = self._v2("replay")
+        out = Path(self.tmp.name) / "replay-out"
+        shutil.rmtree(out, ignore_errors=True)
+        cfg_file = Path(self.tmp.name) / "config.yaml"
+        import yaml
+        cfg_file.write_text(yaml.safe_dump(_cfg().as_dict()), encoding="utf-8")
+        code, text = _quiet(replay.main, [str(run), str(out), "--repo", str(ROOT),
+                                          "--config", str(cfg_file)])
+        self.assertEqual(code, 0, text)
+        same, text = _quiet(compare_runs.compare, self.v1, out)
+        self.assertTrue(same, text)
+
+
+def _as_mediapipe(frames):
+    """Frames whose numbers are what MediaPipe would give: float32 underneath."""
+    out = []
+    for pf in frames:
+        w, h = pf.frame_size
+        scale = np.array([w, h, w], dtype=np.float64)
+        pf.landmarks_norm = (pf.landmarks / scale).astype(np.float32)
+        pf.landmarks = pf.landmarks_norm.astype(np.float64) * scale
+        pf.visibility = np.asarray(pf.visibility, dtype=np.float32).astype(np.float64)
+        # The anchors the front end derives from those numbers (Step-0).
+        from pef_fall_detector.pose_frontend import CORE_LANDMARKS, compute_step0
+        pf.mid_hip, pf.mid_shoulder, pf.torso_length = compute_step0(pf.landmarks)
+        pf.core_visibility = float(pf.visibility[list(CORE_LANDMARKS)].min())
+        if len(pf.world_landmarks) == 33:
+            pf.world_landmarks = pf.world_landmarks.astype(np.float32).astype(np.float64)
+            w_hip = (pf.world_landmarks[23] + pf.world_landmarks[24]) / 2.0
+            w_sh = (pf.world_landmarks[11] + pf.world_landmarks[12]) / 2.0
+            pf.world_torso_length = float(np.linalg.norm(w_sh - w_hip))
+        out.append(pf)
+    return out
+
+
+def _write_run_folder(run: Path, frames, cfg: Config, stem: str = STEM) -> None:
+    """A schema-2 run as main.py writes it (without MediaPipe)."""
+    from pef_fall_detector.records import RunRecords
+    pipe = FramePipeline(cfg, labelling=True)
+    records = RunRecords(run, stem, metadata={"source_fps_declared": FPS,
+                                              "frame_count": len(frames),
+                                              "config": cfg.as_dict()})
+    for pf in frames:
+        result = pipe.analyze(pf)
+        records.frame(result)
+        if result.resolved_event is not None:
+            records.event_settled(pipe.machine.events, result.resolved_event)
+    pipe.finalise(frames[-1].timestamp)
+    records.close(pipe.machine.events)
+
+
+class TestExactRecords(unittest.TestCase):
+    """Schema 2 keeps MediaPipe's numbers: a replay is the run, to the last digit."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.run_dir = Path(cls.tmp.name) / "run"
+        cls.cfg = _cfg()
+        # Off-grid coordinates on purpose: schema 1 would have rounded them.
+        frames = _frames()
+        for pf in frames:
+            pf.landmarks = pf.landmarks + 0.3173
+        _write_run_folder(cls.run_dir, _as_mediapipe(frames), cls.cfg)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.tmp.cleanup()
+
+    def test_a_replay_reproduces_the_run_exactly(self) -> None:
+        import yaml
+        out = Path(self.tmp.name) / "replay"
+        cfg_file = Path(self.tmp.name) / "config.yaml"
+        cfg_file.write_text(yaml.safe_dump(self.cfg.as_dict()), encoding="utf-8")
+        code, text = _quiet(replay.main, [str(self.run_dir), str(out), "--repo", str(ROOT),
+                                          "--config", str(cfg_file)])
+        self.assertEqual(code, 0, text)
+        self.assertIn("visibility nudged 0", text)
+        self.assertTrue((out / "run.json").exists())                 # a run folder
+        self.assertEqual(json.loads((out / "run.json").read_text())["kind"], "replay")
+        same, text = _quiet(compare_runs.compare, self.run_dir, out, landmarks=True)
+        self.assertTrue(same, text)
+        # Exact, not within a tolerance: the files themselves are equal.
+        a = _records.find_runs(self.run_dir)[0]["A99-S1"]
+        b = _records.find_runs(out)[0]["A99-S1"]
+        self.assertEqual(a.landmarks.read_bytes(), b.landmarks.read_bytes())
+        self.assertEqual(a.frames.read_bytes(), b.frames.read_bytes())
+
+    def test_the_csv_and_the_npz_hold_the_same_numbers(self) -> None:
+        import export
+        code, text = _quiet(export.main, [str(self.run_dir), "--check"])
+        self.assertEqual(code, 0, text)
+        self.assertIn("1/1 CSVs equal their npz -> IDENTICAL", text)
+        rec = _records.find_runs(self.run_dir)[0]["A99-S1"]
+        out = Path(self.tmp.name) / "exported"
+        _quiet(export.main, [str(self.run_dir), "--out", str(out)])
+        self.assertEqual((out / f"{STEM}.csv").read_bytes(), rec.landmarks.read_bytes())
+
+    def test_a_changed_csv_is_caught(self) -> None:
+        import export
+        copy_dir = Path(self.tmp.name) / "tampered"
+        shutil.rmtree(copy_dir, ignore_errors=True)
+        shutil.copytree(self.run_dir, copy_dir)
+        rec = _records.find_runs(copy_dir)[0]["A99-S1"]
+
+        def edit(header, rows):
+            rows[5]["lm00_x"] = str(float(rows[5]["lm00_x"]) + 1e-9)
+            return header, rows
+        _rewrite(rec.landmarks, edit)
+        code, text = _quiet(export.main, [str(copy_dir), "--check"])
+        self.assertEqual(code, 1)
+        self.assertIn("A99-S1: the CSV differs from the npz", text)
+
+    def test_the_cli_compare(self) -> None:
+        from pef_fall_detector import cli
+        same, _ = _quiet(cli.compare_runs, str(self.run_dir), str(self.run_dir))
+        self.assertTrue(same)
 
 
 class TestMetrics(unittest.TestCase):

@@ -23,6 +23,7 @@ below the threshold MediaPipe extrapolates anatomy that is not in the image
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from collections import deque
@@ -53,6 +54,15 @@ from .quantities import r as quantity_r
 from .results import FrameResult, Timings
 from .state_machine import Stage
 from .state_machine.build import build_machine
+
+
+def frame_digest(frame_bgr: np.ndarray) -> str:
+    """First 16 hex digits of the SHA-1 of a decoded image's bytes.
+
+    Sixty-four bits are plenty to tell two images apart; the full digest
+    would only make the record wider.
+    """
+    return hashlib.sha1(np.ascontiguousarray(frame_bgr).data).hexdigest()[:16]
 
 
 class FramePipeline:
@@ -141,6 +151,10 @@ class FramePipeline:
         self.alerts = AlertDispatcher(
             dispatch_verdicts=tuple(cfg.alerts.dispatch_verdicts))
         self.source_name = ""
+        #: Hash every decoded image into ``FrameResult.frame_sha1`` (records
+        #: schema 2). About 1 ms a 720p frame; set by whoever records, so the
+        #: deployed detector, which records nothing, does not pay for it.
+        self.hash_frames = False
         self._recent_state = ""
         self.timings = Timings()
         self._last_timestamp: float | None = None
@@ -175,6 +189,8 @@ class FramePipeline:
                 visibility_threshold=float(cfg.pose.visibility_threshold),
                 reacquire_after_s=float(cfg.pose.reacquire_after_s),
             )
+        # Hashed before MediaPipe sees it, from the very array it receives.
+        digest = frame_digest(frame_bgr) if self.hash_frames else ""
         t0 = time.perf_counter()
         pf = self._frontend.process(frame_bgr, frame_index, timestamp)
         t1 = time.perf_counter()
@@ -185,6 +201,8 @@ class FramePipeline:
         # measured split is cheap and settles the argument.
         self.timings.add("pose", t1 - t0)
         self.timings.add("quantities", t2 - t1)
+        result.frame_sha1 = digest
+        result.timing_ms = {"pose_ms": 1000.0 * (t1 - t0), "analysis_ms": 1000.0 * (t2 - t1)}
         return result
 
     def analyze(self, pf: PoseFrame) -> FrameResult:

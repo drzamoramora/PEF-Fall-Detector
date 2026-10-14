@@ -36,7 +36,7 @@ from pef_fall_detector.gui import lab_window, plots  # noqa: E402
 from pef_fall_detector.gui.lab_window import SPEEDS, LabWindow  # noqa: E402
 from pef_fall_detector.pipeline import FramePipeline  # noqa: E402
 from pef_fall_detector.sources import VideoFileSource  # noqa: E402
-from tests.support import TEST_CFG, make_pose, toppling_pose  # noqa: E402
+from tests.support import TEST_CFG, make_pose, recorded, toppling_pose  # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
 FPS = 30.0
@@ -128,13 +128,8 @@ class _Base(unittest.TestCase):
             self.fail("the queue did not finish")
 
     def records(self, kind: str = "frames") -> list[Path]:
-        files = sorted(self.out.glob("*.csv")) if self.out.exists() else []
-        if kind == "events":
-            return [f for f in files if "-events-" in f.name]
-        if kind == "landmarks":
-            return [f for f in files if "-landmarks-" in f.name]
-        return [f for f in files if "-events-" not in f.name and "-landmarks-" not in f.name
-                and not f.name.startswith("dataset-labels")]
+        """The records of one kind in every run folder PEF-Lab wrote (schema 2)."""
+        return recorded(self.out, kind) if self.out.exists() else []
 
     def analyse(self, path: Path, **kw) -> None:
         self.win.load_video(str(path), **kw)
@@ -172,10 +167,10 @@ class TestFrozenAfterAPass(_Base):
         events = [TriggerEvent(frame_index=i, timestamp=i / 10, t_deg=50.0, v_tps=-2.0,
                                formulation="score", trigger_source="score")
                   for i in range(2)]
-        self.win.records = RunRecords(self.out, "abandoned")
+        self.win.records = RunRecords(self.out / "run", "abandoned")
         self.win._run_events = events
         self.win._finalise_records("test")
-        files = sorted(self.out.glob("abandoned-events-*.csv"))
+        files = [self.out / "run" / "clips" / "abandoned" / "events.csv"]
         with open(files[0], newline="", encoding="utf-8") as fh:
             self.assertEqual([r["event_index"] for r in csv.DictReader(fh)], ["0", "1"])
 
@@ -338,7 +333,7 @@ class TestQueue(_Base):
         # A01 is a train actor in config/partition.yaml; without the
         # partition the summary would silently lose this section.
         self._run_queue()
-        self.assertIn("CALIBRATION  (2 clips)", self.printed)
+        self.assertIn("TRAIN (2)", self.printed)
 
     def test_the_reason_is_on_the_label_row_and_the_tooltip(self) -> None:
         self._run_queue()
@@ -479,11 +474,91 @@ class TestWindowWiring(_Base):
         self.win.queue_panel.table.cellWidget(0, 4).setCurrentText("Recovered")
         with contextlib.redirect_stdout(io.StringIO()):
             self.win.queue_panel.save_btn.click()
-        saved = sorted(self.out.glob("dataset-labels-reviewed-*.csv"))
+        saved = self.records("reviewed")
         self.assertEqual(len(saved), 1)
         with open(saved[0], newline="", encoding="utf-8") as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual([r["reviewed_class"] for r in rows], ["Recovered", ""])
+        run = saved[0].parent
+        self.assertTrue((run / "metrics-reviewed.txt").exists())
+        # A second save is a second file: the sequence of reviews stays readable.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.win.queue_panel.save_btn.click()
+        self.assertTrue((run / "dataset-labels-reviewed-2.csv").exists())
+
+
+class TestRunFolders(_Base):
+    """Records schema 2 in PEF-Lab: run folders, Results, Open Run, Export Figure."""
+
+    def _run_queue(self) -> None:
+        w = self.win
+        w._queue = [self.a, self.b]
+        w.queue_panel.add_clips([self.a, self.b])
+        w._update_controls()
+        self.drive_queue(w.queue_panel.start_btn.click, check_started=True)
+
+    def test_a_clip_on_its_own_is_a_run_of_its_own(self) -> None:
+        self.analyse(self.a)
+        runs = self.records("runs")
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].parent.name.endswith("-A01-S1-NotRecovered"))
+        import json
+        info = json.loads(runs[0].read_text())
+        self.assertEqual((info["kind"], info["status"]), ("video", "finished"))
+        clip = json.loads(self.records("clip")[0].read_text())
+        self.assertTrue(clip["complete"])
+        self.assertEqual(len(clip["video_sha256"]), 64)
+        self.assertEqual(len(self.records("npz")), 1)
+        self.assertIn(runs[0].parent.name, self.win.run_label.text())
+
+    def test_a_queue_is_one_run_with_labels_and_metrics(self) -> None:
+        self._run_queue()
+        runs = self.records("runs")
+        self.assertEqual(len(runs), 1)
+        run = runs[0].parent
+        self.assertTrue(run.name.endswith(f"-{self.clips.name}"))
+        self.assertEqual(len(self.records("frames")), 2)
+        self.assertTrue((run / "dataset-labels.csv").exists())
+        self.assertTrue((run / "metrics.csv").exists())
+        text = self.win.results_text.toPlainText()
+        self.assertIn("Accuracy, 4 classes", text)
+        self.assertEqual(text, (run / "metrics.txt").read_text())
+        self.assertIs(self.win.side_tabs.currentWidget(), self.win.results_text)
+        with open(run / "clips" / "A01-S1-NotRecovered" / "frames.csv", newline="") as fh:
+            row = next(csv.DictReader(fh))
+        self.assertTrue(row["decode_ms"])                      # what the frame cost
+
+    def test_open_run_shows_its_clips_frozen_without_mediapipe(self) -> None:
+        self._run_queue()
+        run = self.records("runs")[0].parent
+        verdicts = [r["verdict"] for r in self.win._queue_rows]
+        self.win.close()
+        self.win = LabWindow(Config(copy.deepcopy(self.cfg)))     # a new session
+        calls = self.calls[0]
+        self.assertTrue(self.win.open_run(run))
+        self.assertEqual(self.win.queue_panel.table.rowCount(), 2)
+        self.assertEqual(self.win.queue_panel.table.item(0, 2).text(), "NotRecovered")
+        self.assertIn("Accuracy, 4 classes", self.win.results_text.toPlainText())
+        self.win._open_for_review(0)
+        self.assertIsNotNone(self.win._frozen)
+        self.assertEqual(self.win._frozen.frame_count, N)
+        self.assertEqual([e.verdict for e in self.win._frozen.events][-1:], verdicts[:1])
+        self.assertEqual(self.calls[0], calls, "MediaPipe ran to show a recorded run")
+        self.assertEqual(len(self.records("runs")), 1, "reviewing wrote a run")
+        self.assertIn("rebuilt from the landmarks", self.win.status_label.text())
+
+    def test_open_run_refuses_a_folder_that_is_not_one(self) -> None:
+        self.assertFalse(self.win.open_run(self.clips))
+        self.assertIn("not a run folder", self.win.status_label.text())
+
+    def test_export_figure_lands_in_the_run(self) -> None:
+        self.analyse(self.a)
+        path = self.win.export_figure()
+        self.assertIsNotNone(path)
+        self.assertEqual(path.parent.name, "figures")
+        self.assertEqual(path.parent.parent, self.records("runs")[0].parent)
+        self.assertGreater(path.stat().st_size, 0)
+        self.assertNotEqual(self.win.export_figure(), path)    # never overwritten
 
 
 if __name__ == "__main__":

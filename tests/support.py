@@ -264,6 +264,26 @@ class FakeSource:
                 "implied_duration_s": self.frame_count / FPS}
 
 
+#: Where each record of a schema-2 run lives, relative to the folder the run
+#: folders are created in (``logging.output_dir``).
+RECORD_GLOBS = {
+    "runs": "*/run.json",
+    "frames": "*/clips/*/frames.csv",
+    "events": "*/clips/*/events.csv",
+    "clip": "*/clips/*/clip.json",
+    "landmarks": "*/landmarks/csv/*.csv",
+    "npz": "*/landmarks/npz/*.npz",
+    "labels": "*/dataset-labels.csv",
+    "reviewed": "*/dataset-labels-reviewed.csv",
+    "metrics": "*/metrics.csv",
+}
+
+
+def recorded(output_dir, kind: str = "frames") -> list[Path]:
+    """Every record of one kind under ``output_dir``'s run folders (records schema 2)."""
+    return sorted(Path(output_dir).glob(RECORD_GLOBS[kind]))
+
+
 class HeadlessRun:
     """Runs main.py's headless path on a scripted clip (mixin for a TestCase).
 
@@ -310,7 +330,7 @@ class HeadlessRun:
                                   expected_seconds=None, headless=True)
         with contextlib.redirect_stdout(io.StringIO()):
             main.run_headless(args)
-        events = sorted(Path(self.tmp.name).glob("*-events-*.csv"))
+        events = recorded(self.tmp.name, "events")
         self.assertEqual(len(events), 1, "no events record was written")
         with events[0].open(newline="") as fh:
             return list(csv.DictReader(fh))

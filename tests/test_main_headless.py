@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import unittest
+from pathlib import Path
 
 import main
 from tests.support import FakeSource, HeadlessRun, down_past_w_then_up
@@ -89,9 +91,9 @@ class TestAFailingRunStillClosesItsFiles(HeadlessRun, unittest.TestCase):
                 released.append(True)
 
         class _Records(main.RunRecords):
-            def close(self, events) -> None:
-                closed.append(True)
-                super().close(events)
+            def close(self, events, complete: bool = True) -> None:
+                closed.append(complete)
+                super().close(events, complete)
 
         n = len(self.frames)
         self._more = (main.RunRecords,)
@@ -109,7 +111,12 @@ class TestAFailingRunStillClosesItsFiles(HeadlessRun, unittest.TestCase):
         with self.assertRaises(RuntimeError), contextlib.redirect_stdout(io.StringIO()):
             main.run_headless(args)
         self.assertEqual(self.released, [True])
-        self.assertEqual(self.closed, [True])
+        self.assertEqual(self.closed, [False])          # closed, and marked incomplete
+        clip_json = sorted(Path(self.tmp.name).glob("*/clips/*/clip.json"))
+        self.assertEqual(len(clip_json), 1)
+        self.assertFalse(json.loads(clip_json[0].read_text())["complete"])
+        run_json = json.loads(sorted(Path(self.tmp.name).glob("*/run.json"))[0].read_text())
+        self.assertEqual(run_json["status"], "failed")
 
 
 if __name__ == "__main__":

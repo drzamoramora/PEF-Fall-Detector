@@ -5,9 +5,10 @@
 # OpenCV 5.0).
 #
 # The direct dependencies and their groups are declared in pyproject.toml.
-# This file is the lock: to be regenerated on the reference Mac with
-#   pip freeze --exclude-editable > requirements.txt
-# (B9; README, "Install"). The Raspberry Pi gets its own lock, frozen there.
+# This file is the lock of the reference Mac. The direct dependencies below
+# are edited by hand, with their reasons; the transitive ones at the end are
+# copied from `pip freeze --exclude-editable` (without ruff, a development
+# tool). The Raspberry Pi gets its own lock, frozen there.
 #
 # Install in a clean venv:
 #   python3.11 -m venv venv && source venv/bin/activate

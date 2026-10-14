@@ -52,7 +52,8 @@ _ALIASES = {
     "partiallyrecovered": PARTIALLY_RECOVERED,
 }
 
-#: Column schema of ``dataset-labels-<stamp>.csv``: one row per clip.
+#: Column schema of ``dataset-labels.csv`` (``dataset-labels-<stamp>.csv``
+#: before records schema 2): one row per clip.
 #: Before 0.2.0.dev3 the columns were in Spanish (fecha, hora, duracion_s,
 #: frames_confiables_pct, clase_detectada, clase_verdad, clase_revisada,
 #: acierto, eventos, t_disparo_s, motivo).
@@ -73,16 +74,22 @@ LABEL_FIELDS = [
     "severity",
     "I_max_s",
     "reason",
+    # Records schema 2 (0.3.0.dev0), appended so older readers keep working:
+    "alarm",                 # 1 when an event ended in a verdict that dispatches an alert
+    "trigger_sources",       # what raised each event, in order: "score;H"
+    "video_sha256",          # the clip by content (run_folder.file_sha256)
 ]
 
 
 def label_row(path, events, frames: int, reliable_frames: int, duration_s: float,
-              when: datetime) -> dict:
+              when: datetime, dispatch=("stage3_confirmed",), video_sha256: str = "") -> dict:
     """The labels-file row of one clip, from the events its run left.
 
     Shared by PEF-Lab's queue and ``main.py --folder``, so both write the
     same row for the same run. The class is the one ``classify_clip`` reads
-    from the events; the truth is the one the file name carries.
+    from the events; the truth is the one the file name carries. ``dispatch``:
+    the verdicts that raise an alarm (``alerts.dispatch_verdicts``), for the
+    alarm column.
     """
     detected, reason = classify_clip(events)
     truth = truth_from_name(path)
@@ -108,7 +115,16 @@ def label_row(path, events, frames: int, reliable_frames: int, duration_s: float
                     else ""),
         "reason": (f"{reason} — {worst.reason}" if worst and worst.reason
                    else reason),
+        "alarm": int(any(ev.verdict in tuple(dispatch) for ev in events)),
+        "trigger_sources": ";".join(getattr(ev, "trigger_source", "") or "?"
+                                    for ev in events),
+        "video_sha256": video_sha256,
     }
+
+
+def clip_id(path) -> str:
+    """``A01-S1-Recovered.mp4`` -> ``A01-S1``: the clip, without its class."""
+    return "-".join(Path(path).stem.split("-")[:2])
 
 
 def truth_from_name(path) -> str:

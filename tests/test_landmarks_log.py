@@ -27,27 +27,35 @@ from pef_fall_detector.audit_log import LANDMARK_FIELDS, landmark_row  # noqa: E
 from pef_fall_detector.config import Config  # noqa: E402
 from pef_fall_detector.pipeline import FramePipeline  # noqa: E402
 from pef_fall_detector.pose_frontend import PoseFrame  # noqa: E402
-from tests.support import TEST_CFG, FakeSource, make_pose, short_fall  # noqa: E402
+from tests.support import TEST_CFG, FakeSource, make_pose, recorded, short_fall  # noqa: E402
 
 
 class TestRow(unittest.TestCase):
 
     def test_schema_is_33_image_and_33_world_landmarks(self) -> None:
+        # x, y, z and visibility per image landmark; x, y, z per world one.
         self.assertEqual(len(LANDMARK_FIELDS), 3 + 33 * 4 + 33 * 3)
         self.assertEqual(len(set(LANDMARK_FIELDS)), len(LANDMARK_FIELDS))
 
     def test_a_detected_frame_writes_what_mediapipe_gave(self) -> None:
         pf = make_pose(7, 0.25)
+        pf.landmarks = pf.landmarks + 0.123456789012
         pf.visibility = np.linspace(0.0, 1.0, 33)
-        pf.world_landmarks = np.arange(99, dtype=float).reshape(33, 3) / 100.0
+        pf.world_landmarks = np.arange(99, dtype=float).reshape(33, 3) / 100.0 + 1e-7
         row = landmark_row(pf)
         self.assertEqual(set(row) - set(LANDMARK_FIELDS), set())
         self.assertEqual(row["frame_index"], 7)
-        self.assertEqual(row["lm23_y"], f"{pf.landmarks[23][1]:.2f}")
-        self.assertEqual(row["lm11_x"], f"{pf.landmarks[11][0]:.2f}")
-        self.assertEqual(row["lm32_v"], "1.000")
-        self.assertEqual(row["w05_z"], f"{pf.world_landmarks[5][2]:.4f}")
+        # Exact since records schema 2: every value reads back as the same float.
+        self.assertEqual(float(row["lm23_y"]), pf.landmarks[23][1])
+        self.assertEqual(float(row["lm11_x"]), pf.landmarks[11][0])
+        self.assertEqual(row["lm32_v"], "1.0")
+        self.assertEqual(float(row["lm16_v"]), pf.visibility[16])
+        self.assertEqual(float(row["w05_z"]), pf.world_landmarks[5][2])
         self.assertEqual(len(row), len(LANDMARK_FIELDS))
+
+    def test_presence_is_not_recorded(self) -> None:
+        # The pinned MediaPipe API leaves it at 0 for every landmark.
+        self.assertFalse([c for c in LANDMARK_FIELDS if c.endswith("_p")])
 
     def test_without_world_landmarks_only_the_image_ones(self) -> None:
         pf = make_pose(1, 0.0)
@@ -99,19 +107,31 @@ class TestHeadless(unittest.TestCase):
 
     def test_research_writes_one_landmark_row_per_frame(self) -> None:
         d = self._run("research")
-        lm = list(d.glob("*-landmarks-*.csv"))
+        lm = recorded(d, "landmarks")
         self.assertEqual(len(lm), 1)
         with lm[0].open(newline="") as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual(len(rows), self.n_frames)
-        self.assertEqual(rows[0]["lm23_x"], "640.00")
-        self.assertTrue(lm[0].with_suffix(".meta.json").exists())
+        self.assertEqual(rows[0]["lm23_x"], "640.0")
+        self.assertFalse(lm[0].with_suffix(".meta.json").exists())   # run.json instead
+        npz = recorded(d, "npz")
+        self.assertEqual([p.stem for p in npz], ["A00-S1-NotRecovered"])
+        with np.load(npz[0]) as data:
+            self.assertEqual(data["image"].shape, (self.n_frames, 33, 3))
 
     def test_research_writes_frames_events_and_landmarks(self) -> None:
-        names = sorted(p.name for p in self._run("research").glob("*.csv"))
-        self.assertEqual([n.split("-2")[0] for n in names],
-                         ["A00-S1-NotRecovered", "A00-S1-NotRecovered-events",
-                          "A00-S1-NotRecovered-landmarks"])
+        d = self._run("research")
+        runs = [p.parent for p in recorded(d, "runs")]
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].name.endswith("-A00-S1-NotRecovered"))
+        self.assertEqual(sorted(str(p.relative_to(runs[0])) for p in runs[0].rglob("*")
+                                if p.is_file()),
+                         ["clips/A00-S1-NotRecovered/clip.json",
+                          "clips/A00-S1-NotRecovered/events.csv",
+                          "clips/A00-S1-NotRecovered/frames.csv",
+                          "landmarks/csv/A00-S1-NotRecovered.csv",
+                          "landmarks/npz/A00-S1-NotRecovered.npz",
+                          "run.json"])
 
     def test_deployment_writes_nothing(self) -> None:
         # §3.6: the deployed detector persists nothing.
