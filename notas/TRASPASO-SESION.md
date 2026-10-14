@@ -15,7 +15,7 @@ esto es el mapa.
 - Videos: `Paper Fall/recordings/` (128 clips: 72 caídas A01–A18 × S1–S4, clases Recovered / PartiallyRecovered / NotRecovered, y 56 NoFall B01–B14).
   - Errata de nombres: `A3-S2` es A13-S2; `A06-S14` y `A11-S14` son S4.
 - Entorno del Mac: `venv/` con `requirements.txt` fijado (mediapipe 0.10.14, protobuf 4.25.9, opencv-contrib-python 4.13.0.92, numpy 2.4.4, PySide6 6.11.2, pyqtgraph 0.14.0, PyYAML 6.0.3). El `venv-viejo` ya se borró.
-- Respaldo de la nube (fuera del repo): `Paper Fall/respaldo-nube/`.
+- Respaldo de la nube (fuera del repo): `Paper Fall/respaldos/respaldo-nube/`.
   - `scripts/` con `verif2.py`, `diag81.py`, `sim81.py` y los demás; ver su `LEEME.md`.
   - `corridas/nube-8.1` y `corridas/nube-8.3`, que son registros x86 sin los CSV de 33 puntos.
   - `LEGACY.md` y este traspaso.
