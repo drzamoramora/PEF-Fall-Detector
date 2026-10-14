@@ -228,23 +228,25 @@ Al terminar, actualizar `LEGACY.md` en `legacy-pre-cleanup` con lo realmente hec
 
 Claude Code en la nube puede hacer el código y las pruebas unitarias, pero no tiene los videos. La verificación de los 128 clips la corre el autor en su Mac, contra una corrida de referencia hecha antes de empezar.
 
-## 8. Cómo correr y verificar
+### Estado de la limpieza (13/10)
 
-- Pruebas: `python -m unittest discover -s tests`. Hoy son 594 y 1 omitida.
-- GUI: `python main.py`.
-- Lote en el Mac:
-  `sed 's#output_dir: "logs"#output_dir: "logs/X"#' config.yaml > /tmp/c.yaml; for v in ../recordings/*.mp4; do python main.py --video "$v" --headless --config /tmp/c.yaml > /dev/null 2>&1; done`
-- Métricas: `python3 respaldo-nube/scripts/verif2.py <repo> <logs> [<logs_b>]` (accuracy total y por partición, sensibilidad, falsos positivos, alarma, eventos disparados por H, concordancia).
-- Diagnóstico de A: `diag81.py`. Simulación de reglas con A: `sim81.py`.
-- Replay sin MediaPipe: `python3 rep84.py <repo> <logs>`.
-  - Reconstruye cada cuadro desde el CSV de 33 puntos y pasa la corrida por el código del repo.
-  - Con `--a ALTO BAJO VENTANA --vneed V` simula el disparo por A sobre código viejo.
-  - Hoy vive en la nube del chat y en la VM (`~/ana/`).
+- B0 y B1: hechos y commiteados (ramas `cleanup-b0` y `cleanup-b1`).
+- B2 a B8: hechos y verificados con replay (idénticos a la 8.4 en las dos plataformas), **sin commit**: las ramas `cleanup-b2` a `cleanup-b8` apuntan al commit de B1 y el trabajo está en la carpeta.
+- B9: hecho (pyproject, dependencias, `.gitignore`, `notas/archivo/`, README); falta generar `requirements.txt` con `pip freeze` en el Mac.
+- Falta: commitear B2–B9, un lote real del Mac contra `logs/cli-a84` con el mapa de B5, y actualizar `LEGACY.md` en `legacy-pre-cleanup` (después de los commits: cambiar de rama con trabajo sin commit lo pondría en riesgo).
 
-## 9. Notas vigentes en `notas/`
+## 8. Cómo correr y verificar (desde B9)
 
-- `ANALISIS-82-90.md`: el diagnóstico y la propuesta de A.
-- `NOFALL.md`: por qué los falsos positivos son los ADL de estrés del §3.3.
-- `POSIBLES-CAMBIOS-DEL-DRAFT.md`: 36 cambios al paper, con dos repasadas.
-- `HALLAZGO-B05.md` y `CONVENCION-NOMBRES.md`.
-- Las demás son históricas.
+- Instalar: ver el README (`pip install -r requirements.txt` y `pip install -e ".[gui,dev]" --no-deps`).
+- Pruebas: `python -m unittest discover -s tests` (las de PEF-Lab se omiten sin PySide6). Estilo: `python -m ruff check .`.
+- GUI: `pef-lab` (o `python main.py`).
+- Lote en el Mac (el modo por defecto, despliegue, no escribe nada; el lote necesita `--mode research`):
+  `pef-run --folder ../recordings --mode research --output-dir logs/X --quiet`
+- Métricas: `python tools/metrics.py logs/X [logs/Y]`.
+- Comparar dos corridas: `python tools/compare_runs.py logs/A logs/B --landmarks`. Contra una corrida anterior a 0.2.0.dev5 (por ejemplo `logs/cli-a84`): agregar `--map tools/maps/b5.json`.
+- Replay sin MediaPipe: `python tools/replay.py logs/X /tmp/salida [--repo OTRO-CHECKOUT]`.
+- Diagnóstico de A (`diag81.py`) y los demás scripts de la nube: siguen en `respaldo-nube/scripts/`, sin portar.
+
+## 9. Notas
+
+El índice está en `notas/README.md`: las vigentes en `notas/` y las de fases cerradas en `notas/archivo/`.

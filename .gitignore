@@ -221,3 +221,9 @@ __marimo__/
 
 
 logs/
+
+# End-to-end test data: volunteers' poses, kept off the repository
+tests/data/
+
+# macOS Finder metadata
+.DS_Store

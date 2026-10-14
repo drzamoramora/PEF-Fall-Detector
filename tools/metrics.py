@@ -3,7 +3,7 @@
 Works the same on a real run and on a replay (``replay.py``):
 
 * accuracy over the four classes, total and per partition (train/test by
-  actor, ``notas/particion.yaml``);
+  actor, ``config/partition.yaml``);
 * falls detected (any fall class), the falls missed, the false-positive labels;
 * alarms: an alarm is an event whose verdict the run's configuration
   dispatches (``alerts.dispatch_verdicts``, stage3_confirmed). Counted per
@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _records import find_runs  # noqa: E402
 
 TOOLS_REPO = Path(__file__).resolve().parents[1]
-DEFAULT_PARTITION = TOOLS_REPO / "notas" / "particion.yaml"
+DEFAULT_PARTITION = TOOLS_REPO / "config" / "partition.yaml"
 
 
 class _Event:

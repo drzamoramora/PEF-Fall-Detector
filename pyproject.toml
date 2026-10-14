@@ -1,0 +1,66 @@
+# PEF-Fall-Detector: what the package is, what it needs, and the commands it
+# installs. Install from a checkout, editable, so the detector keeps reading
+# config.yaml and config/partition.yaml from the repository:
+#
+#     python3.11 -m venv venv && source venv/bin/activate
+#     pip install -e ".[gui,dev]"      # Mac / development: everything
+#     pip install -e .                 # Raspberry Pi: the detector alone
+#
+# The versions below are pinned exactly, not with ranges: MediaPipe's
+# landmarks change with the MediaPipe, OpenCV and numpy versions, and with
+# them the decisions (README, "Reproducibility"). requirements.txt adds the
+# exact version of every indirect dependency, frozen on the reference Mac.
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pef-fall-detector"
+dynamic = ["version"]
+description = "Physics-informed, explainable fall detection from MediaPipe pose landmarks"
+readme = "README.md"
+license = { file = "LICENSE" }
+# 3.11 is the reference (Mac and Raspberry Pi OS Bookworm). numpy 2.4 needs
+# 3.11 or newer; mediapipe 0.10.14 publishes wheels up to 3.12.
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "mediapipe==0.10.14",
+    "protobuf==4.25.9",
+    # mediapipe 0.10.14 depends on opencv-contrib-python, which already ships
+    # cv2. Do not also install opencv-python: both write the same package.
+    "opencv-contrib-python==4.13.0.92",
+    "numpy==2.4.4",
+    "PyYAML==6.0.3",
+]
+
+[project.optional-dependencies]
+# PEF-Lab, the visual workbench. Not needed on the Raspberry Pi.
+gui = [
+    "PySide6==6.11.2",
+    "pyqtgraph==0.14.0",
+]
+dev = [
+    "ruff>=0.6",
+]
+
+[project.scripts]
+pef-lab = "main:main"      # PEF-Lab (GUI); same options as python main.py
+pef-run = "main:run"       # headless: --video FILE or --folder DIR
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["pef_fall_detector*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pef_fall_detector.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["venv", "logs", "notas"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B"]

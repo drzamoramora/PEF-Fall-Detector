@@ -17,7 +17,7 @@ The properties pinned here, and why each one earns a test:
 * an occluded nose does not end the episode — that is the face-down case
   the quantity exists for.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ class TestMotionResets(unittest.TestCase):
             if i > 0 and secs == 0.0:
                 broke = True
                 break
-        self.assertTrue(broke, "una deriva lenta deberia terminar el episodio")
+        self.assertTrue(broke, "a slow drift should end the episode")
 
     def test_the_radius_is_measured_around_the_mean_not_the_first_frame(self) -> None:
         """§3.4: "within a small radius ε around their **average** position".
@@ -167,7 +167,7 @@ class TestMotionResets(unittest.TestCase):
             if secs == 0.0:
                 broke = True
                 break
-        self.assertTrue(broke, "el episodio deberia romperse al alejarse el promedio")
+        self.assertTrue(broke, "the episode should break as the average moves away")
 
     def test_the_episode_buffer_is_bounded(self) -> None:
         # A subject asleep in frame keeps one episode alive indefinitely; the

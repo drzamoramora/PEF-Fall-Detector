@@ -1,15 +1,15 @@
-"""Tema visual de PEF-Lab: oscuro, sobrio, con un solo color de acento.
+"""PEF-Lab's visual theme: dark, sober, with a single accent colour.
 
-Solo aspecto. Ningun valor de aqui cambia lo que el detector mide o decide.
-Los colores de etapa son los mismos de la linea de tiempo, para que la
-etiqueta de la etapa y la franja de colores digan lo mismo.
+Looks only. No value here changes what the detector measures or decides.
+The stage colours are the timeline's, so the stage label and the colour
+strip say the same thing.
 """
 
 from __future__ import annotations
 
-BG = "#111317"          # fondo de la ventana
-PANEL = "#1a1d23"       # tarjetas y paneles
-PANEL_2 = "#22262e"     # campos, tablas, botones secundarios
+BG = "#111317"          # window background
+PANEL = "#1a1d23"       # cards and panels
+PANEL_2 = "#22262e"     # fields, tables, secondary buttons
 BORDER = "#2c313a"
 TEXT = "#e6e8eb"
 MUTED = "#98a2ad"
@@ -20,11 +20,11 @@ WARNING = "#f5a524"
 SUCCESS = "#30a46c"
 INFO = "#4fc3f7"
 
-#: Fondo de las graficas (pyqtgraph), un punto mas claro que la ventana.
+#: Plot background (pyqtgraph), a shade lighter than the window.
 PLOT_BG = "#15181d"
 PLOT_FG = "#aab2bd"
 
-#: Color de la etiqueta de etapa; iguales a la linea de tiempo.
+#: Stage label colour; the same as the timeline's.
 STAGE_COLOURS = {
     "MONITORING": "#546e7a",
     "CONFIRMING": "#ff9800",
@@ -153,6 +153,6 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 
 
 def chip_style(colour: str) -> str:
-    """Una etiqueta tipo pastilla con fondo de color."""
+    """A pill-shaped label with a coloured background."""
     return (f"background-color: {colour}; color: white; font-weight: bold; "
             f"border-radius: 10px; padding: 3px 12px;")

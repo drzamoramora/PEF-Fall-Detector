@@ -149,7 +149,7 @@ EXPERIMENTAL_QUANTITIES = frozenset({
                           # Proposed to cover two gaps measured in this
                           # project's footage — P unmeasurable when feet are
                           # occluded, T falsely low when a fall's rotation
-                          # axis points at the camera. See quantities.py.
+                          # axis points at the camera. See quantities.h.
     "H_raw",              # H's numerator/denominator ratio BEFORE baselining
                           # (vertical spine extent / shoulder width). Recorded
                           # so a calibration pass can see the raw signal
@@ -163,11 +163,12 @@ EXPERIMENTAL_QUANTITIES = frozenset({
                           # apart from a fall — T/V/P/I/H all read posture,
                           # this is the only one that reads the hands. Logged
                           # only; not wired into any §3.5 stage yet.
-    "A_head",             # Quantity A (fase 8, not in the paper, in tension
+    "A_head",             # Quantity A (phase 8, not in the paper, in tension
                           # with §3.2): head height above the ankles along
                           # gravity, from the 3D world landmarks, over the
                           # same subject's standing height. ~1 standing, ~0
-                          # on the floor. NaN until calibrated. Logged only.
+                          # on the floor. NaN until calibrated. Read by
+                          # Stage 3 (8.2/8.3) and Stage 1 (8.4).
     "A_hip",              # the same for the hips (sitting on a sofa vs on
                           # the floor). Logged only.
 })
@@ -181,7 +182,7 @@ EXPERIMENTAL_QUANTITIES = frozenset({
 #: The decision pipeline reads none of this; it exists so that a candidate
 #: measurement can be evaluated on every clip, on every platform, without
 #: re-running MediaPipe. Written to its own file, never into the frame
-#: record, and only when ``logging.save_landmarks`` is true: §3.6 promises
+#: record, and only in research mode (``records.RunRecords``): §3.6 promises
 #: that the deployed device stores no landmark coordinates.
 LANDMARK_FIELDS: list[str] = (
     ["frame_index", "timestamp_s", "detected"]
@@ -231,8 +232,8 @@ def csv_column(name: str) -> str:
 #: signals the paper does not define. Most are diagnostic only; two
 #: (``H_ratio_EXP``, indirectly ``H_raw_EXP``/``H_baseline_EXP``) ARE wired
 #: into Stage1Trigger/Stage3Evaluator as OR'd fallbacks, gated by the
-#: ``experimental.*`` thresholds in config.yaml — see quantities.py's module
-#: docstring. The mark is about the QUANTITY'S STATUS in the paper, not
+#: ``experimental.*`` thresholds in config.yaml — see the ``quantities``
+#: package docstring. The mark is about the QUANTITY'S STATUS in the paper, not
 #: about whether today's config happens to consume it.
 PHASE2_FIELDS = PHASE1_FIELDS + [
     "T_deg",              # Quantity T: trunk inclination angle (§3.4)
@@ -298,7 +299,7 @@ EVENT_FIELDS = [
                             # recorded even when it was NOT what fired, so a
                             # reviewer can tell whether Stage1Trigger's H+V
                             # fallback or T/V's own formulation was responsible.
-    "motivo",               # the rule that decided the verdict, with the numbers
+    "reason",               # the rule that decided the verdict, with the numbers
                             # it read (TriggerEvent.reason). §3.5: "a downstream
                             # reviewer can reconstruct the decision".
 ]

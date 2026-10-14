@@ -6,24 +6,26 @@ it silently scores the detector against the wrong answer. So the tests pin
 the exact spellings seen in the 128 clips, including the ones that are
 wrong, and pin that nothing else is normalised.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from pef_fall_detector.classification import (
-    NOT_RECOVERED,
     NO_FALL,
+    NOT_RECOVERED,
     PARTIALLY_RECOVERED,
     RECOVERED,
 )
 from pef_fall_detector.dataset import (
     confusion,
     format_confusion,
+    label_row,
     truth_from_name,
     video_files,
 )
@@ -89,7 +91,7 @@ class TestVideoFiles(unittest.TestCase):
 class TestConfusion(unittest.TestCase):
 
     def rows(self, *pairs):
-        return [{"clase_verdad": t, "clase_detectada": d, "clase_revisada": ""}
+        return [{"true_class": t, "detected_class": d, "reviewed_class": ""}
                 for t, d in pairs]
 
     def test_counts_land_in_the_right_cells(self) -> None:
@@ -110,7 +112,7 @@ class TestConfusion(unittest.TestCase):
 
     def test_a_human_review_overrides_the_machine(self) -> None:
         rows = self.rows((RECOVERED, NOT_RECOVERED))
-        rows[0]["clase_revisada"] = RECOVERED
+        rows[0]["reviewed_class"] = RECOVERED
         _, scored, correct = confusion(rows)
         self.assertEqual((scored, correct), (1, 1))
 
@@ -118,11 +120,26 @@ class TestConfusion(unittest.TestCase):
         text = format_confusion(self.rows((RECOVERED, RECOVERED),
                                           (NO_FALL, NO_FALL),
                                           (NOT_RECOVERED, NO_FALL)))
-        self.assertIn("aciertos: 2/3", text)
+        self.assertIn("correct: 2/3", text)
         self.assertIn(NOT_RECOVERED, text)
 
     def test_no_scorable_rows_says_so_instead_of_dividing_by_zero(self) -> None:
-        self.assertIn("sin clips", format_confusion(self.rows(("", ""))))
+        self.assertIn("no clips", format_confusion(self.rows(("", ""))))
+
+
+class TestLabelRow(unittest.TestCase):
+
+    def test_an_unmeasured_immobility_is_left_empty(self) -> None:
+        # An event that never reached Stage 3 has I max NaN: the row says
+        # nothing, never the text "nan".
+        from pef_fall_detector.state_machine import TriggerEvent
+        ev = TriggerEvent(frame_index=3, timestamp=0.1, t_deg=50.0, v_tps=-2.0,
+                          formulation="score", verdict="stage2_rejected")
+        row = label_row("B01-S1-NoFall.mp4", [ev], 10, 10, 1.0, datetime(2026, 10, 1))
+        self.assertEqual(row["I_max_s"], "")
+        ev.max_immobility_s = 1.234
+        row = label_row("B01-S1-NoFall.mp4", [ev], 10, 10, 1.0, datetime(2026, 10, 1))
+        self.assertEqual(row["I_max_s"], "1.23")
 
 
 if __name__ == "__main__":

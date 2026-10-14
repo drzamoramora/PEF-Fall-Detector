@@ -1,0 +1,812 @@
+# Historia de `config.yaml`
+
+Desde B2 (versión 0.2.0.dev2), cada clave de `config.yaml` lleva una línea en inglés: qué es, en qué unidad y para qué. Las historias de medición que explicaban cada valor salieron del archivo y quedan aquí, bajo su clave.
+
+**Cómo está hecha esta nota:**
+
+- Cada bloque es el texto original **copiado tal cual**, con sus líneas de valor, del `config.yaml` anterior a B2 (commit `b45f03f`, rama `cleanup-b1`, versión 0.2.0.dev1). No se corrigió nada dentro de los bloques: ni acentos, ni erratas, ni afirmaciones viejas.
+- Cuando un bloque dice algo que hoy es falso, o estaba debajo de la clave equivocada, lo aclara una nota **antes** del bloque.
+- Están todas las líneas del archivo viejo, cada una una sola vez (verificado al generar la nota). El archivo completo: `git show b45f03f:config.yaml`.
+- El orden es el de `config.yaml` desde B2: pose, registros, Etapa 1, Etapa 2, Etapa 3, A, H, alertas y pantalla.
+- Las fechas son de 2026.
+
+**Qué cambió en los valores:** nada, salvo una clave. `logging.save_landmarks: true` pasó a ser `logging.mode`, y `config.yaml` queda en `deployment`, que no guarda los 33 puntos (§3.6). Las corridas del dataset tienen que usar `research`.
+
+**[EXP]** marca lo que el draft 4 no describe: las cantidades A y H, y `stage3.severity_uses_leg_extension`.
+
+## Encabezado del archivo
+
+### Encabezado
+
+Líneas 1–9 del archivo viejo.
+
+> **Nota (B2):** Las marcas `[Phase N]` ya no dicen nada: todas las fases que nombran están construidas. En B2 salieron del archivo.
+
+```yaml
+# =============================================================================
+# PEF-Fall-Detector — central configuration
+#
+# Every tunable parameter of the pipeline lives in this file, so that the
+# calibration protocol reported in Section 4 of the paper maps 1:1 to a
+# concrete, versionable artifact. Parameters marked [Phase N] are read only
+# once that phase of the implementation plan is built; they are declared here
+# from day one so the full calibration surface is visible.
+# =============================================================================
+```
+
+## `pose`
+
+### `pose` (línea de la sección)
+
+Línea 11 del archivo viejo.
+
+```yaml
+pose: # [Phase 1] MediaPipe Pose front-end (§3.2)
+```
+
+### `pose.model_complexity`
+
+Líneas 12–34 del archivo viejo.
+
+> **Nota (B2):** En el archivo este bloque estaba entre `pose:` y `model_complexity`. Es la historia de esa clave: los párrafos del principio son de cuando se usó el modelo pesado (2); el último, de la vuelta a 1 el 23/09. El valor vigente es 1.
+
+```yaml
+  # PESADO. El §3.2 lo autoriza literalmente: "with the heavy variant
+  # reserved for low-light or multi-person scenarios where LANDMARK DRIFT IS
+  # OBSERVED IN PRACTICE". Se observo drift, esta medido y confirmado
+  # visualmente: en A09-S3 el esqueleto se invierte 163 grados en 33 ms y no
+  # vuelve, y MediaPipe reporta 0.961 de confianza en ese mismo cuadro.
+  # De las 24 caidas NotRecovered, las 19 con esqueleto fiel aciertan 19/19 y
+  # las 4 sin el aciertan 0/4: el cuello de botella no es la logica del §3.4
+  # ni del §3.5, es la percepcion que las alimenta.
+  # CUIDADO: cambiar esto cambia los landmarks, y con ellos TODO lo calibrado
+  # encima — trigger_score, las bandas de severidad
+  # 30/60. Ninguno de esos numeros sigue siendo valido hasta recalibrar.
+  # Cuesta velocidad de inferencia, que toca el §3.6.
+  # NOTA OPERATIVA: model_complexity 2 NO se puede correr en el contenedor de
+  # desarrollo. MediaPipe no trae el modelo pesado — lo descarga la primera
+  # vez desde storage.googleapis.com, que el proxy de ese entorno bloquea
+  # (403). Se mide solo en la maquina del autor.
+  # 23/09: vuelve a 1. El modelo cambia QUE caidas se pierden, no cuantas:
+  # con 1 se perdia A08-S3; con 2 se detecta, pero se pierden A08-S1 y A08-S2
+  # (el esqueleto desaparece con la persona en el suelo). La referencia tiene
+  # que ser una sola para que las fases sean comparables, y 1 es el default
+  # del §3.2, el que corre en el Pi del §3.6, y el que midio mejor en conjunto
+  # (78.1 % contra 73.4 % del pesado).
+  model_complexity: 1 # 0=lite, 1=full (§3.2 default), 2=heavy
+```
+
+### `pose`: claves de una línea
+
+Líneas 35–38 del archivo viejo.
+
+```yaml
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+  smooth_landmarks: true # MediaPipe's internal temporal smoothing
+  visibility_threshold: 0.5 # below this, a landmark is treated as unreliable
+```
+
+### `pose.reacquire_after_s`
+
+Líneas 39–45 del archivo viejo.
+
+```yaml
+  # Fase 4: si el nucleo (hombros y caderas) sigue bajo visibility_threshold
+  # este tiempo con el rastreador "enganchado", se reinicia MediaPipe para que
+  # el detector vuelva a buscar a la persona (A16-S1: 5.4 s pegado a una
+  # region vieja mientras el sujeto caia a la vista). 0 lo apaga. Mismo valor
+  # que stage1.history_max_gap_s: mas alla de ese hueco la velocidad ya se
+  # descarta, asi que esperar mas no conserva nada.
+  reacquire_after_s: 0.5
+```
+
+## `logging`
+
+### `logging` (línea de la sección)
+
+Línea 47 del archivo viejo.
+
+```yaml
+logging: # [Phase 1] per-frame audit CSV (§3.5 auditability)
+```
+
+### `logging.output_dir`
+
+Línea 48 del archivo viejo.
+
+> **Nota (B2):** Desactualizado: una ruta relativa se toma desde la raíz del repositorio (`audit_log.AuditLogger`), no desde donde se lanza el programa.
+
+```yaml
+  output_dir: "logs" # created next to the working directory if missing
+```
+
+### `logging.save_landmarks` (desde B2: `logging.mode`)
+
+Líneas 49–53 del archivo viejo.
+
+> **Nota (B2):** Desde B2 la clave es `logging.mode`: `research` guarda los 33 puntos por cuadro y `deployment` no. `config.yaml` queda en `deployment`; las corridas del dataset usan `research`.
+
+```yaml
+  # EXPERIMENTAL, solo investigacion: los 33 puntos del esqueleto por cuadro
+  # (imagen y 3D) en <clip>-landmarks-<fecha>.csv. Ninguna decision los lee;
+  # sirven para evaluar medidas nuevas sin volver a correr MediaPipe. En el
+  # dispositivo desplegado va en false: el §3.6 promete no guardar landmarks.
+  save_landmarks: true
+```
+
+## `stage1`
+
+### `stage1` (línea de la sección)
+
+Línea 55 del archivo viejo.
+
+```yaml
+stage1: # [Phase 2-3] kinematic trigger (T + V), §3.4/§3.5
+```
+
+### `stage1.threshold_T_deg` y `stage1.threshold_V`
+
+Líneas 56–57 del archivo viejo.
+
+```yaml
+  threshold_T_deg: 45.0 # trunk inclination angle to arouse suspicion
+  threshold_V: -1.5 # vertical centroid velocity, torso-lengths/second
+```
+
+### `stage1.velocity_window_s`
+
+Líneas 58–62 del archivo viejo.
+
+```yaml
+  # Window and smoothing are expressed in SECONDS, never in frames: the same
+  # "5 frames" spanned 0.08 s in one of this project's clips and 0.40 s in
+  # another, and a longer window flattens the peak, so a threshold tuned on
+  # 30 fps footage would miss falls on a slower device.
+  velocity_window_s: 0.167 # time span of the discrete derivative
+```
+
+### `stage1.ema_time_constant_s`
+
+Líneas 63–65 del archivo viejo.
+
+```yaml
+  ema_time_constant_s:
+    0.1 # centroid smoothing before differentiation;
+    # 0 disables it (honest way to run without)
+```
+
+### `stage1.history_max_gap_s`
+
+Líneas 66–69 del archivo viejo.
+
+> **Nota (B2):** Le falta un uso: el mismo valor decide cuánto puede estar perdido el sujeto antes de que un evento pendiente se cierre o se abandone (`FramePipeline.analyze`).
+
+```yaml
+  history_max_gap_s:
+    0.5 # a larger gap between samples clears velocity
+    # history (differentiating across a detection
+    # loss or a seek would produce a fake spike)
+```
+
+### `stage1.trigger_formulation`
+
+Líneas 70–82 del archivo viejo.
+
+> **Nota (B2):** Las cuentas (13 caídas) son de la fase en que se eligió la formulación. Desde B1, `simultaneous` y `sequential` viven en `ablations.py`.
+
+```yaml
+  # Which reading of §3.5's "instantaneous combination of the two quantities
+  # [that] exceeds a configurable trigger threshold while V remains negative"
+  # the trigger implements. Measured on 13 real falls with a 0.1 s hold:
+  # score 13/13, sequential 12/13, v_only 13/13 (one false positive),
+  # simultaneous 8/13.
+  #
+  # 'score' is the default because it follows that sentence literally — a
+  # combination of both quantities, on a single frame, against a threshold,
+  # with V negative on that same frame — and because it loses no falls. The
+  # other three stay available: §3.7 requires the single-threshold ablation,
+  # and comparing readings of the same sentence is itself a result.
+  # PROVISIONAL — confirmed by the dataset, not settled by these numbers.
+  trigger_formulation: score # score | simultaneous | sequential | v_only
+```
+
+### `stage1.trigger_score`
+
+Líneas 83–111 del archivo viejo.
+
+> **Nota (B2):** Las cifras son de la calibración de `trigger_score`, anterior a la fase 8. No son las cifras actuales del sistema completo (8.4: 115/128 en la nube, 110/128 en el Mac).
+
+```yaml
+  trigger_score:
+    2.6 # 'score' only. Each term is its quantity over
+    # its own threshold, so 2.0 means "both exactly
+    # at threshold" y por encima significa que las
+    # dos juntas son mas extremas que eso.
+    # 2.2 era el valor calibrado para el disparador
+    # instantaneo. Con la ventana de pico la
+    # condicion es mas facil de cumplir, asi que el
+    # umbral se recalibro: barrido 2.2-3.0 sobre los
+    # 88 clips de CALIBRACION. 2.5 y 2.6 EMPATAN
+    # ahi (72/88 = 81.8% los dos), separados por un
+    # clip en cada direccion: 2.5 pierde una caida
+    # menos, 2.6 da una alarma falsa menos. La
+    # calibracion no puede distinguirlos.
+    # El empate se rompio con un criterio declarado
+    # de antemano — preferir menos alarmas falsas,
+    # porque el §3.7 pide reportar falsos positivos
+    # por hora y con 9.7 minutos de metraje ADL cada
+    # alarma indebida se extrapola muy alto — y NO
+    # mirando la particion de prueba. Que sobre los
+    # 128 uno de 97 y el otro 100 no es evidencia de
+    # que 2.6 sea mejor: es la diferencia que la
+    # particion existe para no dejarnos creer.
+    # El resto de la curva, para el §3.5 ("tunable
+    # at deployment time"): a 2.2 la sensibilidad
+    # sube a 93.1% con especificidad 71.4%; a 2.8
+    # baja a 76.4% con 91.1%; a 3.0, 72.2% / 92.9%.
+    # Quien despliegue en un contexto donde perder
+    # una caida sea inaceptable debe bajarlo.
+```
+
+### `stage1.min_trunk_ratio` y `stage1.trunk_reference_window_s`
+
+Líneas 113–125 del archivo viejo.
+
+> **Nota (B2):** Cuando la guarda salta, T queda sin medir (NaN) en ese cuadro.
+
+```yaml
+  # Guarda de plausibilidad del tronco (§3.2). El §3.4 descarta T bajo
+  # 0.001 px, umbral que ninguna pose real alcanza: en el clip A14 el tronco
+  # se proyecto a 2 px con confianza 0.99 y T dio 176.9 junto a 26.0 grados en
+  # cuadros consecutivos. Aqui la comparacion es contra la MEDIANA reciente del
+  # mismo sujeto — una razon entre cuadros, que es lo que el §3.2 pide — y no
+  # contra un conteo absoluto de pixeles, porque un sujeto lejos de la camara
+  # tiene un tronco corto sin que nada este mal.
+  # Suelto a proposito: una caida real tambien acorta el tronco (mediana 0.40
+  # de su propio valor reciente, medido sobre las 56 caidas que dispararon),
+  # asi que un valor apretado rechazaria caidas. Esto quita geometria
+  # imposible, no geometria escorzada. 0 lo desactiva.
+  min_trunk_ratio: 0.15
+  trunk_reference_window_s: 1.0
+```
+
+### `stage1.trigger_hold_s`
+
+Líneas 126–131 del archivo viejo.
+
+```yaml
+  trigger_hold_s:
+    0.1 # how long the condition must persist before
+    # firing (hysteresis). In SECONDS: a frame
+    # count would mean a different physical
+    # duration on the Pi than on a laptop, and
+    # the trigger is measurably sensitive to it.
+```
+
+### `stage1.confirm_window_s`
+
+Líneas 132–135 del archivo viejo.
+
+```yaml
+  confirm_window_s:
+    1.0 # 'sequential' only: how long after the V event
+    # T may still arrive and confirm. Real falls
+    # show T-V peak offsets of 0.03 s to 1.8 s.
+```
+
+### `stage1.trigger_peak_window_s`
+
+Líneas 136–155 del archivo viejo.
+
+```yaml
+  # Ventana de pico: de que tan atras puede venir cada cantidad.
+  # El §3.5 pide una combinacion "instantanea" de T y V. Esa es una condicion
+  # ADICIONAL que el §3.4 no implica: el §3.4 describe la firma temporal de
+  # cada cantidad por separado — T llegando al rango de caida "within a short
+  # time window", V muy negativa "within a short window" — y no dice que
+  # coincidan.
+  # No coinciden, y por mecanica, no por casualidad: T es una posicion y V es
+  # una velocidad del mismo cuerpo. El centroide va mas rapido cuando el
+  # tronco aun esta casi vertical, y el tronco alcanza su mayor inclinacion
+  # cuando el movimiento ya casi se detuvo. Medido sobre PEF-FallDB, en las
+  # caidas que el disparador perdio los dos picos estan separados entre 0.6 s
+  # y 3.1 s — nunca menos de medio segundo. Doce clips con el tronco llegando
+  # a 178 grados y el sistema sin ver nada.
+  # El §3.5 ya le concede a cada etapa una longitud de ventana calibrable
+  # ("Each stage's input variables, threshold values, and window lengths are
+  # tunable at deployment time"), asi que esto es un parametro que el paper ya
+  # declaro, no maquinaria nueva.
+  # 0.0 = lectura literal del §3.5, ambas cantidades del mismo cuadro. Es el
+  # comportamiento anterior exacto y la ablacion que pide el §3.7.
+  trigger_peak_window_s: 0.8
+```
+
+## `stage2`
+
+### `stage2` (sección)
+
+Líneas 195–197 del archivo viejo.
+
+> **Nota (B2):** Desactualizado: la Etapa 2 existe desde la fase 4 y no usa un voto k-de-n sino una fracción de los cuadros medibles (`com_outside_fraction`).
+
+```yaml
+stage2: # [Phase 4] geometric verification (P), §3.4/§3.5
+  # Quantity P is computed every frame from Phase 4a on; the STAGE that
+  # consumes it (the k-of-n vote below) arrives with the state machine.
+```
+
+### `stage2.com_hip_weight`
+
+Líneas 198–203 del archivo viejo.
+
+```yaml
+  com_hip_weight:
+    0.65 # weight of the hip cluster in the COM estimate.
+    # §3.4: "the hip cluster carries the dominant
+    # contribution". PROVISIONAL — the body's mass
+    # sits near the sacrum, so >0.5 is anatomy, but
+    # the exact value awaits the dataset.
+```
+
+### `stage2.com_eval_window_s`
+
+Líneas 204–210 del archivo viejo.
+
+```yaml
+  # The window opens AT the trigger and runs forward: when Stage 1 fires the
+  # body is still on its way down, so judging the geometry on the trigger
+  # frame would test the posture the subject was leaving.
+  com_eval_window_s:
+    0.33 # how long P is watched before the verdict.
+    # In SECONDS (was 10 frames): a frame count
+    # is a different duration on the Pi.
+```
+
+### `stage2.com_outside_fraction`
+
+Líneas 211–215 del archivo viejo.
+
+```yaml
+  com_outside_fraction:
+    0.5 # share of MEASURABLE frames in the window that
+    # must show the COM outside the support. A
+    # fraction, not a vote count: "5 of 10" is
+    # unreachable at 10 fps over a third of a second.
+```
+
+### `stage2.com_min_samples`
+
+Líneas 216–219 del archivo viejo.
+
+```yaml
+  com_min_samples:
+    3 # fewer measurable frames than this -> verdict
+    # 'inconclusive', never 'rejected'. Occluded
+    # feet must not read as "no fall".
+```
+
+### `stage2.min_foot_visibility`
+
+Línea 220 del archivo viejo.
+
+```yaml
+  min_foot_visibility: 0.5 # below this, feet are occluded -> P inconclusive
+```
+
+### `stage2.contact_band_torso`
+
+Líneas 221–228 del archivo viejo.
+
+```yaml
+  contact_band_torso:
+    0.15 # §3.4 builds the support polygon from the foot
+    # landmarks "in bipedal contact". With no
+    # calibrated ground plane, the floor is the
+    # lowest foot landmark still inside the frame,
+    # and anything more than this far above it has
+    # left the floor. In torso lengths, so it means
+    # the same at any camera distance. PROVISIONAL.
+```
+
+## `stage3`
+
+### `stage3` (línea de la sección)
+
+Línea 230 del archivo viejo.
+
+```yaml
+stage3: # [Phase 5] immobility confirmation (I), §3.4/§3.5
+```
+
+### `stage3.epsilon`
+
+Línea 231 del archivo viejo.
+
+```yaml
+  epsilon: 0.05 # stillness radius, torso-lengths
+```
+
+### `stage3.threshold_W_seconds`
+
+Líneas 232–234 del archivo viejo.
+
+```yaml
+  threshold_W_seconds:
+    5.0 # §3.4: "if I exceeds a confirmation threshold W,
+    # the event is classified as a confirmed fall"
+```
+
+### `stage3.observation_window_seconds`
+
+Líneas 235–238 del archivo viejo.
+
+```yaml
+  observation_window_seconds:
+    30.0 # upper bound on how long a verdict may stay
+    # open. It resolves earlier: on a held recovery,
+    # or as soon as I reaches W.
+```
+
+### `stage3.upright_T_deg`
+
+Línea 239 del archivo viejo.
+
+```yaml
+  upright_T_deg: 30.0 # trunk angle below which posture counts as upright
+```
+
+### `stage3.recovery_hold_seconds`
+
+Líneas 240–242 del archivo viejo.
+
+```yaml
+  recovery_hold_seconds:
+    1.0 # how long upright must last to be a recovery
+    # rather than a wobble
+```
+
+### `stage3.severity_uses_leg_extension`
+
+Líneas 243–254 del archivo viejo.
+
+```yaml
+  # Severity (§3.3) is defined by RECOVERY, not by impact: recovered alone =
+  # mild, partially recovered = moderate, remained down = severe. Separating
+  # mild from moderate needs to know whether the subject STOOD or merely sat
+  # up, and the trunk angle alone cannot tell those apart. The signal that
+  # can is the hip-to-ankle extension — recorded as extension_ratio_EXP, an
+  # EXPERIMENTAL column. Setting this true lets an _EXP signal into a
+  # decision, which this project's own rule says needs draft text first;
+  # §3.5's "hip landmark recovery to upright" is the closest the paper comes
+  # to authorising it. With it false, any recovery is reported as moderate —
+  # never mild, because claiming a full recovery one cannot verify is the
+  # error that matters. PENDING: draft wording.
+  severity_uses_leg_extension: true
+```
+
+### `stage3.cooldown_seconds`
+
+Línea 255 del archivo viejo.
+
+```yaml
+  cooldown_seconds: 3.0 # refractory period after an event resolves
+```
+
+### `stage3.cooldown_after_rejection`
+
+Líneas 256–259 del archivo viejo.
+
+```yaml
+  # Fase 4: tras un rechazo de la Etapa 2 no hay enfriamiento (vuelve a
+  # MONITORING). El rechazo no es una caida; el pestillo del disparador ya
+  # evita la rafaga. true = comportamiento anterior.
+  cooldown_after_rejection: false
+```
+
+### `stage3.persistent_still_s` y `stage3.persistent_immobility_fraction`
+
+Líneas 260–261, 269–274 del archivo viejo.
+
+> **Nota (B2):** En el archivo, la explicación (segundo bloque) estaba debajo de `getup_window_s`, pero describe `persistent_immobility_fraction`.
+
+```yaml
+  persistent_still_s: 0.5     # a Stage-3 frame counts as still when I >= this (s)
+  persistent_immobility_fraction: 0.5
+```
+
+```yaml
+    # §3.5 "if the immobility persists": an ending that is neither lying
+    # nor standing (sat up, knelt, propped) is SEVERE instead of moderate
+    # when at least this share of Stage-3 frames were still. Separates A17
+    # (reclined against a wall, NotRecovered: 63.4 / 57.8 %) from every
+    # other fall ending below 60 deg (0-35.3 %). Chosen on all 128 clips,
+    # not on the calibration split, with only two positives. 0 disables.
+```
+
+### `stage3.getup_rise_torsos` y `stage3.getup_window_s`
+
+Líneas 262–268 del archivo viejo.
+
+```yaml
+  # Fase 6a (§3.5 "hip landmark recovery to upright"): si al final T dice "en
+  # el suelo" pero la cadera subio al menos esto (en torsos) durante los
+  # ultimos getup_window_s, el sujeto se esta levantando -> moderate. Umbral
+  # entre lo medido en entrenamiento: A14-S3 (NotRecovered) 0.21 y A06-S14
+  # (se levanta) 0.70. 0 lo apaga.
+  getup_rise_torsos: 0.45
+  getup_window_s: 2.0
+```
+
+## `quantity_a` [EXP]
+
+### `quantity_a` (sección) y calibración
+
+Líneas 276–289 del archivo viejo.
+
+```yaml
+quantity_a: # EXPERIMENTAL (fase 8): A = altura de la cabeza sobre los tobillos
+  # en la direccion de la gravedad (puntos 3D de mundo de MediaPipe), dividida
+  # por la altura del mismo sujeto de pie. ~1 de pie, ~0.3-0.7 sentado o
+  # arrodillado, ~0 en el suelo. En tension con el §3.2, que excluye la
+  # profundidad monocular: el autor acepto el cambio (25/09): A usa las
+  # coordenadas de mundo solo como cociente autocalibrado (POSIBLES-CAMBIOS C5).
+  # Fase 8.1: se registra (A_head_EXP, A_hip_EXP). Fases 8.2 y 8.3: la Etapa 3
+  # la lee al cierre (modo etiquetado), cada regla con su interruptor.
+  #
+  # Calibracion ("arriba" y altura de pie) con el propio sujeto parado:
+  standing_T_deg: 20.0     # tronco erguido en la imagen
+  standing_knee_deg: 150.0 # y piernas rectas en 3D (180 = rectas)
+  min_standing_s: 0.5      # tiempo de pie antes de dar A (antes: NaN)
+  max_samples: 300         # cuadros de pie que se recuerdan (~10 s)
+```
+
+### `quantity_a.severity_from_a` y las bandas (fase 8.2)
+
+Líneas 290–294 del archivo viejo.
+
+```yaml
+  # Fase 8.2: la postura final sale de A cuando esta calibrada (si no, T).
+  # Bandas de los huecos de la particion de entrenamiento (ANALISIS-82-90.md).
+  severity_from_a: true
+  band_floor: 0.26         # A final <= esto: en el suelo (severe)
+  band_standing: 0.82      # A final >= esto: de pie (mild)
+```
+
+### `quantity_a.reach_check` y sus umbrales (fase 8.3)
+
+Líneas 295–306 del archivo viejo.
+
+```yaml
+  # Fase 8.3: "¿llego al suelo?". Si la cabeza nunca bajo de floor_reached
+  # entre reach_before_s antes y reach_after_s despues del disparo, y la cadera
+  # termino sobre hip_raised, no hubo caida (NoFall, sin alarma). Se abstiene
+  # si A no estaba calibrada al disparar (A16-S3 en el Mac).
+  # 0.31 y no 0.28 (decidido 25/09): los NoFall de entrenamiento que hay que
+  # rechazar empiezan en 0.34; menos el p90 de la diferencia entre plataformas
+  # (0.04) deja toda caida real a mas de 0.04 del corte.
+  reach_check: true
+  floor_reached: 0.31
+  hip_raised: 0.22         # la cadera final debe estar elevada (protege A17-S2)
+  reach_before_s: 1.0
+  reach_after_s: 4.0
+```
+
+### `quantity_a.trigger_from_a` y sus umbrales (fase 8.4)
+
+Líneas 307–318 del archivo viejo.
+
+```yaml
+  # Phase 8.4: A as an additional Stage-1 trigger (besides the score and H).
+  # Fires when the head reaches trigger_low having been at trigger_high or
+  # above within the last trigger_window_s, while the body is still descending
+  # fast on that same frame (V < stage1.threshold_V), held
+  # stage1.trigger_hold_s. Only with A calibrated (NaN before). Catches falls
+  # with the trunk vertical (A3-S2); the V condition keeps lying down on
+  # purpose out (B11-S2, B12-S2). See Stage1Trigger and
+  # notas/TRASPASO-SESION.md (8.4).
+  trigger_from_a: true
+  trigger_high: 0.7
+  trigger_low: 0.3
+  trigger_window_s: 1.5
+```
+
+## `experimental` [EXP] (cantidad H)
+
+### `experimental` (sección)
+
+Líneas 320–346 del archivo viejo.
+
+> **Nota (B2):** Desactualizado en una parte. "Both default to 0.0 ... a stock config runs identically to before H existed" habla de los valores por defecto de las clases: en `config.yaml` H está encendida (0.35 / 0.85 / 2.0 / 0.75) y cambia resultados; en la 8.4 levanta 25 de 90 eventos en la nube y 21 de 90 en el Mac. Sigue vigente que no hay registro de un barrido de estos valores sobre PEF-FallDB.
+
+```yaml
+experimental: # signals NOT in §3.4/§3.5. See quantities.py's
+  # module docstring for Quantity H's rationale,
+  # and body_height_ratio()'s docstring for the
+  # two limits it does not overcome (camera-angle
+  # dependence, and it confirms posture, not
+  # intent) before touching either threshold
+  # below.
+  #
+  # The two thresholds ARE wired into the §3.5
+  # funnel (Stage1Trigger, Stage3Evaluator) as
+  # OR'd fallbacks — never mixed into T/V's own,
+  # already-calibrated arithmetic. Both default
+  # to 0.0, which disables them by construction
+  # (H is always positive when defined, so
+  # "<= 0" and ">= 0"-as-disabled can never be
+  # satisfied by a real reading): a stock config
+  # runs identically to before H existed. NEITHER
+  # VALUE IS CALIBRATED YET — they are placeholder
+  # numbers chosen for plausibility (H ~ 1
+  # standing, -> 0 collapsed; see
+  # HeightBaseline), enabled here so the
+  # mechanism can be exercised end-to-end, not
+  # because PEF-FallDB has confirmed them. Sweep
+  # against the dataset before trusting a fall
+  # count or a false-alarm count produced with
+  # these on — same discipline already applied to
+  # trigger_score.
+```
+
+### `experimental.height_baseline_time_constant_s`
+
+Líneas 347–352 del archivo viejo.
+
+```yaml
+  height_baseline_time_constant_s:
+    2.0
+    # Quantity H: EMA time constant for the personal
+    # standing-height calibration (HeightBaseline).
+    # Seconds, not frames, same reasoning as every
+    # other *_time_constant_s in this file.
+```
+
+### `experimental.trigger_H_ratio`
+
+Líneas 353–358 del archivo viejo.
+
+> **Nota (B2):** También es el umbral de "tumbado" de la Etapa 3 cuando T no está medida (ver `recovery_H_ratio`, al final).
+
+```yaml
+  trigger_H_ratio:
+    0.35 # Stage1Trigger's OR'd fallback: H at/below this,
+    # combined with V still falling, fires the
+    # trigger even when T's own formulation does
+    # not — the axis-aligned-fall blind spot.
+    # 0.0 disables it.
+```
+
+### `experimental.trigger_H_erect`
+
+Líneas 359–374 del archivo viejo.
+
+```yaml
+  trigger_H_erect:
+    0.85 # Requires H to have read at/above this — subject
+    # confirmed standing — within the last
+    # trigger_H_sequence_window_s seconds before the
+    # H+V fallback above may fire at all. Encodes
+    # the STORY (erect, then a short-window
+    # collapse) instead of a bare instantaneous
+    # reading. READ THE CAVEAT ON
+    # Stage1Trigger.threshold_h_erect before
+    # treating this as a fix for voluntary bends
+    # (tying a shoe, picking something up): a
+    # deliberate crouch is ALSO erect-then-collapsed
+    # — same shape, different intent — and this
+    # guard cannot tell them apart. It only removes
+    # noise-only collapses and subjects never seen
+    # standing. 0.0 disables the requirement.
+```
+
+### `experimental.trigger_H_sequence_window_s`
+
+Líneas 375–380 del archivo viejo.
+
+```yaml
+  trigger_H_sequence_window_s:
+    2.0
+    # How far back trigger_H_erect may look for a
+    # confirmed-standing reading. Seconds, not
+    # frames, same convention as every window in
+    # this file.
+```
+
+### `experimental.recovery_H_ratio`
+
+Líneas 381–394 del archivo viejo.
+
+```yaml
+  recovery_H_ratio:
+    0.75 # Stage3Evaluator's OR'd fallback: H at/above
+    # this counts as "upright" for recovery even
+    # when T does not clear upright_T_deg. 0.0
+    # disables it.
+    #
+    # trigger_H_ratio is reused (not duplicated) as
+    # Stage3Evaluator's threshold_h_ratio_lying: the
+    # same "H at/below this = collapsed" reading
+    # confirms a SEVERE (remained down) immobility
+    # verdict, alongside T >= lying_T_deg, instead
+    # of confirming SEVERE from stillness alone —
+    # see Stage3Evaluator.threshold_h_ratio_lying's
+    # docstring for the gap this closes.
+```
+
+## `alerts`
+
+### `alerts.dispatch_verdicts`
+
+Líneas 185–193 del archivo viejo.
+
+```yaml
+alerts: # [Phase 5b+] the §3.5 output, §3.6 transports
+  # Which verdicts produce an alert. §3.5 dispatches a CONFIRMED fall; a
+  # nullified one is the alarm being called off. Events no stage could
+  # resolve (stage3_unresolved, stage2_inconclusive) are RECORDED but not
+  # dispatched — a deliberate reading of §3.5. On a device meant to catch
+  # falls, "I could not tell" may deserve a quieter notification instead of
+  # silence; that is a question for the dataset, which is why it is a knob.
+  dispatch_verdicts:
+    - stage3_confirmed
+```
+
+## `state_display`
+
+### `state_display` (sección)
+
+Líneas 157–161 del archivo viejo.
+
+> **Nota (B2):** Desactualizado: cuatro de estas claves sí entran en la Etapa 3. `lying_T_deg`, `standing_extension` y `max_extension_ratio` se le pasan a `Stage3Evaluator`, y `ratio_time_constant_s` suaviza la razón de extensión que la Etapa 3 lee. Solo `transition_v_tps`, `leaning_T_deg`, `crouch_extension` y `walking_vh_tps` son de pantalla y registro.
+
+```yaml
+state_display: # [Phase 2] person-state labels — DISPLAY/LOG ONLY.
+  # No §3.5 stage consumes these; they exist so a
+  # human can verify the quantities and so alerts
+  # can say what the subject was doing before the
+  # event. Provisional values; tuned in 2.6.
+```
+
+### `state_display`: claves de una línea
+
+Líneas 162–167 del archivo viejo.
+
+```yaml
+  transition_v_tps: 0.7 # |V| above this (torso/s) -> TRANSITION
+  lying_T_deg: 60.0 # trunk at/above this -> LYING
+  leaning_T_deg: 15.0 # trunk at/above this (legs extended) -> LEANING
+  standing_extension: 1.1 # hip-to-ankle extent / torso at/above -> legs extended
+  crouch_extension: 0.6 # below this -> legs collapsed (CROUCHING)
+  walking_vh_tps: 0.25 # |V horizontal| above this while upright -> WALKING
+```
+
+### `state_display.max_extension_ratio`
+
+Líneas 168–176 del archivo viejo.
+
+```yaml
+  max_extension_ratio:
+    3.0 # above this the hip-to-ankle ratio is not a
+    # leg: the torso is foreshortened to a few
+    # pixels and the ratio is dividing by it. On
+    # PEF-FallDB, 20 of 128 clips recorded values
+    # over 3, up to 183 torso lengths. Beyond this
+    # the quantity reads NaN (unknown), never a
+    # clamped number that would look measured.
+    # A human hip-to-ankle span is ~1.5 torsos.
+```
+
+### `state_display.ratio_time_constant_s`
+
+Líneas 177–183 del archivo viejo.
+
+```yaml
+  ratio_time_constant_s:
+    0.1 # smoothing applied to the FINISHED extension
+    # ratio, never to its inputs. Ankles
+    # are among the noisiest landmarks; without
+    # this, a perfectly still subject sitting near
+    # the standing/sitting boundary changes label
+    # 7x more often. 0 disables it.
+```

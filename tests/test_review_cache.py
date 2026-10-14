@@ -1,4 +1,4 @@
-"""La memoria del análisis congelado (gui/review_cache.py), sin Qt."""
+"""The memory of the frozen analysis (gui/review_cache.py), without Qt."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class TestPassRecorder(unittest.TestCase):
 
     def test_revisiting_a_frame_invalidates_the_pass(self) -> None:
         rec = _pass(3)
-        rec.record(1, "otra vez")
+        rec.record(1, "again")
         self.assertIsNone(rec.finish(events=[]))
 
     def test_a_pass_that_did_not_start_at_zero_is_not_frozen(self) -> None:
@@ -60,9 +60,9 @@ class TestPassRecorder(unittest.TestCase):
 
     def test_an_explicit_invalidation_is_kept_with_its_first_reason(self) -> None:
         rec = _pass(3)
-        rec.invalidate("salto durante la pasada")
-        rec.invalidate("otro")
-        self.assertEqual(rec.invalid_reason, "salto durante la pasada")
+        rec.invalidate("jump during the pass")
+        rec.invalidate("another")
+        self.assertEqual(rec.invalid_reason, "jump during the pass")
         self.assertIsNone(rec.finish(events=[]))
 
     def test_an_empty_pass_is_not_frozen(self) -> None:
@@ -110,6 +110,7 @@ class TestRecordsNeverOverwrite(unittest.TestCase):
 
     def test_the_second_takes_a_numbered_name(self) -> None:
         import tempfile
+
         from pef_fall_detector.audit_log import AuditLogger
         with tempfile.TemporaryDirectory() as out:
             first = AuditLogger(out, "A01-S1", fields=["x"])

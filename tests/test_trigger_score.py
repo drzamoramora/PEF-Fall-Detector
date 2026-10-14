@@ -1,9 +1,9 @@
-"""El puntaje del disparador, cuadro a cuadro, es lo que la Etapa 1 compara.
+"""The trigger score, frame by frame, is what Stage 1 compares.
 
-Las líneas punteadas de threshold_T y threshold_V en PEF-Lab no dicen nada del
-disparo cuando la formulación es "score": lo que se compara es
-T/threshold_T + V/threshold_V sobre la ventana de pico. Estas pruebas fijan
-que el valor expuesto sea exactamente ese.
+The dashed threshold_T and threshold_V lines in PEF-Lab say nothing about
+the trigger when the formulation is "score": what is compared is
+T/threshold_T + V/threshold_V over the peak window. These tests pin that the
+value exposed is exactly that.
 """
 
 from __future__ import annotations
@@ -20,17 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pef_fall_detector.audit_log import PHASE2_FIELDS  # noqa: E402
 from pef_fall_detector.config import Config  # noqa: E402
 from pef_fall_detector.pipeline import FramePipeline  # noqa: E402
-from tests.test_main_headless import _toppling_pose  # noqa: E402
-from tests.test_pipeline import TEST_CFG, make_pose  # noqa: E402
+from tests.support import TEST_CFG, make_pose, toppling_pose  # noqa: E402
 
 DT = 1.0 / 30.0
 
 
 def _fall():
     frames = [make_pose(i, i * DT) for i in range(30)]           # 1 s standing
-    frames += [_toppling_pose(i, i * DT, angle_deg=(i - 30) * 4.5,
+    frames += [toppling_pose(i, i * DT, angle_deg=(i - 30) * 4.5,
                               hip_y=500.0 + (i - 30) * 12.0) for i in range(30, 50)]
-    frames += [_toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
+    frames += [toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
                for i in range(50, 90)]
     return frames
 
@@ -49,7 +48,7 @@ class TestTriggerScore(unittest.TestCase):
         pipe, results = _run("score")
         thr = float(TEST_CFG["stage1"]["trigger_score"])
         fired = [i for i, r in enumerate(results) if r.event is not None]
-        self.assertEqual(len(fired), 1, "la Etapa 1 no disparo una vez")
+        self.assertEqual(len(fired), 1, "Stage 1 did not fire once")
         f = fired[0]
         self.assertGreaterEqual(results[f].quantities["trigger_score"], thr)
         # The hold: the score was already at/over the threshold for the
@@ -57,7 +56,7 @@ class TestTriggerScore(unittest.TestCase):
         over = [i for i, r in enumerate(results[:f])
                 if not math.isnan(r.quantities["trigger_score"])
                 and r.quantities["trigger_score"] >= thr]
-        self.assertTrue(over, "el puntaje no estuvo sobre el umbral antes del disparo")
+        self.assertTrue(over, "the score was not above the threshold before the trigger")
         self.assertEqual(over, list(range(over[0], f)))
 
     def test_standing_scores_far_below(self) -> None:

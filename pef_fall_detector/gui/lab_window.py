@@ -1,15 +1,17 @@
-"""PEF-Lab main window (Phase 1).
+"""PEF-Lab main window.
 
 A visualization workbench over the source-agnostic core: open a recorded
 clip (e.g. from PEF-Video-Tool's ``recordings/``) or a live camera, watch
-the MediaPipe skeleton and Step-0 anchors drawn in real time, and get a
-per-frame audit CSV written automatically.
+the MediaPipe skeleton and Step-0 anchors drawn in real time, and get the
+run's records written automatically.
 
 The window is strictly a *viewer*: every computation happens in the core
-modules (``pose_frontend``, later ``quantities``/``state_machine``), which
-also power the headless CLI used for batch evaluation and, eventually, the
-Raspberry Pi deployment. Later phases extend this window with time-series
-plots (T(t), V(t)), live threshold editing, and per-overlay toggles.
+modules (``pose_frontend``, ``quantities``, ``state_machine``), which also
+power the headless CLI used for batch evaluation and the Raspberry Pi
+deployment. This module is the flow — sources, playback, the per-frame
+loop, frozen review and the queue pass; what it shows lives beside it:
+:mod:`.plots` (curves and timeline), :mod:`.queue_panel` (the Queue tab),
+:mod:`.widgets` (the video view, the View tab, small building blocks).
 
 Video-mode controls: Play/Pause, single-frame step (◀ / ▶), and a seek bar —
 falls last 10–15 frames, so being able to stop on the exact frame where a
@@ -26,71 +28,48 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-import numpy as np
-import pyqtgraph as pg
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QFont, QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
-    QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
     QStyle,
     QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from ..alerts import Alert
-from ..audit_log import EVENT_FIELDS, AuditLogger
-from ..classification import CLASSES, classify_clip
-from ..config import Config
-from ..dataset import LABEL_FIELDS, format_confusion, truth_from_name, video_files
-from ..evaluation import binary_metrics, load_split, report, split_rows
+from ..audit_log import AuditLogger
+from ..config import PARTITION_PATH, Config
+from ..dataset import LABEL_FIELDS, format_confusion, label_row, video_files
+from ..evaluation import pass_summary
 from ..overlay import draw_overlay
 from ..pipeline import FramePipeline
+from ..records import RunRecords
 from ..sources import CameraSource, FrameSource, VideoFileSource
 from . import theme
+from .plots import SEVERITY_PEN, PlotPanel
+from .queue_panel import QueuePanel, metrics_text
 from .review_cache import ClipAnalysis, PassRecorder, ReviewCache, config_key
+from .widgets import VideoView, ViewPanel, card, fit_to_screen, format_time, separator
 
-#: Velocidades de reproducción. En la revisión congelada no corre MediaPipe,
-#: así que 2x es alcanzable; en una pasada de análisis el límite lo pone el
-#: procesamiento, y la velocidad solo puede frenarla.
+#: Playback speeds. Frozen review does not run MediaPipe, so 2x is
+#: reachable; in an analysis pass the processing sets the limit, and the
+#: speed can only slow it down.
 SPEEDS = (0.25, 0.5, 0.75, 1.0, 2.0)
 
-#: Colores de la línea de tiempo, por cuadro.
-_STAGE_RGB = {
-    "MONITORING": (84, 110, 122),
-    "CONFIRMING": (255, 152, 0),
-    "OBSERVING": (30, 136, 229),
-    "COOLDOWN": (142, 36, 170),
-}
-_LOST_RGB = (0, 0, 0)            # sin detección
-_UNRELIABLE_RGB = (60, 60, 60)   # detectado pero poco visible
-_SEVERITY_PEN = {"severe": "#e53935", "moderate": "#fb8c00", "mild": "#43a047"}
-
-
-def _frame_rgb(result) -> tuple[int, int, int]:
-    """El color de un cuadro en la línea de tiempo."""
-    if not result.pose.detected:
-        return _LOST_RGB
-    if not result.reliable:
-        return _UNRELIABLE_RGB
-    return _STAGE_RGB.get(result.stage, _STAGE_RGB["MONITORING"])
+PLAY_TEXT, PAUSE_TEXT = "Play", "Pause"
+CAMERA_START, CAMERA_STOP = "Start Camera", "Stop Camera"
 
 
 def _p_side(p_offset: float | None) -> bool | None:
@@ -105,97 +84,6 @@ def _p_side(p_offset: float | None) -> bool | None:
     return p_offset > 0.0
 
 
-def _format_time(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    minutes, secs = divmod(seconds, 60)
-    return f"{minutes}:{secs:02d}"
-
-
-PLAY_TEXT, PAUSE_TEXT = "Play", "Pause"
-CAMERA_START, CAMERA_STOP = "Start Camera", "Stop Camera"
-#: Minimum plot height. The curves live in a scroll area, so this never
-#: adds up into the window's own minimum height.
-PLOT_MIN_HEIGHT = 125
-
-
-def _separator() -> QFrame:
-    line = QFrame()
-    line.setFrameShape(QFrame.VLine)
-    line.setStyleSheet(f"color: {theme.BORDER};")
-    return line
-
-
-def _caption(text: str) -> QLabel:
-    label = QLabel(text.upper())
-    label.setObjectName("cardTitle")
-    return label
-
-
-def _card(title: str) -> tuple[QFrame, QVBoxLayout]:
-    """A titled panel: rounded, one step lighter than the window."""
-    frame = QFrame()
-    frame.setObjectName("card")
-    layout = QVBoxLayout(frame)
-    layout.setContentsMargins(12, 8, 12, 10)
-    layout.setSpacing(6)
-    layout.addWidget(_caption(title))
-    return frame, layout
-
-
-def _legend_row(colour: str, text: str) -> QWidget:
-    row = QWidget()
-    h = QHBoxLayout(row)
-    h.setContentsMargins(0, 0, 0, 0)
-    swatch = QLabel()
-    swatch.setFixedSize(14, 14)
-    swatch.setStyleSheet(f"background-color: {colour}; border: 1px solid {theme.BORDER}; "
-                         f"border-radius: 3px;")
-    h.addWidget(swatch)
-    h.addWidget(QLabel(text), stretch=1)
-    return row
-
-
-class _VideoView(QLabel):
-    """The video frame, rescaled to whatever space the layout gives it.
-
-    Its size policy is Ignored so the pixmap never drives the layout (a
-    pixmap-sized label grows the window frame after frame); the explicit
-    minimum still holds.
-    """
-
-    def __init__(self, text: str) -> None:
-        super().__init__(text)
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(426, 240)
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self._source: QPixmap | None = None
-
-    def show_image(self, pixmap: QPixmap) -> None:
-        self._source = pixmap
-        self._rescale()
-
-    def _rescale(self) -> None:
-        if self._source is None or self._source.isNull():
-            return
-        target = self.size() - QSize(4, 4)
-        self.setPixmap(self._source.scaled(target, Qt.KeepAspectRatio,
-                                           Qt.SmoothTransformation))
-
-    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        super().resizeEvent(event)
-        self._rescale()
-
-
-def _fit_to_screen(window: QWidget) -> None:
-    """Open at a size that fits the screen, leaving room for the menu bar and dock."""
-    screen = QApplication.primaryScreen()
-    if screen is None:
-        window.resize(1280, 800)
-        return
-    geo = screen.availableGeometry()
-    window.resize(min(1520, int(geo.width() * 0.94)), min(960, int(geo.height() * 0.92)))
-
-
 class LabWindow(QWidget):
     """PEF-Lab: source selection + overlay display + audit logging."""
 
@@ -203,13 +91,17 @@ class LabWindow(QWidget):
         super().__init__()
         self.setWindowTitle("PEF-Lab — Fall Detection Workbench")
         self.setMinimumSize(980, 640)
-        _fit_to_screen(self)
+        fit_to_screen(self)
 
         self.cfg = cfg
         self.source: FrameSource | None = None
         self.pipeline: FramePipeline | None = None
-        self.logger: AuditLogger | None = None
-        self.event_logger: AuditLogger | None = None
+        #: The records of the pass in progress (records.RunRecords); None
+        #: once they are closed, or while a finished pass is being reviewed.
+        self.records: RunRecords | None = None
+        #: The events list of the pass, kept to close its records after the
+        #: pipeline itself is gone.
+        self._run_events: list = []
         self.playing = False
         self.frame_index = 0
         self._user_scrubbing = False
@@ -223,32 +115,23 @@ class LabWindow(QWidget):
         self._reliable_frames = 0
         # Dataset pass
         self._queue: list[Path] = []
-        #: Clip abierto para revisión, o None si todavía ninguno.
-        #: Es el ancla de las flechas Alt+← / Alt+→; se mantiene
-        #: aparte de ``_queue_index`` porque revisar y correr la
-        #: pasada son dos recorridos distintos sobre la misma cola.
+        #: Clip open for review, or None if none yet. It anchors the
+        #: Alt+← / Alt+→ arrows; kept apart from ``_queue_index`` because
+        #: reviewing and running the pass are two different walks over
+        #: the same queue.
         self._review_index: int | None = None
         self._queue_rows: list[dict] = []
         self._queue_index = 0
         self._queue_running = False
         self._label_logger: AuditLogger | None = None
-        # Plot data keyed by frame index so scrubbing overwrites cleanly
-        # instead of appending duplicates:
-        # index -> (t, T_deg, V_tps, P_offset, I_still_s, trigger_score).
-        self._plot_data: dict[int, tuple[float, ...]] = {}
-        # Análisis congelado (ver review_cache.py): lo que una pasada completa
-        # calculó, para revisar sin recalcular ni escribir registros.
+        # Frozen analysis (see review_cache.py): what a full pass computed,
+        # to review without recomputing or writing records.
         self._cache = ReviewCache()
         self._cfg_key = config_key(cfg.as_dict())
         self._recorder: PassRecorder | None = None
         self._frozen: ClipAnalysis | None = None
         self._current_path: str | None = None
         self._speed = 1.0
-        # Línea de tiempo: un color por cuadro, y las marcas de eventos que
-        # hay que quitar al cambiar de clip.
-        self._timeline_rgb: dict[int, tuple[int, int, int]] = {}
-        self._timeline_t: dict[int, float] = {}
-        self._markers: list[tuple[object, object]] = []
 
         self._build_ui()
         self._update_controls()
@@ -320,7 +203,7 @@ class LabWindow(QWidget):
         self.queue_add_btn.setToolTip("Load a folder of clips into the queue (see the Queue tab)")
         self.queue_add_btn.clicked.connect(self._on_queue_add_folder)
         hl.addWidget(self.queue_add_btn)
-        hl.addWidget(_separator())
+        hl.addWidget(separator())
         hl.addWidget(QLabel("Camera"))
         self.camera_spin = QSpinBox()
         self.camera_spin.setRange(0, 9)
@@ -330,7 +213,7 @@ class LabWindow(QWidget):
         self.camera_btn.setIcon(style.standardIcon(QStyle.SP_ComputerIcon))
         self.camera_btn.clicked.connect(self._on_toggle_camera)
         hl.addWidget(self.camera_btn)
-        hl.addWidget(_separator())
+        hl.addWidget(separator())
         # The only way to analyze an already frozen clip again in this
         # session: an explicit decision, which writes a new record.
         self.reanalyze_btn = QPushButton("Re-analyze")
@@ -348,7 +231,7 @@ class LabWindow(QWidget):
         root.addWidget(header)
 
         # --- Video and the state readouts -----------------------------------
-        self.video_label = _VideoView("Open a video or start the camera to begin.")
+        self.video_label = VideoView("Open a video or start the camera to begin.")
         self.video_label.setObjectName("videoView")
 
         self.status_label = QLabel("")
@@ -370,198 +253,8 @@ class LabWindow(QWidget):
         self.stage_label.setWordWrap(True)
         self.stage_label.setObjectName("muted")
 
-        # --- Curves ---------------------------------------------------------
-        # Two tabs sharing the time axis, the cursor and the firing / verdict
-        # marks:
-        #   «Paper»: what decides the funnel (T, V, the score actually
-        #            compared, P, I and phase 3's still share);
-        #   «Experimental [EXP]»: what is logged outside §3.4 (A, H, R, legs,
-        #            Vh, I's displacement), with the config lines each one is
-        #            compared against.
-        pg.setConfigOptions(antialias=False, background=theme.PLOT_BG,
-                            foreground=theme.PLOT_FG)  # cheap drawing at 30 FPS
-        score_formulation = str(self.cfg.stage1.trigger_formulation) == "score"
-        #: FrameResult.quantities key -> the curve that draws it
-        self._series: dict[str, object] = {}
-
-        def plot(title: str, y0: float | None = None, y1: float | None = None):
-            w = pg.PlotWidget()
-            w.setTitle(title, size="9pt", color=theme.TEXT)
-            w.setMinimumHeight(PLOT_MIN_HEIGHT)
-            w.setMinimumWidth(200)
-            w.showGrid(x=True, y=True, alpha=0.12)
-            tick_font = QFont()
-            tick_font.setPointSize(8)
-            for side in ("left", "bottom"):
-                w.getAxis(side).setStyle(tickFont=tick_font, tickTextOffset=3)
-            w.getAxis("left").setWidth(34)
-            if y0 is not None:
-                w.setYRange(y0, y1)
-            return w
-
-        def hline(w, y, label, colour, dash=True, width=1, at=0.15):
-            line = pg.InfiniteLine(
-                pos=float(y), angle=0,
-                pen=pg.mkPen(colour, width=width,
-                             style=Qt.DashLine if dash else Qt.SolidLine),
-                label=label or None,
-                labelOpts={"position": at, "color": colour} if label else None)
-            w.addItem(line)
-
-        def curve(w, key, colour, dash=False):
-            c = w.plot(pen=pg.mkPen(colour, width=2,
-                                    style=Qt.DashLine if dash else Qt.SolidLine))
-            self._series[key] = c
-            return c
-
-        def grid_of(plots, cols=3):
-            """A tab page: the plots in a grid, inside a scroll area.
-
-            The scroll area is what keeps the window's minimum height small:
-            without it every plot row adds to it (a seventh plot once pushed
-            the buttons off the Mac's screen).
-            """
-            inner = QWidget()
-            g = QGridLayout(inner)
-            g.setContentsMargins(6, 6, 6, 6)
-            g.setSpacing(6)
-            for i, w in enumerate(plots):
-                g.addWidget(w, i // cols, i % cols)
-            page = QScrollArea()
-            page.setWidgetResizable(True)
-            page.setFrameShape(QFrame.NoFrame)
-            page.setWidget(inner)
-            return page
-
-        # ---- Paper ---------------------------------------------------------
-        # T up to 180: above 120 live the inverted skeletons, this project's
-        # central failure mode. The lines are §3.4's bands and Stage 3's cuts,
-        # labels staggered because 30, 45 and 60 sit a few pixels apart.
-        self.t_plot = plot("T — trunk angle (deg)", 0, 180)
-        hline(self.t_plot, 15, "", (90, 90, 90))
-        hline(self.t_plot, 90, "", (90, 90, 90))
-        hline(self.t_plot, float(self.cfg.stage3.upright_T_deg),
-              f"upright < {float(self.cfg.stage3.upright_T_deg):.0f}", (120, 180, 120), at=0.12)
-        # With the "score" formulation threshold_T does not fire on its own:
-        # it is the score's scale. Drawn faint, and named for what it is.
-        hline(self.t_plot, float(self.cfg.stage1.threshold_T_deg),
-              "T scale" if score_formulation else "threshold_T",
-              (130, 130, 130) if score_formulation else "orange", at=0.45)
-        hline(self.t_plot, float(self.cfg.state_display.lying_T_deg),
-              f"floor ≥ {float(self.cfg.state_display.lying_T_deg):.0f}", (229, 57, 53),
-              at=0.78)
-        self.t_curve = curve(self.t_plot, "T_deg", "y")
-
-        self.v_plot = plot("V — vertical velocity (torso/s, neg = down)", -4, 4)
-        hline(self.v_plot, float(self.cfg.stage1.threshold_V),
-              "V scale" if score_formulation else "threshold_V",
-              (110, 110, 110) if score_formulation else "orange")
-        hline(self.v_plot, 0.0, "", (120, 120, 120), dash=False)
-        self.v_curve = curve(self.v_plot, "V_tps", "m")
-
-        # What Stage 1 actually compares: T/T_scale + V/V_scale over the peak
-        # window. Empty where the trigger does not evaluate it.
-        self.s_plot = plot("Trigger score", 0, 5)
-        hline(self.s_plot, float(self.cfg.stage1.trigger_score),
-              f"fires ≥ {float(self.cfg.stage1.trigger_score):.1f}", (229, 57, 53),
-              dash=False, width=2)
-        self.s_curve = curve(self.s_plot, "trigger_score", (255, 255, 255))
-
-        # Quantity P. Zero is the whole decision line: the sign says inside
-        # or outside the support, so it is solid, not a configurable threshold.
-        self.p_plot = plot("P — COM vs support (torso, >0 = outside)", -1.5, 1.5)
-        hline(self.p_plot, 0.0, "outside", "orange", dash=False, width=2)
-        self.p_curve = curve(self.p_plot, "P_offset", "c")
-
-        # Quantity I. The dashed line is W. It saws back to zero on every
-        # movement, which is the quantity working, not a glitch.
-        self.i_plot = plot("I — immobility (s)", 0,
-                           max(2.0, float(self.cfg.stage3.threshold_W_seconds) * 1.5))
-        hline(self.i_plot, float(self.cfg.stage3.threshold_W_seconds), "W", "orange")
-        self.i_curve = curve(self.i_plot, "I_still_s", "g")
-
-        # Phase 3: the share of Stage 3 that stayed still. At the end of the
-        # clip, above the line and neither lying nor standing -> severe.
-        self.q_plot = plot("Stage 3 still share (phase 3)", 0, 1)
-        frac = float(self.cfg.stage3.persistent_immobility_fraction)
-        if frac > 0.0:
-            hline(self.q_plot, frac, f"severe if ≥ {100 * frac:.0f}%", (229, 57, 53),
-                  dash=False, at=0.2)
-        self.q_curve = curve(self.q_plot, "still_fraction", (255, 213, 79))
-
-        paper = grid_of((self.t_plot, self.v_plot, self.s_plot,
-                         self.p_plot, self.i_plot, self.q_plot))
-
-        # ---- Experimental --------------------------------------------------
-        ex = self.cfg.experimental
-        sd = self.cfg.state_display
-        # H: the H trigger uses trigger_H_ratio (also the "lying" cut when T
-        # is not measured); recovery uses recovery_H_ratio.
-        self.h_plot = plot("H — height vs baseline [EXP]", 0, 2)
-        for value, label, colour, at in (
-                (ex.trigger_H_ratio, "collapse", (229, 57, 53), 0.15),
-                (ex.recovery_H_ratio, "recovered", (67, 160, 71), 0.45),
-                (ex.trigger_H_erect, "erect", (120, 180, 120), 0.75)):
-            if float(value) > 0.0:
-                hline(self.h_plot, float(value), f"{label} {float(value):.2f}", colour, at=at)
-        curve(self.h_plot, "H_ratio", (255, 112, 67))
-
-        # Raw H and its baseline: B05's poisoned baseline shows here (a raw H
-        # spike the baseline absorbs and drags for seconds). Auto axis,
-        # because that spike reached 98.
-        self.hraw_plot = plot("Raw H (white) and baseline (cyan) [EXP]")
-        curve(self.hraw_plot, "H_raw", (236, 239, 241))
-        curve(self.hraw_plot, "H_baseline", (0, 229, 255), dash=True)
-
-        self.ext_plot = plot("Legs: hip-ankle / torso [EXP]", 0,
-                             float(sd.max_extension_ratio) * 1.1)
-        hline(self.ext_plot, float(sd.crouch_extension),
-              f"crouched < {float(sd.crouch_extension):.1f}", (255, 152, 0), at=0.15)
-        hline(self.ext_plot, float(sd.standing_extension),
-              f"extended ≥ {float(sd.standing_extension):.1f}", (67, 160, 71), at=0.45)
-        hline(self.ext_plot, float(sd.max_extension_ratio),
-              f"plausible max {float(sd.max_extension_ratio):.0f}", (130, 130, 130), at=0.75)
-        curve(self.ext_plot, "extension_ratio", (171, 71, 188))
-
-        # R: logged only; the config has no threshold for it, so none is drawn.
-        self.r_plot = plot("R — wrist to ankle (torsos) [EXP]", 0, 3)
-        curve(self.r_plot, "reach_proximity", (129, 212, 250))
-
-        self.vh_plot = plot("Vh — horizontal velocity (torso/s) [EXP]", -2, 2)
-        walk = float(sd.walking_vh_tps)
-        hline(self.vh_plot, walk, f"walking ±{walk:.2f}", (130, 130, 130), at=0.15)
-        hline(self.vh_plot, -walk, "", (130, 130, 130))
-        curve(self.vh_plot, "Vh_tps", (255, 241, 118))
-
-        # What I compares every frame: how far the subject moved from where
-        # it started to stay still. Above ε, I drops back to zero.
-        eps = float(self.cfg.stage3.epsilon)
-        self.d_plot = plot("I displacement (torsos) [EXP]", 0, max(0.2, 4 * eps))
-        hline(self.d_plot, eps, f"ε {eps:.2f}", "orange", at=0.15)
-        curve(self.d_plot, "I_displacement", (165, 214, 167))
-
-        # A (phase 8): 3D head height against gravity, 1 = standing. Cyan the
-        # head, dashed purple the hip. The lines are the severity bands (8.2)
-        # and the "reached the floor" cut (8.3).
-        qa = self.cfg.as_dict().get("quantity_a", {}) or {}
-        self.a_plot = plot("A — 3D head height (standing = 1) [EXP]", -0.3, 1.3)
-        for key, label, colour, at in (
-                ("band_standing", "standing", (67, 160, 71), 0.15),
-                ("floor_reached", "reached floor", (255, 167, 38), 0.62),
-                ("band_floor", "on the floor", (229, 57, 53), 0.12)):
-            if key in qa:
-                hline(self.a_plot, float(qa[key]), f"{label} {float(qa[key]):.2f}", colour, at=at)
-        curve(self.a_plot, "A_head", (0, 229, 255))
-        curve(self.a_plot, "A_hip", (186, 104, 200), dash=True)
-
-        # Four columns here: seven plots in two rows, like the Paper tab.
-        experimental = grid_of((self.a_plot, self.h_plot, self.hraw_plot,
-                                self.ext_plot, self.r_plot, self.vh_plot,
-                                self.d_plot), cols=4)
-
-        self.curve_tabs = QTabWidget()
-        self.curve_tabs.addTab(paper, "Paper (§3.4–3.5)")
-        self.curve_tabs.addTab(experimental, "Experimental [EXP]")
+        # --- Curves and timeline (plots.PlotPanel) ----------------------------
+        self.plots = PlotPanel(self.cfg)
 
         # The verdict and its reason: the rule that decided, with its numbers.
         self.verdict_label = QLabel("—")
@@ -569,41 +262,6 @@ class LabWindow(QWidget):
         self.verdict_label.setTextFormat(Qt.RichText)
         self.verdict_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.verdict_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        # No linked X axes: pyqtgraph aligns linked axes by screen pixel, and
-        # with hidden tabs that gave nonsense ranges. The time range is set
-        # by hand on every redraw.
-        self._curve_plots = (self.t_plot, self.v_plot, self.s_plot, self.p_plot,
-                             self.i_plot, self.q_plot, self.a_plot, self.h_plot,
-                             self.hraw_plot, self.ext_plot, self.r_plot, self.vh_plot,
-                             self.d_plot)
-        self._cursors = []
-        for w in self._curve_plots:
-            c = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("w", width=1))
-            w.addItem(c)
-            self._cursors.append(c)
-
-        # Timeline: stage per frame (grey = monitoring, orange = Stage 2,
-        # blue = Stage 3, purple = cooldown), black where detection was lost.
-        # Marks: firing (dashed red) and verdict (severity colour). Detection
-        # gaps were the key to A08-S3; here they show without guessing them
-        # from breaks in the curves.
-        self.timeline = pg.PlotWidget()
-        self.timeline.setFixedHeight(34)
-        self.timeline.hideAxis("left")
-        self.timeline.hideAxis("bottom")
-        self.timeline.setMouseEnabled(x=False, y=False)
-        self.timeline.setYRange(0, 1, padding=0)
-        self.timeline.setToolTip("Stage per frame — grey: monitoring · orange: Stage 2 · "
-                                 "blue: Stage 3 · purple: cooldown · black: no detection")
-        # NOT linked to the curves: pyqtgraph aligns linked axes by screen
-        # pixel, and a full-width strip linked to a one-third-width curve
-        # showed 0-34 s for a 10 s clip. The range is set by hand.
-        self.timeline_img = pg.ImageItem()
-        self.timeline.addItem(self.timeline_img)
-        self.timeline_cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("w", width=2))
-        self.timeline.addItem(self.timeline_cursor)
-        self._cursors.append(self.timeline_cursor)
 
         # --- Playback bar (video only) ---------------------------------------
         playbar = QFrame()
@@ -660,35 +318,8 @@ class LabWindow(QWidget):
             sc.activated.connect(slot)
 
         # --- Overlay toggles (View tab) ---------------------------------------
-        view_page = QWidget()
-        vl = QVBoxLayout(view_page)
-        vl.setContentsMargins(12, 10, 12, 10)
-        vl.setSpacing(4)
-        vl.addWidget(_caption("Draw on the video"))
-        self.chk_skeleton = QCheckBox("Skeleton")
-        self.chk_trunk = QCheckBox("Trunk vector")
-        self.chk_centroid = QCheckBox("Centroid")
-        self.chk_support = QCheckBox("Support polygon / COM")
-        for chk in (self.chk_skeleton, self.chk_trunk, self.chk_centroid, self.chk_support):
-            chk.setChecked(True)
-            vl.addWidget(chk)
-        vl.addSpacing(8)
-        vl.addWidget(_caption("Panels"))
-        self.chk_curves = QCheckBox("Curves and timeline")
-        self.chk_curves.setChecked(True)
-        self.chk_curves.toggled.connect(self._on_curves_toggled)
-        vl.addWidget(self.chk_curves)
-        vl.addSpacing(8)
-        vl.addWidget(_caption("Timeline colours"))
-        for colour, text in ((theme.STAGE_COLOURS["MONITORING"], "Monitoring"),
-                             (theme.STAGE_COLOURS["CONFIRMING"], "Stage 2 · geometry (P)"),
-                             (theme.STAGE_COLOURS["OBSERVING"], "Stage 3 · observing"),
-                             (theme.STAGE_COLOURS["COOLDOWN"], "Cooldown"),
-                             ("#3c3c3c", "Detected, low visibility"),
-                             ("#000000", "No detection"),
-                             ("#ff1744", "Trigger fired (dashed mark)")):
-            vl.addWidget(_legend_row(colour, text))
-        vl.addStretch(1)
+        self.view_panel = ViewPanel()
+        self.view_panel.curves.toggled.connect(self._on_curves_toggled)
 
         # --- Assemble -------------------------------------------------------
         left = QWidget()
@@ -698,16 +329,16 @@ class LabWindow(QWidget):
         ll.addWidget(self.alert_banner)
         ll.addWidget(self.video_label, stretch=1)
         ll.addWidget(playbar)
-        ll.addWidget(self.timeline)
+        ll.addWidget(self.plots.timeline)
 
-        stage_card, sc_l = _card("Stage")
+        stage_card, sc_l = card("Stage")
         chip_row = QHBoxLayout()
         chip_row.addWidget(self.stage_chip)
         chip_row.addStretch(1)
         sc_l.addLayout(chip_row)
         sc_l.addWidget(self.stage_label)
 
-        verdict_card, vc_l = _card("Verdict")
+        verdict_card, vc_l = card("Verdict")
         verdict_scroll = QScrollArea()
         verdict_scroll.setWidgetResizable(True)
         verdict_scroll.setFrameShape(QFrame.NoFrame)
@@ -716,8 +347,15 @@ class LabWindow(QWidget):
         vc_l.addWidget(verdict_scroll)
 
         self.side_tabs = QTabWidget()
-        queue_page = QWidget()
-        self._build_queue_panel(queue_page)
+        queue_page = QueuePanel(style)
+        self.queue_panel = queue_page
+        queue_page.start_btn.clicked.connect(self._on_queue_start)
+        queue_page.stop_btn.clicked.connect(self._on_queue_stop)
+        queue_page.save_btn.clicked.connect(self._on_queue_save_reviews)
+        queue_page.clear_btn.clicked.connect(self._on_queue_clear)
+        queue_page.table.cellDoubleClicked.connect(self._on_queue_row_opened)
+        queue_page.prev_btn.clicked.connect(lambda: self._review_step(-1))
+        queue_page.next_btn.clicked.connect(lambda: self._review_step(+1))
         # Both side tabs scroll, so the side column never sets the window's
         # minimum height; the video column does.
         queue_scroll = QScrollArea()
@@ -728,7 +366,7 @@ class LabWindow(QWidget):
         view_scroll = QScrollArea()
         view_scroll.setWidgetResizable(True)
         view_scroll.setFrameShape(QFrame.NoFrame)
-        view_scroll.setWidget(view_page)
+        view_scroll.setWidget(self.view_panel)
         self.side_tabs.addTab(view_scroll, "View")
 
         side = QWidget()
@@ -751,7 +389,7 @@ class LabWindow(QWidget):
         self.curves_panel = QWidget()
         cl = QVBoxLayout(self.curves_panel)
         cl.setContentsMargins(0, 0, 0, 0)
-        cl.addWidget(self.curve_tabs)
+        cl.addWidget(self.plots.tabs)
 
         self.main_split = QSplitter(Qt.Vertical)
         self.main_split.setChildrenCollapsible(False)
@@ -763,106 +401,6 @@ class LabWindow(QWidget):
 
         root.addWidget(self.main_split, stretch=1)
         root.addWidget(self.status_label)
-
-    # ---------------------------------------------------------------- queue --
-    def _build_queue_panel(self, page: QWidget) -> None:
-        """The dataset pass: a folder of clips, labelled one after another.
-
-        It reuses the ordinary playback path rather than running its own
-        loop, so what you watch during the pass is exactly what produced the
-        label — the same overlay, the same curves, the same pipeline. A
-        separate fast path would label clips nobody ever sees, and the first
-        disagreement with the annotation would have no way to be examined.
-        """
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-        style = self.style()
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(6)
-        self.queue_start_btn = QPushButton("Start")
-        self.queue_start_btn.setObjectName("primary")
-        self.queue_start_btn.setIcon(style.standardIcon(QStyle.SP_MediaPlay))
-        self.queue_start_btn.setToolTip("Run the whole queue, labelling every clip")
-        self.queue_start_btn.clicked.connect(self._on_queue_start)
-        buttons.addWidget(self.queue_start_btn)
-        self.queue_stop_btn = QPushButton("Stop")
-        self.queue_stop_btn.setIcon(style.standardIcon(QStyle.SP_MediaStop))
-        self.queue_stop_btn.setToolTip("Stop after the current clip, keeping every label so far")
-        self.queue_stop_btn.clicked.connect(self._on_queue_stop)
-        buttons.addWidget(self.queue_stop_btn)
-        self.queue_save_btn = QPushButton("Save Reviews")
-        self.queue_save_btn.setIcon(style.standardIcon(QStyle.SP_DialogSaveButton))
-        self.queue_save_btn.setToolTip("Write a labels file with the reviewed column filled in")
-        self.queue_save_btn.clicked.connect(self._on_queue_save_reviews)
-        buttons.addWidget(self.queue_save_btn)
-        buttons.addStretch(1)
-        self.queue_clear_btn = QPushButton("Clear")
-        self.queue_clear_btn.setObjectName("danger")
-        self.queue_clear_btn.setToolTip("Empty the queue")
-        self.queue_clear_btn.clicked.connect(self._on_queue_clear)
-        buttons.addWidget(self.queue_clear_btn)
-        layout.addLayout(buttons)
-
-        progress_row = QHBoxLayout()
-        self.queue_progress = QProgressBar()
-        self.queue_progress.setFormat("%v / %m")
-        progress_row.addWidget(self.queue_progress, stretch=1)
-        layout.addLayout(progress_row)
-        self.queue_score = QLabel("")
-        self.queue_score.setWordWrap(True)
-        self.queue_score.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self.queue_score)
-
-        self._queue_hint = QLabel("No clips yet. Use «Add Folder…» at the top to load a "
-                                  "folder of recordings.")
-        self._queue_hint.setObjectName("muted")
-        self._queue_hint.setWordWrap(True)
-        layout.addWidget(self._queue_hint)
-
-        self.queue_table = QTableWidget(0, 5)
-        self.queue_table.setHorizontalHeaderLabels(
-            ["Video", "Truth", "Detected", "", "Reviewed"])
-        header = self.queue_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in range(1, 5):
-            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        self.queue_table.verticalHeader().setVisible(False)
-        self.queue_table.setAlternatingRowColors(True)
-        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
-        # Double-click replays one clip on its own, outside the pass, so a
-        # disagreement can be inspected frame by frame without re-running the
-        # whole folder.
-        self.queue_table.cellDoubleClicked.connect(self._on_queue_row_opened)
-        layout.addWidget(self.queue_table, stretch=1)
-
-        # Review: move between the clips already run.
-        #
-        # Double-click already opened a single clip, but reviewing a folder
-        # is comparing: PEF-FallDB's situations are recorded with four
-        # subjects, and what explains why three fail and one succeeds is
-        # almost never inside one clip — it is in the difference between
-        # them. Going back to the table each time breaks that comparison, so
-        # the two buttons and their shortcuts live here.
-        nav = QHBoxLayout()
-        self.review_prev_btn = QPushButton("◀ Previous")
-        self.review_prev_btn.clicked.connect(lambda: self._review_step(-1))
-        self.review_prev_btn.setShortcut(QKeySequence("Alt+Left"))
-        self.review_prev_btn.setToolTip("Alt+←   (or double-click a row)")
-        nav.addWidget(self.review_prev_btn)
-
-        self.review_next_btn = QPushButton("Next ▶")
-        self.review_next_btn.clicked.connect(lambda: self._review_step(+1))
-        self.review_next_btn.setShortcut(QKeySequence("Alt+Right"))
-        self.review_next_btn.setToolTip("Alt+→   (or double-click a row)")
-        nav.addWidget(self.review_next_btn)
-        layout.addLayout(nav)
-
-        self.review_label = QLabel("")
-        self.review_label.setObjectName("muted")
-        self.review_label.setWordWrap(True)
-        layout.addWidget(self.review_label)
 
     # -------------------------------------------------------------- sources --
     def _on_open_video(self) -> None:
@@ -884,7 +422,7 @@ class LabWindow(QWidget):
         self._close_source()
         try:
             self.source = VideoFileSource(path)
-        except (IOError, FileNotFoundError) as exc:
+        except OSError as exc:                  # FileNotFoundError is one too
             self._set_status(str(exc), error=True)
             return
         self._current_path = str(path)
@@ -913,64 +451,44 @@ class LabWindow(QWidget):
         self.timer.start(0)  # self-scheduling loop takes over from here
         self._set_status(
             f"Video: {Path(path).name} — {self.source.frame_count} frames "
-            f"@ {self.source.fps:.1f} fps (declared). Logging to {self.logger.path.name}"
+            f"@ {self.source.fps:.1f} fps (declared). Logging to {self.records.path.name}"
         )
         self._update_controls()
 
     def _on_reanalyze(self) -> None:
-        """Descartar lo congelado y correr una pasada nueva, con registro nuevo."""
+        """Drop what is frozen and run a new pass, with new records."""
         if self._current_path is None or self._queue_running:
             return
         self.load_video(self._current_path, reanalyze=True)
 
-    # ---------------------------------------------------------- congelado --
+    # --------------------------------------------------------------- frozen --
     def _enter_frozen(self, analysis: ClipAnalysis) -> None:
-        """Mostrar un análisis guardado: curvas completas, marcas y veredicto."""
+        """Show a saved analysis: full curves, marks and verdict."""
         if self.pipeline is not None:
             self.pipeline.close()
-            self.pipeline = None     # nada puede recalcular a partir de aquí
+            self.pipeline = None     # nothing can recompute from here on
         self._recorder = None
         self._frozen = analysis
         self.playing = False
         self._set_play_state(False)
-        self._clear_curves()
-        marked: set[int] = set()
-        for index in sorted(analysis.frames):
-            res = analysis.frames[index]
-            self._store_plot_point(index, res.pose.timestamp, res)
-            self._timeline_rgb[index] = _frame_rgb(res)
-            self._timeline_t[index] = res.pose.timestamp
-            if res.event is not None:
-                self._mark(res.event.timestamp, "#ff1744", dash=True)
-            if res.resolved_event is not None:
-                self._mark_verdict(res.pose.timestamp, res.resolved_event)
-                marked.add(id(res.resolved_event))
-        # En modo etiquetado casi todo se decide en finalise(), DESPUÉS del
-        # último cuadro: esos veredictos no cuelgan de ningún cuadro y se
-        # marcan al final del clip, que es donde la pasada los vio caer.
-        if analysis.frames:
-            t_end = analysis.frames[max(analysis.frames)].pose.timestamp
-            for ev in analysis.events:
-                if id(ev) not in marked and ev.verdict != "stage1_only":
-                    self._mark_verdict(t_end, ev)
-        self._redraw_curves()
-        self._redraw_timeline()
+        self.verdict_label.setText("—")
+        self.plots.show_analysis(analysis)
         self._show_verdict(analysis.events)
 
     def _show_frozen_frame(self, frame, index: int, timestamp: float) -> None:
-        """Dibujar lo que la pasada vio en este cuadro. Sin pipeline."""
+        """Draw what the pass saw on this frame. No pipeline."""
         res = self._frozen.frames.get(index)
-        if res is None:          # cuadro que la pasada no alcanzó
+        if res is None:          # a frame the pass never reached
             self._display(frame)
         else:
             self._display(draw_overlay(
                 frame, res.pose,
                 visibility_threshold=self.cfg.pose.visibility_threshold,
-                show_skeleton=self.chk_skeleton.isChecked(),
-                show_trunk=self.chk_trunk.isChecked(),
-                show_centroid=self.chk_centroid.isChecked(),
+                show_skeleton=self.view_panel.skeleton.isChecked(),
+                show_trunk=self.view_panel.trunk.isChecked(),
+                show_centroid=self.view_panel.centroid.isChecked(),
                 centroid_px=res.centroid_px,
-                show_support=self.chk_support.isChecked(),
+                show_support=self.view_panel.support.isChecked(),
                 com_px=res.com_px,
                 support_hull_px=res.support_hull_px,
                 com_outside=_p_side(res.quantities.get("P_offset")),
@@ -980,7 +498,7 @@ class LabWindow(QWidget):
             self.stage_label.setText(
                 f"[FROZEN]  stage on this frame: {res.stage}   |   events: {n}")
             self._set_stage_chip(res.stage, frozen=True)
-        self._move_cursors(timestamp)
+        self.plots.move_cursors(timestamp)
 
     def _on_toggle_camera(self) -> None:
         if self.source is not None and self.source.is_live:
@@ -989,7 +507,7 @@ class LabWindow(QWidget):
         self._close_source()
         try:
             self.source = CameraSource(self.camera_spin.value())
-        except IOError as exc:
+        except OSError as exc:
             self._set_status(str(exc), error=True)
             return
         self._start_session(f"camera{self.camera_spin.value()}", metadata={
@@ -1001,7 +519,7 @@ class LabWindow(QWidget):
         self.camera_btn.setText(CAMERA_STOP)
         self.timer.start(0)  # self-scheduling loop; pace comes from the source
         self._set_status(
-            f"Live camera {self.camera_spin.value()} — logging to {self.logger.path.name}"
+            f"Live camera {self.camera_spin.value()} — logging to {self.records.path.name}"
         )
         self._update_controls()
 
@@ -1021,44 +539,24 @@ class LabWindow(QWidget):
         self.alert_banner.setVisible(False)
         meta = dict(metadata or {})
         meta["config"] = self.cfg.as_dict()
-        self.logger = AuditLogger(self.cfg.logging.output_dir, source_name, metadata=meta)
-        # A second record, one row per resolved event. Live sessions used to
-        # produce none at all: the events log existed only in the headless
-        # runner, so a fall watched through this window left no trace of what
-        # any stage decided about it.
-        # flush_each_row: an event is rare and irreplaceable; see AuditLogger.
-        self.event_logger = AuditLogger(
-            self.cfg.logging.output_dir, source_name + "-events",
-            fields=EVENT_FIELDS,
-            metadata={**meta, "record_kind": "stage1_events"},
-            flush_each_row=True)
+        # PEF-Lab is the laboratory, not the deployed device: it always
+        # records everything (research mode), whatever logging.mode says.
+        # logging.mode governs main.py, which is what runs on the Pi (§3.6).
+        self.records = RunRecords(self.cfg.logging.output_dir, source_name,
+                                  metadata=meta, research=True)
+        self._run_events = self.pipeline.machine.events
         self.frame_index = 0
-        self._clear_curves()
+        self.plots.clear()
         self.verdict_label.setText("— analyzing…")
 
     def _log_event(self, ev) -> None:
-        """Write one resolved event. Called when its verdict lands, not when
-        it was raised: the verdict is the point of the record."""
-        if self.event_logger is None:
+        """Write one resolved event, and any earlier one a loss abandoned.
+
+        Called when its verdict lands, not when it was raised: the verdict is
+        the point of the record."""
+        if self.records is None or self.pipeline is None:
             return
-        self.event_logger.log({
-            "event_index": len(self.pipeline.machine.events) - 1,
-            "frame_index": ev.frame_index,
-            "timestamp_s": f"{ev.timestamp:.3f}",
-            "T_deg": f"{ev.t_deg:.2f}",
-            "V_tps": f"{ev.v_tps:.3f}",
-            "formulation": ev.formulation,
-            "trigger_source": ev.trigger_source,
-            "verdict": ev.verdict,
-            "severity": ev.severity,
-            "max_immobility_s": ("" if math.isnan(ev.max_immobility_s)
-                                 else f"{ev.max_immobility_s:.2f}"),
-            "p_outside_fraction": ("" if math.isnan(ev.p_outside_fraction)
-                                   else f"{ev.p_outside_fraction:.3f}"),
-            "p_samples": ev.p_samples,
-            "H_ratio_EXP": "" if math.isnan(ev.h_ratio) else f"{ev.h_ratio:.3f}",
-            "motivo": ev.reason,
-        })
+        self.records.event_settled(self.pipeline.machine.events, ev)
 
     # ----------------------------------------------------------- queue flow --
     def _on_queue_add_folder(self) -> None:
@@ -1069,25 +567,8 @@ class LabWindow(QWidget):
         if not clips:
             self._set_status(f"No videos in {folder}", error=True)
             return
-        start = len(self._queue)
         self._queue.extend(clips)
-        self.queue_table.setRowCount(len(self._queue))
-        for offset, path in enumerate(clips):
-            row = start + offset
-            truth = truth_from_name(path)
-            self.queue_table.setItem(row, 0, QTableWidgetItem(path.name))
-            self.queue_table.setItem(row, 1, QTableWidgetItem(truth or "?"))
-            self.queue_table.setItem(row, 2, QTableWidgetItem(""))
-            self.queue_table.setItem(row, 3, QTableWidgetItem(""))
-            box = QComboBox()
-            box.addItems(("",) + tuple(CLASSES))
-            # The human column. A dataset needs both opinions: without the
-            # reviewed one there is nothing to score the machine against
-            # except a file name, and file names are where this material
-            # already carries typos.
-            self.queue_table.setCellWidget(row, 4, box)
-        self.queue_progress.setRange(0, len(self._queue))
-        self.queue_progress.setValue(0)
+        self.queue_panel.add_clips(clips)
         self._set_status(f"Queued {len(clips)} clips from {Path(folder).name} "
                          f"({len(self._queue)} total)")
         self._update_controls()
@@ -1122,9 +603,7 @@ class LabWindow(QWidget):
         self._queue = []
         self._review_index = None
         self._queue_rows = []
-        self.queue_table.setRowCount(0)
-        self.queue_progress.setRange(0, 0)
-        self.queue_score.setText("")
+        self.queue_panel.clear()
         self._update_controls()
 
     def _on_queue_save_reviews(self) -> None:
@@ -1146,9 +625,7 @@ class LabWindow(QWidget):
                       "config": self.cfg.as_dict()},
             flush_each_row=True)
         for row, record in enumerate(self._queue_rows):
-            box = self.queue_table.cellWidget(row, 4)
-            record["clase_revisada"] = (box.currentText()
-                                        if box is not None else "")
+            record["reviewed_class"] = self.queue_panel.reviewed(row) or ""
             self._label_logger.log(record)
         self._close_label_record("Reviews saved.")
 
@@ -1162,9 +639,8 @@ class LabWindow(QWidget):
             self._update_controls()
             return
         path = self._queue[self._queue_index]
-        self.queue_table.selectRow(self._queue_index)
-        self.queue_table.scrollToItem(self.queue_table.item(self._queue_index, 0))
-        # Iniciar la cola es correr de nuevo, a propósito: nunca congelado.
+        self.queue_panel.select(self._queue_index)
+        # Starting the queue is running again, on purpose: never frozen.
         self.load_video(str(path), reanalyze=True)
 
     def _label_current_clip(self) -> None:
@@ -1178,77 +654,22 @@ class LabWindow(QWidget):
         if self.pipeline is None or self._queue_index >= len(self._queue):
             return
         path = self._queue[self._queue_index]
-        events = self.pipeline.machine.events
-        detected, reason = classify_clip(events)
-        truth = truth_from_name(path)
-        worst = events[-1] if events else None
-        now = datetime.now()
         total = (self.source.frame_count / self.source.fps
                  if self.source is not None and self.source.fps else 0.0)
-        reliable = self._reliable_frames
-        frames = self._logged_frames
-        row = {
-            "video": path.name,
-            "fecha": now.strftime("%Y-%m-%d"),
-            "hora": now.strftime("%H:%M:%S"),
-            "duracion_s": f"{total:.2f}",
-            "frames": frames,
-            "frames_confiables_pct": (f"{100.0 * reliable / frames:.1f}"
-                                      if frames else ""),
-            "clase_detectada": detected,
-            "clase_verdad": truth,
-            "clase_revisada": "",
-            "acierto": ("" if not truth else int(truth == detected)),
-            "eventos": len(events),
-            "t_disparo_s": f"{events[0].timestamp:.2f}" if events else "",
-            "verdict": worst.verdict if worst else "",
-            "severity": worst.severity if worst else "",
-            "I_max_s": (f"{worst.max_immobility_s:.2f}"
-                        if worst and worst.max_immobility_s == worst.max_immobility_s
-                        else ""),
-            "motivo": (f"{reason} — {worst.reason}" if worst and worst.reason
-                       else reason),
-        }
+        row = label_row(path, self.pipeline.machine.events, self._logged_frames,
+                        self._reliable_frames, total, datetime.now())
+        detected, truth = row["detected_class"], row["true_class"]
         if self._label_logger is not None:
             self._label_logger.log(row)
         self._queue_rows.append(row)
         self._show_queue_result(self._queue_index, detected, truth)
-        item = self.queue_table.item(self._queue_index, 2)
+        item = self.queue_panel.table.item(self._queue_index, 2)
         if item is not None:
-            item.setToolTip(row["motivo"])
+            item.setToolTip(row["reason"])
         return row
 
     def _show_queue_result(self, row: int, detected: str, truth: str) -> None:
-        self.queue_table.setItem(row, 2, QTableWidgetItem(detected))
-        mark = "" if not truth else ("OK" if truth == detected else "X")
-        item = QTableWidgetItem(mark)
-        if mark == "X":
-            item.setForeground(Qt.red)
-        self.queue_table.setItem(row, 3, item)
-        self.queue_progress.setValue(row + 1)
-        self.queue_score.setText(self._queue_metrics_text())
-
-    def _queue_metrics_text(self) -> str:
-        """Las métricas del §3.7, con el mismo código que el reporte.
-
-        Usa evaluation.binary_metrics: el número en pantalla y el del reporte
-        no pueden diferir, que es lo que el docstring de evaluation.py pide.
-        """
-        scored = [r for r in self._queue_rows if r["clase_verdad"]]
-        if not scored:
-            return ""
-        hits = sum(1 for r in scored if r["clase_verdad"] == r["clase_detectada"])
-        falls = [r for r in scored if r["clase_verdad"] != "NoFall"]
-        fall_hits = sum(1 for r in falls if r["clase_verdad"] == r["clase_detectada"])
-        b = binary_metrics(scored)
-        parts = [f"4-class {hits}/{len(scored)} ({100.0 * hits / len(scored):.0f}%)"]
-        if falls:
-            parts.append(f"exact falls {fall_hits}/{len(falls)}")
-        for key, name in (("sensibilidad", "sens"), ("especificidad", "spec")):
-            v = b.get(key, float("nan"))
-            if v == v:                              # no NaN
-                parts.append(f"{name} {100.0 * v:.0f}%")
-        return "  ·  ".join(parts)
+        self.queue_panel.show_result(row, detected, truth, metrics_text(self._queue_rows))
 
     def _on_queue_row_opened(self, row: int, _column: int) -> None:
         if self._queue_running or row >= len(self._queue):
@@ -1256,90 +677,77 @@ class LabWindow(QWidget):
         self._open_for_review(row)
 
     def _open_for_review(self, row: int) -> None:
-        """Cargar el clip ``row`` de la cola para mirarlo, fuera de la pasada.
+        """Load queue clip ``row`` to look at it, outside the pass.
 
-        Es la ruta de reproducción de siempre; lo único que agrega es
-        recordar en qué clip quedó, para que las flechas sepan desde dónde
-        moverse. No toca la tabla: los resultados de la pasada siguen ahí,
-        que es contra lo que uno está comparando mientras mira.
+        It is the usual playback path; all it adds is remembering which
+        clip it is on, so the arrows know where to move from. It does not
+        touch the table: the pass results stay there, which is what one is
+        comparing against while looking.
         """
         if not (0 <= row < len(self._queue)):
             return
         self._review_index = row
-        self.queue_table.selectRow(row)
-        item = self.queue_table.item(row, 0)
-        if item is not None:
-            self.queue_table.scrollToItem(item)
+        self.queue_panel.select(row)
         self.load_video(str(self._queue[row]))
         self._update_review_label()
 
     def _review_step(self, delta: int) -> None:
-        """Moverse al clip anterior o siguiente de la cola.
+        """Move to the previous or next clip of the queue.
 
-        Sin clip abierto todavía, la primera flecha entra por un extremo en
-        vez de no hacer nada: llegar a la carpeta y no saber por dónde
-        empezar es el caso más común, no un error.
+        With no clip open yet, the first arrow enters at one end instead of
+        doing nothing: arriving at the folder and not knowing where to
+        start is the most common case, not an error.
 
-        Se detiene en los extremos en lugar de dar la vuelta. Con cuatro
-        sujetos por situación, volver al primero sin avisar se confunde muy
-        fácil con "no pasó nada", y el objetivo aquí es comparar clips
-        distintos.
+        It stops at the ends instead of wrapping around. With four
+        subjects per situation, going back to the first without notice is
+        easily mistaken for "nothing happened", and the point here is to
+        compare different clips.
         """
         if self._queue_running or not self._queue:
             return
         if self._review_index is None:
             self._open_for_review(0 if delta > 0 else len(self._queue) - 1)
             return
-        destino = self._review_index + delta
-        if not (0 <= destino < len(self._queue)):
-            extremo = "primer" if delta < 0 else "último"
-            self._set_status(f"Ya está en el {extremo} clip de la cola.")
+        target = self._review_index + delta
+        if not (0 <= target < len(self._queue)):
+            end = "first" if delta < 0 else "last"
+            self._set_status(f"Already at the {end} clip of the queue.")
             return
-        self._open_for_review(destino)
+        self._open_for_review(target)
 
     def _update_review_label(self) -> None:
-        """El contador junto a las flechas: en qué clip está, y de cuántos."""
+        """The counter next to the arrows: which clip it is on, and of how many."""
         if not self._queue:
-            self.review_label.setText("")
+            self.queue_panel.review_label.setText("")
             return
         if self._review_index is None:
-            self.review_label.setText(
+            self.queue_panel.review_label.setText(
                 f"{len(self._queue)} clips queued — "
                 f"Alt+← / Alt+→ to browse them")
             return
-        nombre = self._queue[self._review_index].name
-        self.review_label.setText(
-            f"clip {self._review_index + 1} of {len(self._queue)}   ·   {nombre}")
+        name = self._queue[self._review_index].name
+        self.queue_panel.review_label.setText(
+            f"clip {self._review_index + 1} of {len(self._queue)}   ·   {name}")
 
     def _close_label_record(self, reason: str) -> None:
         """Finish the labels file, folding in any human corrections."""
         if self._label_logger is None:
             return
         for row, record in enumerate(self._queue_rows):
-            box = self.queue_table.cellWidget(row, 4)
-            if box is not None and box.currentText():
-                record["clase_revisada"] = box.currentText()
+            reviewed = self.queue_panel.reviewed(row)
+            if reviewed:
+                record["reviewed_class"] = reviewed
         path = self._label_logger.path
         self._label_logger.close()
         self._label_logger = None
         summary = format_confusion(self._queue_rows)
-        print(f"\n{summary}")
-        # Entrenamiento y prueba SIEMPRE por separado: un solo numero sobre el
-        # conjunto entero no dice si los ajustes generalizan, y ese es el
-        # unico numero que un revisor va a mirar dos veces.
-        split_file = Path(__file__).resolve().parents[2] / "notas" / "particion.yaml"
-        if split_file.exists():
-            groups = split_rows(self._queue_rows, load_split(split_file))
-            for side, title in (("train", "CALIBRACION"), ("test", "PRUEBA"),
-                                ("sin_asignar", "SIN ASIGNAR")):
-                if groups[side]:
-                    print("\n" + report(groups[side], title))
+        print("\n" + pass_summary(self._queue_rows, PARTITION_PATH))
         print(f"\n-> {path}")
         first = summary.splitlines()[-1]
         self._set_status(f"{reason} {len(self._queue_rows)} clips — {first} -> {path.name}")
 
     def _finalise_records(self, reason: str) -> None:
-        """Close both records and write their metadata sidecars.
+        """Close the records and write their metadata sidecars.
 
         Separate from :meth:`_close_source` because the two events are not the
         same: a video that reaches its end has produced a COMPLETE record and
@@ -1349,23 +757,19 @@ class LabWindow(QWidget):
         this project's own material, a 0-byte event file that had actually
         recorded a confirmed fall.
 
-        Both loggers are dropped afterwards. That is deliberate: AuditLogger
+        The records are dropped afterwards. That is deliberate: AuditLogger
         opens in "w" mode, so continuing to write to a closed record would
         truncate it. It now raises instead, and this keeps the window from
-        ever reaching that.
+        ever reaching that. Closing also writes the events no verdict ever
+        reached (abandoned by a detection loss), which PEF-Lab used to leave
+        out of its record.
         """
-        if self.logger is None and self.event_logger is None:
+        if self.records is None:
             return
-        path, rows = None, 0
-        if self.logger is not None:
-            path, rows = self.logger.path, self.logger.rows_written
-            self.logger.close()
-            self.logger = None
-        events = 0
-        if self.event_logger is not None:
-            events = self.event_logger.rows_written
-            self.event_logger.close()
-            self.event_logger = None
+        path, rows = self.records.path, self.records.frames_written
+        self.records.close(self._run_events)
+        events = self.records.events_written
+        self.records = None
         if path is not None:
             self._set_status(f"{reason} {rows} frames, {events} events -> {path}")
         else:
@@ -1395,13 +799,13 @@ class LabWindow(QWidget):
         self.playing = not self.playing
         self._set_play_state(self.playing)
         if self.playing and self._frozen is not None:
-            # Al final del clip, reproducir vuelve a empezar.
+            # At the end of the clip, play starts over.
             if self.frame_index >= self.source.frame_count - 1:
                 self.source.seek(0)
             self.timer.start(0)
             return
         if self.playing:
-            if self.logger is None:
+            if self.records is None:
                 # The record was finalised when the clip ended, so replaying it
                 # records nothing. Saying so is the point: a silent no-op here
                 # would let someone believe a second pass was captured.
@@ -1419,7 +823,7 @@ class LabWindow(QWidget):
         self._seek_to(min(last, max(0, self.frame_index + delta)))
 
     def _step_seconds(self, seconds: float) -> None:
-        """Moverse un segundo (Mayús+flecha): la escala de una caída."""
+        """Move one second (Shift+arrow): the scale of a fall."""
         if self.source is None or self.source.is_live or self._queue_running:
             return
         self._step(int(round(seconds * self.source.fps)))
@@ -1477,8 +881,8 @@ class LabWindow(QWidget):
         """
         ok, frame, timestamp = self.source.read()
         if self._frozen is not None:
-            # Revisión congelada: se muestra lo que la pasada vio. Nada se
-            # recalcula, nada se registra, ningún evento puede dispararse.
+            # Frozen review: what the pass saw is shown. Nothing is
+            # recomputed, nothing recorded, no event can fire.
             if not ok:
                 self.playing = False
                 self._set_play_state(False)
@@ -1500,7 +904,8 @@ class LabWindow(QWidget):
                     if resolved is not None:
                         self._on_event_resolved(resolved)
                 label = self._label_current_clip() if self._queue_running else None
-                record = str(self.logger.path) if self.logger is not None else ""
+                record = (str(self.records.path)
+                          if self.records is not None and self.records.path else "")
                 # The record is complete the moment the clip ends, so it goes
                 # to disk now rather than waiting for a Close that may never
                 # come. The source stays open: reviewing is the whole point of
@@ -1523,15 +928,15 @@ class LabWindow(QWidget):
         # only displays the result (design rule: the GUI is a viewer).
         result = self.pipeline.process(frame, index, timestamp)
 
-        if log and self.logger is not None:
-            self.logger.log_pose_frame(result.pose, extra=result.csv_extra())
+        if log and self.records is not None:
+            self.records.frame(result)
             self._logged_frames += 1
             self._reliable_frames += int(bool(result.reliable))
         if self._recorder is not None:
             if log:
                 self._recorder.record(index, result)
             else:
-                self._recorder.invalidate("salto durante la pasada")
+                self._recorder.invalidate("jump during the pass")
         self._last_timestamp = timestamp
 
         t_overlay = time.perf_counter()
@@ -1539,11 +944,11 @@ class LabWindow(QWidget):
             frame,
             result.pose,
             visibility_threshold=self.cfg.pose.visibility_threshold,
-            show_skeleton=self.chk_skeleton.isChecked(),
-            show_trunk=self.chk_trunk.isChecked(),
-            show_centroid=self.chk_centroid.isChecked(),
+            show_skeleton=self.view_panel.skeleton.isChecked(),
+            show_trunk=self.view_panel.trunk.isChecked(),
+            show_centroid=self.view_panel.centroid.isChecked(),
             centroid_px=result.centroid_px,
-            show_support=self.chk_support.isChecked(),
+            show_support=self.view_panel.support.isChecked(),
             com_px=result.com_px,
             support_hull_px=result.support_hull_px,
             com_outside=_p_side(result.quantities.get("P_offset")),
@@ -1552,7 +957,9 @@ class LabWindow(QWidget):
         t_display = time.perf_counter()
         self._display(shown)
         t_plots = time.perf_counter()
-        self._update_plots(index, timestamp, result)
+        self.plots.update(index, timestamp, result,
+                          curves=self.view_panel.curves.isChecked(),
+                          live=self.source.is_live)
         t_end = time.perf_counter()
         perf = self.pipeline.timings
         perf.add("overlay", t_display - t_overlay)
@@ -1570,10 +977,10 @@ class LabWindow(QWidget):
         self.seek_slider.setValue(index)
         self.seek_slider.blockSignals(False)
         total = self.source.frame_count / self.source.fps
-        self.time_label.setText(f"{_format_time(timestamp)} / {_format_time(total)}")
+        self.time_label.setText(f"{format_time(timestamp)} / {format_time(total)}")
 
     def _freeze_finished_pass(self, label: dict | None, record: str) -> None:
-        """Congelar la pasada que acaba de terminar, si fue continua."""
+        """Freeze the pass that just ended, if it was continuous."""
         rec, self._recorder = self._recorder, None
         if rec is None or self.pipeline is None:
             return
@@ -1585,8 +992,8 @@ class LabWindow(QWidget):
             return
         self._cache.store(analysis)
         if not self._queue_running:
-            # Quedarse en el clip, ya congelado: moverse por él desde aquí no
-            # recalcula nada. En la cola, el siguiente clip se abre enseguida.
+            # Stay on the clip, now frozen: moving through it from here
+            # recomputes nothing. In the queue, the next clip opens at once.
             self._enter_frozen(analysis)
 
     def _display(self, frame_bgr) -> None:
@@ -1595,107 +1002,18 @@ class LabWindow(QWidget):
         image = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self.video_label.show_image(QPixmap.fromImage(image))
 
-    # ----------------------------------------------------------------- plots --
-    def _update_plots(self, index: int, timestamp: float, result) -> None:
-        """Guardar este cuadro y redibujar las curvas y la línea de tiempo.
-
-        Data is keyed by frame index so scrubbing back over already-seen
-        frames overwrites instead of duplicating; the curve is drawn in
-        time order regardless of the order frames were visited. In live
-        mode only the most recent window is kept so memory stays bounded.
-        """
-        self._timeline_rgb[index] = _frame_rgb(result)
-        self._timeline_t[index] = timestamp
-        if not self.chk_curves.isChecked():
-            return
-        self._store_plot_point(index, timestamp, result)
-        if self.source is not None and self.source.is_live and len(self._plot_data) > 900:
-            # Live mode: keep ~30 s at 30 FPS; drop the oldest entries.
-            for old_key in sorted(self._plot_data)[: len(self._plot_data) - 900]:
-                del self._plot_data[old_key]
-                self._timeline_rgb.pop(old_key, None)
-                self._timeline_t.pop(old_key, None)
-        self._redraw_curves()
-        self._redraw_timeline()
-        self._move_cursors(timestamp)
-
-    def _store_plot_point(self, index: int, timestamp: float, result) -> None:
-        q = result.quantities
-        nan = float("nan")
-        point = {key: q.get(key, nan) for key in self._series}
-        point["t"] = timestamp
-        self._plot_data[index] = point
-
-    def _redraw_curves(self) -> None:
-        if not self._plot_data:
-            return
-        keys = sorted(self._plot_data)
-        times = np.array([self._plot_data[k]["t"] for k in keys], dtype=float)
-        # pyqtgraph skips NaN gaps with connect="finite": the curve breaks
-        # where there was no detection instead of drawing a fake bridge. For
-        # P the break is doubly meaningful — it marks the stretches where the
-        # feet were not visible and the quantity genuinely does not exist.
-        for key, c in self._series.items():
-            ys = np.array([self._plot_data[k].get(key, float("nan")) for k in keys],
-                          dtype=float)
-            c.setData(times, ys, connect="finite")
-        # El eje de tiempo se fija a mano en todas: con ejes enlazados el
-        # autoajuste de X quedaba apagado y la vista se quedaba en -0.5..0.5,
-        # con las curvas fuera de cuadro (visto en la captura de A17-S2).
-        span = max(times[-1] - times[0], 1.0 / 30.0)
-        for w in self._curve_plots:
-            w.setXRange(times[0], times[0] + span, padding=0.01)
-
-    def _redraw_timeline(self) -> None:
-        if not self._timeline_rgb:
-            self.timeline_img.clear()
-            return
-        keys = sorted(self._timeline_rgb)
-        rgb = np.array([self._timeline_rgb[k] for k in keys], dtype=np.uint8)
-        self.timeline_img.setImage(rgb.reshape(len(keys), 1, 3), levels=(0, 255))
-        t0, t1 = self._timeline_t[keys[0]], self._timeline_t[keys[-1]]
-        dt = (t1 - t0) / max(1, len(keys) - 1) if len(keys) > 1 else 1.0 / 30.0
-        self.timeline_img.setRect(QRectF(t0, 0.0, (t1 - t0) + dt, 1.0))
-        self.timeline.setXRange(t0, t1 + dt, padding=0.01)
-
-    def _move_cursors(self, timestamp: float) -> None:
-        for c in self._cursors:
-            c.setPos(timestamp)
-
-    def _clear_curves(self) -> None:
-        self._plot_data.clear()
-        self._timeline_rgb.clear()
-        self._timeline_t.clear()
-        for curve in self._series.values():
-            curve.setData([], [])
-        self.timeline_img.clear()
-        for w, item in self._markers:
-            w.removeItem(item)
-        self._markers.clear()
-        self.verdict_label.setText("—")
-
-    def _mark(self, t: float, colour, dash: bool, width: int = 2) -> None:
-        """Una marca vertical en todas las curvas y en la línea de tiempo."""
-        for w in self._curve_plots + (self.timeline,):
-            item = pg.InfiniteLine(pos=t, angle=90, pen=pg.mkPen(
-                colour, width=width, style=Qt.DashLine if dash else Qt.SolidLine))
-            w.addItem(item)
-            self._markers.append((w, item))
-
-    def _mark_verdict(self, t: float, ev) -> None:
-        self._mark(t, _SEVERITY_PEN.get(ev.severity, "#9e9e9e"), dash=False, width=3)
-
+    # --------------------------------------------------------------- readouts --
     def _show_verdict(self, events) -> None:
-        """El panel del veredicto: cada evento, con la regla que lo decidió."""
+        """The verdict panel: every event, with the rule that decided it."""
         if not events:
             self.verdict_label.setText("No events (Stage 1 never fired).")
             return
         lines = []
         for ev in events:
             tag = ev.verdict + (f" [{ev.severity}]" if ev.severity else "")
-            # Escapado: el motivo lleva '<' y '>=', que como HTML se comían
-            # el texto ("T final 3 deg = 50%" en vez de "< 30 ... >= 50%").
-            colour = _SEVERITY_PEN.get(ev.severity, theme.MUTED)
+            # Escaped: the reason carries '<' and '>=', which as HTML ate
+            # the text ("T final 3 deg = 50%" instead of "< 30 ... >= 50%").
+            colour = SEVERITY_PEN.get(ev.severity, theme.MUTED)
             lines.append(f"<span style='color:{colour}'><b>t={ev.timestamp:.2f}s  "
                          f"{html.escape(tag)}</b></span><br>"
                          f"{html.escape(ev.reason or '—')}")
@@ -1727,7 +1045,7 @@ class LabWindow(QWidget):
         """
         self._log_event(ev)
         if self._last_timestamp is not None:
-            self._mark_verdict(self._last_timestamp, ev)
+            self.plots.mark_verdict(self._last_timestamp, ev)
         if self.pipeline is not None:
             self._show_verdict(self.pipeline.machine.events)
         if self.pipeline is not None and self.pipeline.alerts.should_dispatch(ev.verdict):
@@ -1756,7 +1074,7 @@ class LabWindow(QWidget):
             text += f"   ->  FIRED at t={ev.timestamp:.2f}s  T={ev.t_deg:.1f}  V={ev.v_tps:+.2f}"
             # A vertical marker on every curve and on the timeline, so the
             # moment of the decision is readable against all quantities.
-            self._mark(ev.timestamp, "#ff1744", dash=True)
+            self.plots.mark(ev.timestamp, "#ff1744", dash=True)
         now = time.monotonic()
         if self.pipeline is not None and now - self._last_perf_shown > 1.0:
             self._last_perf_shown = now
@@ -1765,7 +1083,7 @@ class LabWindow(QWidget):
         self._set_stage_chip(result.stage, fired=result.event is not None)
 
     def _on_curves_toggled(self, checked: bool) -> None:
-        for w in (self.curves_panel, self.timeline):
+        for w in (self.curves_panel, self.plots.timeline):
             w.setVisible(checked)
 
     def _set_play_state(self, playing: bool) -> None:
@@ -1811,16 +1129,16 @@ class LabWindow(QWidget):
         self.camera_btn.setEnabled(not running)
         self.close_btn.setEnabled(not running)
         self.queue_add_btn.setEnabled(not running)
-        self.queue_clear_btn.setEnabled(not running and bool(self._queue))
-        self.queue_save_btn.setEnabled(not running and bool(self._queue_rows))
-        self.queue_start_btn.setEnabled(not running and bool(self._queue))
-        self.queue_stop_btn.setEnabled(running)
-        # Revisar es lo contrario de correr la pasada: durante ella las
-        # flechas cargarian otro clip a media medicion, que es el mismo
-        # accidente que ya impide abrir un video con el boton de arriba.
-        self.review_prev_btn.setEnabled(not running and bool(self._queue))
-        self.review_next_btn.setEnabled(not running and bool(self._queue))
-        self._queue_hint.setVisible(not self._queue)
+        self.queue_panel.clear_btn.setEnabled(not running and bool(self._queue))
+        self.queue_panel.save_btn.setEnabled(not running and bool(self._queue_rows))
+        self.queue_panel.start_btn.setEnabled(not running and bool(self._queue))
+        self.queue_panel.stop_btn.setEnabled(running)
+        # Reviewing is the opposite of running the pass: during it the
+        # arrows would load another clip mid-measurement, the same
+        # accident that already stops opening a video with the button above.
+        self.queue_panel.prev_btn.setEnabled(not running and bool(self._queue))
+        self.queue_panel.next_btn.setEnabled(not running and bool(self._queue))
+        self.queue_panel.hint.setVisible(not self._queue)
         self._update_review_label()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)

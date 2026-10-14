@@ -37,7 +37,7 @@ STATE_KW = dict(
 
 NAN = float("nan")
 
-#: Un frame a 30 fps, y la ventana equivalente a los antiguos 5 frames.
+#: One frame at 30 fps, and the window equal to the old 5 frames.
 DT = 1 / 30.0
 WINDOW_S = 5 / 30.0
 
@@ -92,7 +92,7 @@ class TestVelocityEstimator(unittest.TestCase):
         est = VelocityEstimator(window_seconds=WINDOW_S, max_gap_s=0.5)
         xs = xs if xs is not None else [0.0] * len(ys)
         out = []
-        for i, (x, y) in enumerate(zip(xs, ys)):
+        for i, (x, y) in enumerate(zip(xs, ys, strict=True)):
             out.append(est.update(i / self.FPS, np.array([x, y]), self.TORSO))
         return out
 
@@ -221,7 +221,7 @@ class TestFrameRateInvariance(unittest.TestCase):
         spread = (max(peaks) - min(peaks)) / abs(sum(peaks) / len(peaks))
         self.assertLess(
             spread, 0.15,
-            f"V varía {100 * spread:.0f}% entre 60 y 10 fps: {peaks}",
+            f"V varies {100 * spread:.0f}% between 60 and 10 fps: {peaks}",
         )
 
     def test_every_rate_would_cross_a_common_threshold(self) -> None:

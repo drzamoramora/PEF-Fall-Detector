@@ -5,7 +5,7 @@ here is what a caregiver would receive: that it fires on the right verdicts
 and stays silent on the others, that it carries the evidence rather than a
 bare "FALL DETECTED", and that one broken transport cannot silence the rest.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
@@ -69,9 +69,11 @@ class TestSinks(unittest.TestCase):
 
         survived = []
         d = AlertDispatcher([broken, survived.append])
-        self.assertTrue(d.dispatch(alert()))
+        with self.assertLogs("pef_fall_detector.alerts", level="WARNING") as logs:
+            self.assertTrue(d.dispatch(alert()))
         self.assertEqual(len(survived), 1)
         self.assertEqual(len(d.failures), 1)
+        self.assertIn("gateway down", logs.output[0])     # said, not only recorded
 
     def test_a_dispatcher_with_no_sinks_still_records(self) -> None:
         # Before Phase 7 there is no transport at all; the record must still
@@ -88,7 +90,7 @@ class TestMessage(unittest.TestCase):
         msg = alert(t_deg=82.4, v_tps=-4.1, p_outside_fraction=0.75,
                     max_immobility_s=6.2, prior_state="WALKING").message()
         for fragment in ("SEVERE", "82.4", "-4.10", "75%", "6.2", "WALKING"):
-            self.assertIn(fragment, msg, f"falta {fragment!r} en: {msg}")
+            self.assertIn(fragment, msg, f"{fragment!r} is missing from: {msg}")
 
     def test_unmeasurable_quantities_read_as_na_not_zero(self) -> None:
         # A missing P must not appear as "COM outside 0% of window", which

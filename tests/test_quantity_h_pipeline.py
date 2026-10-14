@@ -14,7 +14,7 @@ Building poses directly, the same way ``tests/test_quantity_p.py`` builds its
 own foot geometry rather than reusing another file's fixture, avoids
 changing a shared helper that many unrelated tests already depend on.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from pef_fall_detector.pose_frontend import (
     PoseFrame,
     compute_step0,
 )
-from tests.test_pipeline import TEST_CFG
+from tests.support import TEST_CFG  # noqa: E402
 
 DT = 1.0 / 30.0
 

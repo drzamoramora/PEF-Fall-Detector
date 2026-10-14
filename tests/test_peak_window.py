@@ -1,27 +1,28 @@
-"""La ventana de pico de la Etapa 1.
+"""Stage 1's peak window.
 
-POR QUÉ EXISTE ESTE ARCHIVO. El §3.5 pide que el evento pase a la Etapa 2
-cuando *"an instantaneous combination of the two quantities exceeds a
-configurable trigger threshold"*. Exigir el mismo cuadro es una condición
-**adicional**: el §3.4 describe la firma temporal de cada cantidad por
-separado —T llegando al rango de caída *"within a short time window"*, V muy
-negativa *"within a short window"*— y no dice que coincidan.
+WHY THIS FILE EXISTS. §3.5 asks for the event to move to Stage 2 when *"an
+instantaneous combination of the two quantities exceeds a configurable
+trigger threshold"*. Requiring the same frame is an **additional**
+condition: §3.4 describes the temporal signature of each quantity
+separately — T reaching the fall range *"within a short time window"*, V
+strongly negative *"within a short window"* — and does not say they
+coincide.
 
-Medido sobre PEF-FallDB no coinciden nunca: en las doce caídas que el
-disparador perdió, el pico de T y el de V están separados entre 0.6 s y
-3.1 s. Y es mecánico, no accidental — T es una posición y V una velocidad del
-mismo cuerpo.
+Measured on PEF-FallDB they never coincide: in the twelve falls the trigger
+missed, the T peak and the V peak are 0.6 s to 3.1 s apart. And it is
+mechanical, not accidental — T is a position and V a velocity of the same
+body.
 
-Estas pruebas fijan tres cosas, en orden de importancia:
+These tests pin three things, in order of importance:
 
-* que con ``peak_window_s = 0`` el disparador se comporta **exactamente** como
-  antes de que el parámetro existiera, porque de eso depende que la ablación
-  del §3.7 sea un cambio de configuración y no un cambio de código;
-* que la ventana recupera una caída desincronizada;
-* que la ventana **no** inventa evidencia: no cruza una discontinuidad, no
-  lee un NaN como cero, y olvida lo viejo.
+* that with ``peak_window_s = 0`` the trigger behaves **exactly** as before
+  the parameter existed, because the §3.7 ablation depends on it being a
+  configuration change and not a code change;
+* that the window recovers an out-of-step fall;
+* that the window does **not** invent evidence: it does not cross a
+  discontinuity, does not read a NaN as zero, and forgets what is old.
 
-Correr con:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
@@ -31,7 +32,6 @@ import unittest
 
 from pef_fall_detector.state_machine import (
     SCORE,
-    SEQUENTIAL,
     SIMULTANEOUS,
     PeakWindow,
     Stage1Trigger,
@@ -40,15 +40,15 @@ from pef_fall_detector.state_machine import (
 NAN = float("nan")
 
 
-def drive(trigger, muestras, fps=30.0, start=0.0):
-    """Alimenta (T, V) cuadro a cuadro; devuelve los tiempos en que disparó."""
-    disparos = []
+def drive(trigger, samples, fps=30.0, start=0.0):
+    """Feed (T, V) frame by frame; return the times at which it fired."""
+    fired = []
     t = start
-    for t_deg, v_tps in muestras:
+    for t_deg, v_tps in samples:
         if trigger.update(t, t_deg, v_tps):
-            disparos.append(round(t, 4))
+            fired.append(round(t, 4))
         t += 1.0 / fps
-    return disparos
+    return fired
 
 
 def trigger(**kw):
@@ -58,9 +58,9 @@ def trigger(**kw):
     return Stage1Trigger(**base)
 
 
-class TestLaVentanaEnSi(unittest.TestCase):
+class TestTheWindowItself(unittest.TestCase):
 
-    def test_devuelve_el_maximo_de_T_y_el_minimo_de_V(self) -> None:
+    def test_returns_the_maximum_of_T_and_the_minimum_of_V(self) -> None:
         w = PeakWindow(1.0)
         w.update(0.0, 10.0, -0.5)
         w.update(0.1, 90.0, -0.2)
@@ -68,141 +68,141 @@ class TestLaVentanaEnSi(unittest.TestCase):
         self.assertAlmostEqual(t, 90.0)
         self.assertAlmostEqual(v, -3.0)
 
-    def test_olvida_lo_que_salio_de_la_ventana(self) -> None:
-        # Un clip largo no puede acumular evidencia de hace diez segundos: la
-        # caída que importa es la de este momento.
+    def test_forgets_what_left_the_window(self) -> None:
+        # A long clip cannot pile up evidence from ten seconds ago: the fall
+        # that matters is the one happening now.
         w = PeakWindow(0.5)
         w.update(0.0, 170.0, -5.0)
         t, v = w.update(2.0, 10.0, -0.1)
         self.assertAlmostEqual(t, 10.0)
         self.assertAlmostEqual(v, -0.1)
 
-    def test_un_NaN_no_se_lee_como_cero(self) -> None:
-        # Leer NaN como 0.0 dejaría que una oclusión BAJE un máximo de T o
-        # SUBA un mínimo de V, que es evidencia inventada al revés.
+    def test_a_NaN_is_not_read_as_zero(self) -> None:
+        # Reading NaN as 0.0 would let an occlusion LOWER a T maximum or
+        # RAISE a V minimum, which is evidence invented the other way round.
         w = PeakWindow(1.0)
         w.update(0.0, 150.0, -4.0)
         t, v = w.update(0.1, NAN, NAN)
         self.assertAlmostEqual(t, 150.0)
         self.assertAlmostEqual(v, -4.0)
 
-    def test_sin_ningun_valor_medible_devuelve_NaN(self) -> None:
-        # No es lo mismo "no hubo movimiento" que "no se pudo medir".
+    def test_nothing_measurable_returns_NaN(self) -> None:
+        # "There was no movement" is not the same as "it could not be measured".
         w = PeakWindow(1.0)
         t, v = w.update(0.0, NAN, NAN)
         self.assertTrue(math.isnan(t))
         self.assertTrue(math.isnan(v))
 
-    def test_la_ventana_avanza_con_el_reloj_no_con_los_cuadros(self) -> None:
-        # La lección C5: "24 cuadros" son 0.8 s a 30 fps y 1.6 s a 15 fps.
-        # Con NaN de por medio el conteo de cuadros medibles tampoco sirve.
+    def test_the_window_moves_with_the_clock_not_the_frames(self) -> None:
+        # Lesson C5: "24 frames" is 0.8 s at 30 fps and 1.6 s at 15 fps.
+        # With NaN in between, counting measurable frames does not work either.
         w = PeakWindow(0.5)
         w.update(0.0, 170.0, -5.0)
         for i in range(1, 20):
             t, v = w.update(i * 0.1, 10.0, -0.1)
         self.assertAlmostEqual(t, 10.0)
 
-    def test_una_ventana_no_positiva_se_rechaza(self) -> None:
-        for malo in (0.0, -1.0):
+    def test_a_window_that_is_not_positive_is_refused(self) -> None:
+        for bad in (0.0, -1.0):
             with self.assertRaises(ValueError):
-                PeakWindow(malo)
+                PeakWindow(bad)
 
 
-class TestCeroEsElComportamientoAnterior(unittest.TestCase):
-    """Lo que hace posible la ablación del §3.7 sin tocar código."""
+class TestZeroIsThePreviousBehaviour(unittest.TestCase):
+    """What makes the §3.7 ablation possible without touching code."""
 
-    ESCENAS = [
-        [(10.0, -0.1)] * 30,                                   # quieto
-        [(170.0, -0.05)] * 30,                                 # ya en el suelo
-        [(80.0, -0.5)] * 5 + [(20.0, -3.0)] * 5,               # desincronizada
-        [(100.0, -2.0)] * 10,                                  # caída franca
-        [(NAN, NAN)] * 10 + [(90.0, -2.0)] * 10,               # con oclusión
+    SCENES = [
+        [(10.0, -0.1)] * 30,                                   # still
+        [(170.0, -0.05)] * 30,                                 # already on the floor
+        [(80.0, -0.5)] * 5 + [(20.0, -3.0)] * 5,               # out of step
+        [(100.0, -2.0)] * 10,                                  # plain fall
+        [(NAN, NAN)] * 10 + [(90.0, -2.0)] * 10,               # with an occlusion
     ]
 
-    def test_cero_dispara_igual_que_sin_el_parametro(self) -> None:
-        for i, escena in enumerate(self.ESCENAS):
-            with self.subTest(escena=i):
-                sin = drive(trigger(), escena)
-                cero = drive(trigger(peak_window_s=0.0), escena)
-                self.assertEqual(sin, cero)
+    def test_zero_fires_the_same_as_without_the_parameter(self) -> None:
+        for i, scene in enumerate(self.SCENES):
+            with self.subTest(scene=i):
+                without = drive(trigger(), scene)
+                zero = drive(trigger(peak_window_s=0.0), scene)
+                self.assertEqual(without, zero)
 
-    def test_cero_no_construye_la_ventana(self) -> None:
-        # No es sólo que dé el mismo resultado: no debe pagar el costo ni
-        # arrastrar estado que después haya que resetear.
+    def test_zero_does_not_build_the_window(self) -> None:
+        # Not only the same result: it must not pay the cost or carry state
+        # that would later have to be reset.
         self.assertIsNone(trigger(peak_window_s=0.0)._peaks)
         self.assertIsNotNone(trigger(peak_window_s=0.8)._peaks)
 
-    def test_una_ventana_negativa_se_rechaza(self) -> None:
+    def test_a_negative_window_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             trigger(peak_window_s=-0.1)
 
 
-class TestRecuperaLaCaidaDesincronizada(unittest.TestCase):
+class TestItRecoversTheOutOfStepFall(unittest.TestCase):
 
-    # El perfil medido: V pica primero con el tronco aún casi vertical, T pica
-    # medio segundo después con el cuerpo ya casi detenido, y en el medio no
-    # hay nada notable. Ningún cuadro llega a 2.2 por sí solo:
-    #   0.20 s  20/45 + 2.5/1.5 = 2.11   (V al máximo, tronco vertical)
-    #   0.40 s  20/45 + 0.4/1.5 = 0.71   (la transición, nada extremo)
-    #   0.17 s  85/45 + 0.2/1.5 = 2.09   (T al máximo, ya detenido)
-    # y ninguna pareja parcial tampoco: puentear la transición con el pico de
-    # V da 2.11, y puentearla con el de T da 2.16. Sólo llegar de un extremo
-    # al otro, 85/45 + 2.5/1.5 = 3.56, cruza el umbral — que es exactamente lo
-    # que hace de la longitud de la ventana un parámetro con contenido.
-    # El pico de T se deja por debajo de 99 grados a propósito: por encima de
-    # eso el término del tronco cruza 2.2 sin ayuda de V y la prueba dejaría
-    # de medir la ventana.
-    CAIDA = ([(20.0, -2.5)] * 6 + [(20.0, -0.4)] * 12 + [(85.0, -0.2)] * 6)
+    # The measured profile: V peaks first with the trunk still almost
+    # vertical, T peaks half a second later with the body almost stopped, and
+    # in between there is nothing notable. No frame reaches 2.2 on its own:
+    #   0.20 s  20/45 + 2.5/1.5 = 2.11   (V at its peak, trunk vertical)
+    #   0.40 s  20/45 + 0.4/1.5 = 0.71   (the transition, nothing extreme)
+    #   0.17 s  85/45 + 0.2/1.5 = 2.09   (T at its peak, already stopped)
+    # and no partial pair either: bridging the transition with the V peak
+    # gives 2.11, and with the T peak 2.16. Only reaching from one end to the
+    # other, 85/45 + 2.5/1.5 = 3.56, crosses the threshold — which is exactly
+    # what makes the window's length a parameter with content.
+    # The T peak is kept below 99 degrees on purpose: above that the trunk
+    # term crosses 2.2 without help from V and the test would stop measuring
+    # the window.
+    FALL = ([(20.0, -2.5)] * 6 + [(20.0, -0.4)] * 12 + [(85.0, -0.2)] * 6)
 
-    def test_sin_ventana_no_dispara(self) -> None:
-        self.assertEqual(drive(trigger(), self.CAIDA), [])
+    def test_without_the_window_it_does_not_fire(self) -> None:
+        self.assertEqual(drive(trigger(), self.FALL), [])
 
-    def test_con_ventana_dispara(self) -> None:
-        self.assertTrue(drive(trigger(peak_window_s=0.8), self.CAIDA))
+    def test_with_the_window_it_fires(self) -> None:
+        self.assertTrue(drive(trigger(peak_window_s=0.8), self.FALL))
 
-    def test_una_ventana_mas_corta_que_la_separacion_no_alcanza(self) -> None:
-        # La ventana es el parámetro, y tiene que MEDIR algo: si cualquier
-        # valor sirviera, no habría nada que calibrar.
-        self.assertEqual(drive(trigger(peak_window_s=0.1), self.CAIDA), [])
+    def test_a_window_shorter_than_the_gap_is_not_enough(self) -> None:
+        # The window is the parameter, and it has to MEASURE something: if
+        # any value would do, there would be nothing to calibrate.
+        self.assertEqual(drive(trigger(peak_window_s=0.1), self.FALL), [])
 
-    def test_tambien_funciona_con_la_formulacion_simultaneous(self) -> None:
-        # La ventana no es del 'score': ensancha el instante para cualquier
-        # lectura de la misma frase del §3.5.
-        sin = Stage1Trigger(formulation=SIMULTANEOUS, hold_s=0.0)
-        con = Stage1Trigger(formulation=SIMULTANEOUS, hold_s=0.0,
-                            peak_window_s=0.8)
-        self.assertEqual(drive(sin, self.CAIDA), [])
-        self.assertTrue(drive(con, self.CAIDA))
+    def test_it_also_works_with_the_simultaneous_formulation(self) -> None:
+        # The window does not belong to 'score': it widens the instant for
+        # any reading of the same §3.5 sentence.
+        without = Stage1Trigger(formulation=SIMULTANEOUS, hold_s=0.0)
+        with_window = Stage1Trigger(formulation=SIMULTANEOUS, hold_s=0.0,
+                                    peak_window_s=0.8)
+        self.assertEqual(drive(without, self.FALL), [])
+        self.assertTrue(drive(with_window, self.FALL))
 
 
-class TestNoInventaEvidencia(unittest.TestCase):
+class TestItInventsNoEvidence(unittest.TestCase):
 
-    def test_no_dispara_sobre_alguien_quieto(self) -> None:
-        quieto = [(12.0, -0.08)] * 60
-        self.assertEqual(drive(trigger(peak_window_s=0.8), quieto), [])
+    def test_it_does_not_fire_on_someone_still(self) -> None:
+        still = [(12.0, -0.08)] * 60
+        self.assertEqual(drive(trigger(peak_window_s=0.8), still), [])
 
-    def test_sin_ningun_V_negativo_no_dispara(self) -> None:
-        # §3.5: el disparo ocurre "while V remains negative (downward)".
-        # Con el tronco a 170 el término de T vale 3.8 por sí solo, así que
-        # esta guarda es lo único que separa una caída de alguien que se está
-        # LEVANTANDO del suelo.
-        subiendo = [(170.0, 2.0)] * 30
-        self.assertEqual(drive(trigger(peak_window_s=0.8), subiendo), [])
+    def test_without_any_negative_V_it_does_not_fire(self) -> None:
+        # §3.5: the trigger happens "while V remains negative (downward)".
+        # With the trunk at 170 the T term is worth 3.8 on its own, so this
+        # guard is all that separates a fall from someone GETTING UP from
+        # the floor.
+        rising = [(170.0, 2.0)] * 30
+        self.assertEqual(drive(trigger(peak_window_s=0.8), rising), [])
 
-    def test_reset_impide_cruzar_una_discontinuidad(self) -> None:
-        """El pico de T de antes de una oclusión no puede casarse con la V de después.
+    def test_reset_stops_it_crossing_a_discontinuity(self) -> None:
+        """The T peak from before an occlusion cannot be paired with the V after it.
 
-        Puede ser otro cuerpo, u otro punto de la línea de tiempo. Es la misma
-        razón por la que ``sequential`` no deja sobrevivir un evento armado.
+        It may be another body, or another point of the timeline. It is the
+        same reason ``sequential`` does not let an armed event survive.
         """
         t = trigger(peak_window_s=0.8)
-        drive(t, [(85.0, -0.1)] * 6)           # sólo T, no alcanza
-        t.reset()                              # sujeto perdido
+        drive(t, [(85.0, -0.1)] * 6)           # T only, not enough
+        t.reset()                              # subject lost
         self.assertEqual(drive(t, [(20.0, -2.6)] * 3, start=0.2), [])
 
-    def test_sin_reset_si_se_combinarian(self) -> None:
-        # El complemento del anterior: prueba que el reset es lo que impide
-        # la combinación, y no que la escena no diera para disparar.
+    def test_without_a_reset_they_would_combine(self) -> None:
+        # The complement of the one above: it shows the reset is what stops
+        # the combination, not that the scene could not fire.
         t = trigger(peak_window_s=0.8)
         drive(t, [(85.0, -0.1)] * 6)
         self.assertTrue(drive(t, [(20.0, -2.6)] * 3, start=0.2))

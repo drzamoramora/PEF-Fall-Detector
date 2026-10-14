@@ -15,7 +15,7 @@ What these tests pin, and why each matters:
 * degenerate supports (one foot, collinear feet), which are legitimate
   observations and must not raise or silently produce a wrong hull.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
@@ -62,8 +62,8 @@ class TestBipedalContact(unittest.TestCase):
         lifted = FEET.copy()
         lifted[[1, 3, 5], 1] -= 60.0
         kept = feet_in_contact(lifted, self.FRAME, TORSO)
-        self.assertEqual(len(kept), 3, "solo el pie apoyado deberia quedar")
-        self.assertLess(kept[:, 0].max(), 665.0, "quedo un punto del pie alzado")
+        self.assertEqual(len(kept), 3, "only the planted foot should remain")
+        self.assertLess(kept[:, 0].max(), 665.0, "a point of the raised foot remained")
 
     def test_the_polygon_contracts_when_a_foot_lifts(self) -> None:
         # §3.4's second signature, now actually observable: "a sudden

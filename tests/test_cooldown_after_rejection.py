@@ -1,7 +1,7 @@
-"""Fase 4: sin enfriamiento tras un rechazo de la Etapa 2.
+"""Phase 4: no cooldown after a Stage-2 rejection.
 
-A17-S3: un disparo falso a los 2.5 s, rechazado por la Etapa 2, dejaba al
-sistema 3 s en COOLDOWN; la caída real (4.0-5.0 s) cayó dentro y no se vio.
+A17-S3: a false trigger at 2.5 s, rejected by Stage 2, left the system 3 s in
+COOLDOWN; the real fall (4.0-5.0 s) landed inside it and was not seen.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from pef_fall_detector.state_machine import (  # noqa: E402
     Stage3Evaluator,
     TriggerEvent,
 )
-from tests.test_state_machine import trigger  # noqa: E402
+from tests.support import TEST_CFG, trigger  # noqa: E402
 
 
 def _machine(after_rejection: bool) -> FallStateMachine:
@@ -76,14 +76,19 @@ class TestWiring(unittest.TestCase):
         self.assertFalse(cfg.stage3.cooldown_after_rejection)
         self.assertFalse(FramePipeline(cfg).machine.cooldown_after_rejection)
 
-    def test_old_configs_keep_the_cooldown(self) -> None:
+    def test_true_keeps_the_cooldown_and_the_key_is_required(self) -> None:
+        # Before 0.2.0.dev2 a config without the key kept the cooldown; now
+        # the key is required, and true is how the old behaviour is asked for.
         import copy
-        from pef_fall_detector.config import Config
+
+        from pef_fall_detector.config import Config, ConfigError
         from pef_fall_detector.pipeline import FramePipeline
-        from tests.test_pipeline import TEST_CFG
         cfg = copy.deepcopy(TEST_CFG)
-        cfg["stage3"].pop("cooldown_after_rejection", None)
+        self.assertIs(cfg["stage3"]["cooldown_after_rejection"], True)
         self.assertTrue(FramePipeline(Config(cfg)).machine.cooldown_after_rejection)
+        cfg["stage3"].pop("cooldown_after_rejection")
+        with self.assertRaisesRegex(ConfigError, r"missing key 'stage3\.cooldown_after_rejection'"):
+            Config(cfg)
 
 
 if __name__ == "__main__":

@@ -1,20 +1,27 @@
-# Versiones exactas del entorno de referencia: las mismas con las que se midio
-# PEF-FallDB (104/128). Van fijadas con == y no con >= porque los landmarks de
-# MediaPipe cambian con la version de OpenCV y numpy (clips A01-S4, A14-S1,
-# A17-S4: mismo codigo y misma config, otro veredicto con OpenCV 5.0).
-# Instalar en un venv limpio:
+# Exact versions of the reference environment (the Mac PEF-FallDB was measured
+# on; phase 8.4: 110/128 there, 115/128 on cloud x86). Pinned with == and not
+# >= because MediaPipe's landmarks change with the OpenCV and numpy versions
+# (clips A01-S4, A14-S1, A17-S4: same code and config, another verdict with
+# OpenCV 5.0).
+#
+# The direct dependencies and their groups are declared in pyproject.toml.
+# This file is the lock: to be regenerated on the reference Mac with
+#   pip freeze --exclude-editable > requirements.txt
+# (B9; README, "Install"). The Raspberry Pi gets its own lock, frozen there.
+#
+# Install in a clean venv:
 #   python3.11 -m venv venv && source venv/bin/activate
-#   pip install -r requirements.txt
+#   pip install -r requirements.txt && pip install -e . --no-deps
 
-# MediaPipe fijado: ultima version con la API clasica mp.solutions.pose que usa
-# la guia de implementacion; trae los modelos de pose dentro del wheel (offline,
-# reproducible; ver el docstring de pose_frontend.py).
+# MediaPipe pinned: the last version with the classic mp.solutions.pose API the
+# implementation guide uses; it ships the pose models inside the wheel (offline,
+# reproducible; see the pose_frontend.py docstring).
 mediapipe==0.10.14
 protobuf==4.25.9
 
-# OpenCV: mediapipe 0.10.14 depende de opencv-contrib-python, que ya trae cv2.
-# No instalar tambien opencv-python: los dos escriben el mismo paquete cv2 y,
-# con versiones distintas, gana el ultimo que se instalo.
+# OpenCV: mediapipe 0.10.14 depends on opencv-contrib-python, which already has cv2.
+# Do not also install opencv-python: both write the same cv2 package and, with
+# different versions, the last one installed wins.
 opencv-contrib-python==4.13.0.92
 
 numpy==2.4.4

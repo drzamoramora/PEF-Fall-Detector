@@ -5,7 +5,7 @@ provable on hand-built points before any video is involved. R is not part of
 §3.4 and is not wired into any decision — these tests only pin the
 arithmetic and the honesty of its NaN handling.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations

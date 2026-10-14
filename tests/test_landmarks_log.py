@@ -1,9 +1,9 @@
-"""Registro experimental del esqueleto completo (logging.save_landmarks).
+"""The full-skeleton record (logging.mode: research).
 
-Es un registro de investigación: ninguna decisión lo lee. Estas pruebas fijan
-tres cosas: que escribe lo que MediaPipe entregó, que no cambia ni un byte del
-registro de cuadros, y que apagado no deja rastro (§3.6: el dispositivo
-desplegado no guarda landmarks).
+It is a research record: no decision reads it. These tests pin that it
+writes what MediaPipe delivered, that research records frames, events and
+skeleton, and that deployment leaves nothing on disk and changes no decision
+(§3.6: the deployed detector keeps nothing).
 """
 
 from __future__ import annotations
@@ -27,8 +27,7 @@ from pef_fall_detector.audit_log import LANDMARK_FIELDS, landmark_row  # noqa: E
 from pef_fall_detector.config import Config  # noqa: E402
 from pef_fall_detector.pipeline import FramePipeline  # noqa: E402
 from pef_fall_detector.pose_frontend import PoseFrame  # noqa: E402
-from tests.test_main_headless import _FakeSource, _short_fall  # noqa: E402
-from tests.test_pipeline import TEST_CFG, make_pose  # noqa: E402
+from tests.support import TEST_CFG, FakeSource, make_pose, short_fall  # noqa: E402
 
 
 class TestRow(unittest.TestCase):
@@ -64,22 +63,27 @@ class TestRow(unittest.TestCase):
 
 
 class TestHeadless(unittest.TestCase):
+    """What main.py records in each logging.mode (0.2.0.dev3)."""
 
-    def _run(self, save: bool | None) -> Path:
+    def _run(self, mode: str) -> Path:
         tmp = tempfile.mkdtemp()
-        frames = _short_fall()
+        frames = short_fall()
+        built = []
 
         class _Scripted(FramePipeline):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                built.append(self)
+
             def process(self, frame_bgr, frame_index, timestamp):
                 return self.analyze(frames[frame_index])
 
         cfg = copy.deepcopy(TEST_CFG)
         cfg["logging"]["output_dir"] = tmp
-        if save is not None:
-            cfg["logging"]["save_landmarks"] = save
+        cfg["logging"]["mode"] = mode
         saved = (main.load_config, main.VideoFileSource, main.FramePipeline)
         main.load_config = lambda _p: Config(cfg)
-        main.VideoFileSource = lambda _p: _FakeSource(len(frames))
+        main.VideoFileSource = lambda _p: FakeSource(len(frames))
         main.FramePipeline = _Scripted
         try:
             args = argparse.Namespace(video="A00-S1-NotRecovered.mp4", config=None,
@@ -89,17 +93,12 @@ class TestHeadless(unittest.TestCase):
         finally:
             main.load_config, main.VideoFileSource, main.FramePipeline = saved
         self.n_frames = len(frames)
+        self.events = [(e.timestamp, e.verdict, e.severity, e.reason)
+                       for e in built[-1].machine.events]
         return Path(tmp)
 
-    @staticmethod
-    def _frames_csv(d: Path) -> str:
-        f = [p for p in d.glob("*.csv") if "-events-" not in p.name
-             and "-landmarks-" not in p.name]
-        assert len(f) == 1, f
-        return f[0].read_text()
-
-    def test_on_writes_one_row_per_frame(self) -> None:
-        d = self._run(True)
+    def test_research_writes_one_landmark_row_per_frame(self) -> None:
+        d = self._run("research")
         lm = list(d.glob("*-landmarks-*.csv"))
         self.assertEqual(len(lm), 1)
         with lm[0].open(newline="") as fh:
@@ -108,21 +107,30 @@ class TestHeadless(unittest.TestCase):
         self.assertEqual(rows[0]["lm23_x"], "640.00")
         self.assertTrue(lm[0].with_suffix(".meta.json").exists())
 
-    def test_it_changes_nothing_in_the_frame_record(self) -> None:
-        on, off = self._run(True), self._run(False)
-        self.assertEqual(self._frames_csv(on), self._frames_csv(off))
-        ev_on = next(on.glob("*-events-*.csv")).read_text()
-        ev_off = next(off.glob("*-events-*.csv")).read_text()
-        self.assertEqual(ev_on, ev_off)
+    def test_research_writes_frames_events_and_landmarks(self) -> None:
+        names = sorted(p.name for p in self._run("research").glob("*.csv"))
+        self.assertEqual([n.split("-2")[0] for n in names],
+                         ["A00-S1-NotRecovered", "A00-S1-NotRecovered-events",
+                          "A00-S1-NotRecovered-landmarks"])
 
-    def test_off_or_absent_leaves_no_file(self) -> None:
-        for save in (False, None):
-            self.assertEqual(list(self._run(save).glob("*-landmarks-*")), [])
+    def test_deployment_writes_nothing(self) -> None:
+        # §3.6: the deployed detector persists nothing.
+        self.assertEqual(list(self._run("deployment").iterdir()), [])
 
-    def test_the_shipped_config_turns_it_on(self) -> None:
-        from pef_fall_detector.config import load_config
+    def test_the_mode_changes_what_is_written_never_what_is_decided(self) -> None:
+        self._run("research")
+        research = self.events
+        self._run("deployment")
+        self.assertTrue(research)
+        self.assertEqual(self.events, research)
+
+    def test_the_shipped_config_is_deployment(self) -> None:
+        # Decided in B2 (0.2.0.dev2): config.yaml runs as the deployed device
+        # does; dataset runs switch to research.
+        from pef_fall_detector.config import load_config, research_mode
         cfg = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
-        self.assertTrue(cfg.logging.save_landmarks)
+        self.assertEqual(cfg.logging.mode, "deployment")
+        self.assertFalse(research_mode(cfg))
 
 
 if __name__ == "__main__":

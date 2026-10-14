@@ -5,15 +5,16 @@ label per video, and the reason each was made the way it was:
 
 * the §3.3 mapping itself, because it is the only place the paper's
   vocabulary and the dataset's vocabulary are allowed to meet;
-* that an unjudged event is UNDETERMINED and never NoFall, because a
+* that an unjudged event is NoFall by default — §3.4 confirms only when I
+  reaches W, so it raises no alarm — and UNDETERMINED on request, because a
   confusion matrix that cannot separate "never fired" from "fired but could
-  not judge" hides two different defects behind one number;
+  not judge" hides two different defects behind one number (D12);
 * the end-of-clip rule, whose whole reason to exist is clip A13 of this
   project's own dataset: the subject lies still for about six seconds and
   then stands up unaided, and a resolver that closes on the first branch to
   fire calls that NotRecovered — the opposite label.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
@@ -53,48 +54,47 @@ class TestSeverityMapping(unittest.TestCase):
         # a judgement, so it earns the NoFall label.
         self.assertEqual(class_for_event("stage2_rejected", ""), NO_FALL)
 
-    def test_un_rechazo_geometrico_es_NoFall_bajo_cualquier_politica(self) -> None:
-        """El rechazo de la Etapa 2 no es un evento sin resolver.
+    def test_a_geometric_rejection_is_NoFall_under_any_policy(self) -> None:
+        """A Stage-2 rejection is not an unresolved event.
 
-        Escrito porque una mutación que borraba este caso especial pasó toda
-        la suite: con la política nueva ``stage2_rejected`` cae igual en
-        NoFall por omisión, así que el caso especial sólo se nota cuando se
-        pide la conducta anterior. Y ahí importa — una etapa que MIRÓ la
-        geometría y dictaminó que no hubo derribo no es lo mismo que un
-        embudo que nunca cerró, y confundirlos borra la única evidencia
-        positiva de "aquí no pasó nada" que produce el sistema.
+        Written because a mutation that deleted this special case passed the
+        whole suite: under the new policy ``stage2_rejected`` lands in NoFall by
+        default anyway, so the special case only shows when the old behaviour is
+        asked for. And there it matters — a stage that LOOKED at the geometry
+        and ruled there was no topple is not the same as a funnel that never
+        closed, and mixing them up erases the only positive evidence of
+        "nothing happened here" the system produces.
         """
         self.assertEqual(
             class_for_event("stage2_rejected", "", unresolved_as=UNDETERMINED),
             NO_FALL)
 
     def test_an_event_that_never_reached_confirmation_is_no_fall(self) -> None:
-        """§3.4: confirmación condicionada a que I supere W.
+        """§3.4: confirmation is conditional on I exceeding W.
 
         *"If I exceeds a confirmation threshold W, the event is classified as
-        a confirmed fall and an alert ... is dispatched."* Si el sujeto deja
-        de ser observable antes, la condición no se cumple: no hay caída
-        confirmada y no sale alarma. Etiquetarlo como una quinta clase era
-        invención de este proyecto (D12) y hacía que el registro no
-        coincidiera con el sistema desplegado, que sólo despacha
-        ``stage3_confirmed``.
+        a confirmed fall and an alert ... is dispatched."* If the subject stops
+        being observable first, the condition is not met: there is no confirmed
+        fall and no alarm goes out. Labelling it as a fifth class was this
+        project's invention (D12) and made the record disagree with the deployed
+        system, which only dispatches ``stage3_confirmed``.
         """
         for verdict in ("stage1_only", "stage2_confirmed",
                         "stage2_inconclusive", "stage3_unresolved"):
             self.assertEqual(class_for_event(verdict, ""), NO_FALL, verdict)
 
-    def test_la_conducta_anterior_sigue_disponible_para_diagnostico(self) -> None:
-        # "El embudo nunca terminó" y "el embudo decidió que no" son fallas
-        # distintas. Una corrida que no las distingue esconde los clips donde
-        # el sujeto simplemente salió del cuadro.
+    def test_the_previous_behaviour_is_still_available_for_diagnosis(self) -> None:
+        # "The funnel never finished" and "the funnel decided no" are different
+        # failures. A run that cannot tell them apart hides the clips where the
+        # subject simply left the frame.
         for verdict in ("stage1_only", "stage2_inconclusive", "stage3_unresolved"):
             self.assertEqual(
                 class_for_event(verdict, "", unresolved_as=UNDETERMINED),
                 UNDETERMINED, verdict)
 
-    def test_un_veredicto_desconocido_no_se_adivina(self) -> None:
-        # Un veredicto que este módulo nunca oyó nombrar sigue el mismo
-        # camino que uno sin resolver: no se inventa una severidad.
+    def test_an_unknown_verdict_is_not_guessed(self) -> None:
+        # A verdict this module has never heard of takes the same path as an
+        # unresolved one: no severity is invented.
         self.assertEqual(class_for_event("stage9_teleported", "critical"),
                          NO_FALL)
         self.assertEqual(class_for_event("stage9_teleported", "critical",
@@ -107,7 +107,7 @@ class TestClipLabel(unittest.TestCase):
     def test_a_clip_with_no_events_is_no_fall(self) -> None:
         label, reason = classify_clip([])
         self.assertEqual(label, NO_FALL)
-        self.assertIn("sin eventos", reason)
+        self.assertIn("no events", reason)
 
     def test_the_worst_event_names_the_clip(self) -> None:
         # Someone who gets up from one fall and stays down after a second one
@@ -119,25 +119,25 @@ class TestClipLabel(unittest.TestCase):
         ])
         self.assertEqual(label, NOT_RECOVERED)
         self.assertIn("t=9.00", reason)
-        self.assertIn("el peor de 2", reason)
+        self.assertIn("worst of 2", reason)
 
-    def test_un_evento_sin_resolver_no_tapa_a_uno_resuelto(self) -> None:
-        # Un evento que nadie pudo juzgar no puede silenciar a una etapa que
-        # sí llegó a un veredicto, ni con la política nueva ni con la vieja.
+    def test_an_unresolved_event_does_not_hide_a_resolved_one(self) -> None:
+        # An event nobody could judge cannot silence a stage that did reach a
+        # verdict, under the new policy or the old one.
         for politica in (NO_FALL, UNDETERMINED):
             label, _ = classify_clip([event("stage2_inconclusive", "", 1.0),
                                       event("stage3_confirmed", "severe", 5.0)],
                                      unresolved_as=politica)
             self.assertEqual(label, NOT_RECOVERED, politica)
 
-    def test_un_clip_solo_de_eventos_sin_resolver_es_no_fall(self) -> None:
-        # El caso que gana los cuatro clips: un ADL que disparó y cuyo sujeto
-        # dejó de verse. El sistema desplegado no despacha nada; la etiqueta
-        # ahora dice lo mismo.
+    def test_a_clip_of_only_unresolved_events_is_no_fall(self) -> None:
+        # The case that wins the four clips: an ADL that fired and whose subject
+        # went out of sight. The deployed system dispatches nothing; the label now
+        # says the same.
         label, reason = classify_clip([event("stage2_inconclusive")])
         self.assertEqual(label, NO_FALL)
-        # y la evidencia sigue ahí: NoFall por silencio y NoFall por un
-        # embudo que no cerró no son lo mismo para quien revisa.
+        # and the evidence is still there: NoFall by silence and NoFall by a
+        # funnel that never closed are not the same to whoever reviews it.
         self.assertIn("stage2_inconclusive", reason)
 
     def test_the_reason_carries_the_evidence(self) -> None:
@@ -174,7 +174,7 @@ class TestEndOfClipRule(unittest.TestCase):
     def test_standing_at_the_end_is_mild(self) -> None:
         stage3 = self.build()
         end = self.feed(stage3, 0.0, 6.0, t_deg=95.0, extension=1.5, still=6.0)
-        self.feed(stage3, end, 2.0, t_deg=4.0, extension=1.4)   # se levanta
+        self.feed(stage3, end, 2.0, t_deg=4.0, extension=1.4)   # gets up
         stage3.finalise()
         self.assertEqual(stage3.verdict(), ("stage3_nullified", "mild"))
 

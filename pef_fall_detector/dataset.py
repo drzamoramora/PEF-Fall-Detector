@@ -28,6 +28,8 @@ different statements.
 
 from __future__ import annotations
 
+import math
+from datetime import datetime
 from pathlib import Path
 
 from .classification import (
@@ -36,6 +38,7 @@ from .classification import (
     NOT_RECOVERED,
     PARTIALLY_RECOVERED,
     RECOVERED,
+    classify_clip,
 )
 
 VIDEO_SUFFIXES = (".mp4", ".avi", ".mov", ".mkv")
@@ -50,24 +53,62 @@ _ALIASES = {
 }
 
 #: Column schema of ``dataset-labels-<stamp>.csv``: one row per clip.
+#: Before 0.2.0.dev3 the columns were in Spanish (fecha, hora, duracion_s,
+#: frames_confiables_pct, clase_detectada, clase_verdad, clase_revisada,
+#: acierto, eventos, t_disparo_s, motivo).
 LABEL_FIELDS = [
     "video",
-    "fecha",
-    "hora",
-    "duracion_s",
+    "date",
+    "time",
+    "duration_s",
     "frames",
-    "frames_confiables_pct",
-    "clase_detectada",
-    "clase_verdad",
-    "clase_revisada",        # what a human says, when they disagree
-    "acierto",
-    "eventos",
-    "t_disparo_s",
+    "reliable_frames_pct",
+    "detected_class",
+    "true_class",
+    "reviewed_class",        # what a human says, when they disagree
+    "correct",
+    "events",
+    "first_trigger_s",
     "verdict",
     "severity",
     "I_max_s",
-    "motivo",
+    "reason",
 ]
+
+
+def label_row(path, events, frames: int, reliable_frames: int, duration_s: float,
+              when: datetime) -> dict:
+    """The labels-file row of one clip, from the events its run left.
+
+    Shared by PEF-Lab's queue and ``main.py --folder``, so both write the
+    same row for the same run. The class is the one ``classify_clip`` reads
+    from the events; the truth is the one the file name carries.
+    """
+    detected, reason = classify_clip(events)
+    truth = truth_from_name(path)
+    worst = events[-1] if events else None
+    return {
+        "video": Path(path).name,
+        "date": when.strftime("%Y-%m-%d"),
+        "time": when.strftime("%H:%M:%S"),
+        "duration_s": f"{duration_s:.2f}",
+        "frames": frames,
+        "reliable_frames_pct": (f"{100.0 * reliable_frames / frames:.1f}"
+                                if frames else ""),
+        "detected_class": detected,
+        "true_class": truth,
+        "reviewed_class": "",
+        "correct": ("" if not truth else int(truth == detected)),
+        "events": len(events),
+        "first_trigger_s": f"{events[0].timestamp:.2f}" if events else "",
+        "verdict": worst.verdict if worst else "",
+        "severity": worst.severity if worst else "",
+        "I_max_s": (f"{worst.max_immobility_s:.2f}"
+                    if worst and not math.isnan(worst.max_immobility_s)
+                    else ""),
+        "reason": (f"{reason} — {worst.reason}" if worst and worst.reason
+                   else reason),
+    }
 
 
 def truth_from_name(path) -> str:
@@ -107,8 +148,8 @@ def confusion(rows) -> tuple[dict, int, int]:
     matrix = {t: {d: 0 for d in labels} for t in labels}
     scored = correct = 0
     for row in rows:
-        truth = row.get("clase_verdad") or ""
-        detected = row.get("clase_revisada") or row.get("clase_detectada") or ""
+        truth = row.get("true_class") or ""
+        detected = row.get("reviewed_class") or row.get("detected_class") or ""
         if truth not in matrix or detected not in labels:
             continue
         matrix[truth][detected] += 1
@@ -123,14 +164,14 @@ def format_confusion(rows) -> str:
     labels = [c for c in CLASSES
               if any(matrix[t][c] for t in matrix) or any(matrix[c].values())]
     if not labels:
-        return "sin clips con verdad legible"
+        return "no clips with a readable truth"
     width = max(len(c) for c in labels) + 2
-    head = "verdad \\ detectada".ljust(22) + "".join(c[:width - 1].rjust(width)
+    head = "truth \\ detected".ljust(22) + "".join(c[:width - 1].rjust(width)
                                                      for c in labels)
     lines = [head]
     for truth in labels:
         cells = "".join(str(matrix[truth][d]).rjust(width) for d in labels)
         lines.append(truth.ljust(22) + cells)
     pct = (100.0 * correct / scored) if scored else 0.0
-    lines.append(f"aciertos: {correct}/{scored} ({pct:.1f}%)")
+    lines.append(f"correct: {correct}/{scored} ({pct:.1f}%)")
     return "\n".join(lines)

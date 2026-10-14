@@ -1,10 +1,10 @@
-"""Fases 8.2 y 8.3: la Etapa 3 lee la cantidad A (altura 3D de la cabeza).
+"""Phases 8.2 and 8.3: Stage 3 reads Quantity A (3D head height).
 
-8.2: con A calibrada, la postura final sale de A (<= 0.26 en el suelo,
->= 0.82 de pie, en medio sentado o arrodillado). 8.3: si la cabeza nunca bajo
-de 0.31 alrededor del disparo y la cadera termino elevada, no hubo caida
-(stage3_not_down, NoFall, sin alarma); se abstiene si A no estaba calibrada al
-disparar. Las dos solo en modo etiquetado, igual que las fases 3 y 6a.
+8.2: with A calibrated, the final posture comes from A (<= 0.26 on the
+floor, >= 0.82 standing, sitting or kneeling in between). 8.3: if the head
+never went below 0.31 around the trigger and the hip ended raised, there was
+no fall (stage3_not_down, NoFall, no alarm); it abstains if A was not
+calibrated at the trigger. Both in labelling mode only, like phases 3 and 6a.
 """
 
 from __future__ import annotations
@@ -35,16 +35,17 @@ from pef_fall_detector.state_machine import (  # noqa: E402
     SEVERE,
     Stage3Evaluator,
 )
-from tests.test_main_headless import _toppling_pose  # noqa: E402
-from tests.test_pipeline import TEST_CFG, make_pose  # noqa: E402
-from tests.test_quantity_a import (  # noqa: E402
-    KNEELING,
-    LYING,
-    SITTING_FLOOR,
-    STANDING,
-    _body,
-    _pose,
-    _with_world,
+from tests.support import (  # noqa: E402
+    POSE_KNEELING,
+    POSE_LYING,
+    POSE_SITTING_FLOOR,
+    POSE_STANDING,
+    TEST_CFG,
+    attach_world,
+    make_pose,
+    toppling_pose,
+    world_body,
+    world_pose,
 )
 
 DT = 1.0 / 30.0
@@ -72,13 +73,13 @@ def _ev(a_head, a_hip=0.5, *, t_final=90.0, calibrated=True, u1=True, u2=True,
 
 
 class TestReachedFloor(unittest.TestCase):
-    """8.3: "¿llego al suelo?"."""
+    """8.3: "did it reach the floor?"."""
 
     def test_head_high_and_hip_raised_is_not_a_fall(self) -> None:
         ev = _ev(0.5, 0.45)
         self.assertEqual(ev.verdict(), (NOT_DOWN, ""))
-        self.assertIn("no llego al suelo", ev.reason)
-        self.assertIn("A minima 0.50 > 0.31", ev.reason)
+        self.assertIn("never reached the floor", ev.reason)
+        self.assertIn("minimum A 0.50 > 0.31", ev.reason)
 
     def test_head_that_reached_the_floor_is_judged_as_before(self) -> None:
         ev = _ev(lambda t: 0.2 if t < 2.0 else 0.6, 0.45)
@@ -89,12 +90,12 @@ class TestReachedFloor(unittest.TestCase):
         self.assertEqual(_ev(0.32, 0.45).verdict()[0], NOT_DOWN)
 
     def test_hip_on_the_floor_protects_the_slumped_fall(self) -> None:
-        # A17-S2: cabeza 0.44 contra la pared, cadera 0.07 en el piso.
+        # A17-S2: head 0.44 against the wall, hip 0.07 on the floor.
         ev = _ev(0.44, 0.07)
         self.assertEqual(ev.verdict()[0], CONFIRMED_FALL)
 
     def test_abstains_without_calibration_at_the_trigger(self) -> None:
-        # A16-S3 en el Mac: calibra 2.6 s despues de caer, ya de pie.
+        # A16-S3 on the Mac: calibrates 2.6 s after falling, already standing.
         ev = _ev(0.5, 0.45, calibrated=False)
         self.assertNotEqual(ev.verdict()[0], NOT_DOWN)
 
@@ -126,7 +127,7 @@ class TestReachedFloor(unittest.TestCase):
         self.assertTrue(math.isnan(ev.a_min_window))
         idle = Stage3Evaluator(a_reach_floor=0.31)
         idle.arm_a(0.0, True)
-        self.assertFalse(idle.a_armed, "sin start() no hay episodio que armar")
+        self.assertFalse(idle.a_armed, "without start() there is no episode to arm")
         ev2 = _ev(0.5, 0.45)
         ev2.reset()
         self.assertFalse(ev2.a_armed)
@@ -143,12 +144,13 @@ class TestReachedFloor(unittest.TestCase):
 
 
 class TestSeverityFromA(unittest.TestCase):
-    """8.2: la postura final sale de A cuando esta calibrada."""
+    """8.2: the final posture comes from A when it is calibrated."""
 
     def test_three_bands(self) -> None:
         self.assertEqual(_ev(0.10, 0.1, u2=False, t_final=20.0).verdict(), (CONFIRMED_FALL, SEVERE))
         self.assertEqual(_ev(0.95, 0.9, u2=False, t_final=90.0).verdict(), (NULLIFIED, MILD))
-        self.assertEqual(_ev(0.50, 0.1, u2=False, t_final=90.0).verdict(), (CONFIRMED_FALL, MODERATE))
+        self.assertEqual(_ev(0.50, 0.1, u2=False, t_final=90.0).verdict(),
+                         (CONFIRMED_FALL, MODERATE))
 
     def test_band_edges(self) -> None:
         self.assertEqual(_ev(0.26, 0.1, u2=False).verdict()[1], SEVERE)
@@ -162,7 +164,7 @@ class TestSeverityFromA(unittest.TestCase):
     def test_persistence_still_applies_in_the_middle(self) -> None:
         ev = _ev(0.50, 0.1, u2=False, still=2.0)
         self.assertEqual(ev.verdict(), (CONFIRMED_FALL, SEVERE))
-        self.assertIn("la inmovilidad persistio", ev.reason)
+        self.assertIn("the immobility persisted", ev.reason)
 
     def test_without_a_t_decides_as_before(self) -> None:
         self.assertEqual(_ev(NAN, NAN, u2=False, t_final=90.0).verdict(), (CONFIRMED_FALL, SEVERE))
@@ -183,7 +185,7 @@ class TestSeverityFromA(unittest.TestCase):
             ev.observe_a(ts, 0.1, 0.1)
         ev.finalise()
         self.assertEqual(ev.verdict(), (CONFIRMED_FALL, MODERATE))
-        self.assertIn("se esta levantando", ev.reason)
+        self.assertIn("getting up", ev.reason)
 
     def test_bad_bands(self) -> None:
         with self.assertRaises(ValueError):
@@ -195,26 +197,26 @@ class TestSeverityFromA(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Through the pipeline: stand 1.5 s, topple in 2D, then a 3D posture.
 
-SITTING_CHAIR = _pose(ankles=((-0.1, 0.45, 0.45), (0.1, 0.45, 0.45)),
+SITTING_CHAIR = world_pose(ankles=((-0.1, 0.45, 0.45), (0.1, 0.45, 0.45)),
                       knees=((-0.1, 0.0, 0.45), (0.1, 0.0, 0.45)),
                       shoulders_y=-0.5, nose=(0, -0.7, 0))   # bent knees: never "standing"
 
 
-def _clip(after, before=STANDING):
+def _clip(after, before=POSE_STANDING):
     frames = [make_pose(i, i * DT) for i in range(45)]
-    frames += [_toppling_pose(i, i * DT, angle_deg=(i - 45) * 4.5, hip_y=500.0 + (i - 45) * 12.0)
+    frames += [toppling_pose(i, i * DT, angle_deg=(i - 45) * 4.5, hip_y=500.0 + (i - 45) * 12.0)
                for i in range(45, 65)]
-    frames += [_toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0) for i in range(65, 185)]
+    frames += [toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0) for i in range(65, 185)]
     for i, pf in enumerate(frames):
-        _with_world(pf, _body(before if i < 45 else after))
+        attach_world(pf, world_body(before if i < 45 else after))
     return frames
 
 
 def _cfg(u1=True, u2=True):
     cfg = copy.deepcopy(TEST_CFG)
-    cfg["quantity_a"] = {"severity_from_a": u1, "reach_check": u2, "band_floor": 0.26,
-                         "band_standing": 0.82, "floor_reached": 0.31, "hip_raised": 0.22,
-                         "reach_before_s": 1.0, "reach_after_s": 4.0}
+    cfg["quantity_a"].update({"severity_from_a": u1, "reach_check": u2, "band_floor": 0.26,
+                              "band_standing": 0.82, "floor_reached": 0.31, "hip_raised": 0.22,
+                              "reach_before_s": 1.0, "reach_after_s": 4.0})
     return Config(cfg)
 
 
@@ -228,73 +230,74 @@ def _run(frames, cfg):
 class TestPipeline(unittest.TestCase):
 
     def test_kneeling_after_the_trigger_never_reached_the_floor(self) -> None:
-        pipe = _run(_clip(KNEELING), _cfg())
+        pipe = _run(_clip(POSE_KNEELING), _cfg())
         ev = pipe.machine.events[-1]
         self.assertEqual(ev.verdict, NOT_DOWN)
         self.assertEqual(classify_clip(pipe.machine.events)[0], NO_FALL)
         self.assertFalse(pipe.alerts.should_dispatch(ev.verdict))
 
     def test_lying_is_severe_from_a(self) -> None:
-        pipe = _run(_clip(LYING), _cfg())
+        pipe = _run(_clip(POSE_LYING), _cfg())
         ev = pipe.machine.events[-1]
         self.assertEqual((ev.verdict, ev.severity), (CONFIRMED_FALL, SEVERE))
         self.assertIn("A final 0.03", ev.reason)
         self.assertTrue(pipe.alerts.should_dispatch(ev.verdict))
 
     def test_sitting_on_the_floor_is_moderate_not_rejected(self) -> None:
-        pipe = _run(_clip(SITTING_FLOOR), _cfg())
+        pipe = _run(_clip(POSE_SITTING_FLOOR), _cfg())
         ev = pipe.machine.events[-1]
         self.assertEqual((ev.verdict, ev.severity), (CONFIRMED_FALL, MODERATE))
-        self.assertIn("sentado o arrodillado", ev.reason)
+        self.assertIn("sitting or kneeling", ev.reason)
 
     def test_the_second_before_stage3_comes_from_history(self) -> None:
         # Lying only during the topple, kneeling afterwards: the floor reading
         # exists only before Stage 3 starts, so only the history carries it.
-        frames = _clip(KNEELING)
+        frames = _clip(POSE_KNEELING)
         for i in range(45, 65):
-            _with_world(frames[i], _body(LYING))
+            attach_world(frames[i], world_body(POSE_LYING))
         ev = _run(frames, _cfg()).machine.events[-1]
         self.assertNotEqual(ev.verdict, NOT_DOWN)
 
     def test_late_calibration_abstains(self) -> None:
-        # A16-S3 en el Mac: sin calibrar al caer, calibra ya de pie despues.
-        frames = _clip(LYING, before=SITTING_CHAIR)
+        # A16-S3 on the Mac: not calibrated when falling, calibrates standing later.
+        frames = _clip(POSE_LYING, before=SITTING_CHAIR)
         for i in range(105, 185):
-            frames[i] = _with_world(make_pose(i, i * DT), _body(STANDING))
+            frames[i] = attach_world(make_pose(i, i * DT), world_body(POSE_STANDING))
         pipe = _run(frames, _cfg())
-        self.assertTrue(pipe._gravity.calibrated, "el escenario debe calibrar tarde")
+        self.assertTrue(pipe._gravity.calibrated, "the scenario must calibrate late")
         self.assertNotEqual(pipe.machine.events[-1].verdict, NOT_DOWN)
 
     def test_frames_after_stage3_starts_are_read(self) -> None:
         # Down during the fall, kneeling at the end: the end posture is only
         # in the frames Stage 3 observes itself.
-        frames = _clip(KNEELING)
+        frames = _clip(POSE_KNEELING)
         for i in range(45, 100):
-            _with_world(frames[i], _body(LYING))
+            attach_world(frames[i], world_body(POSE_LYING))
         ev = _run(frames, _cfg()).machine.events[-1]
         self.assertEqual((ev.verdict, ev.severity), (CONFIRMED_FALL, MODERATE))
 
     def test_history_is_bounded(self) -> None:
-        pipe = _run(_clip(LYING), _cfg())
+        pipe = _run(_clip(POSE_LYING), _cfg())
         self.assertLessEqual(len(pipe._a_history), int(5.0 / DT) + 2)
 
     def test_uncalibrated_at_the_trigger_abstains(self) -> None:
         # Never standing in 3D before the fall: no calibration, T decides.
-        pipe = _run(_clip(KNEELING, before=SITTING_CHAIR), _cfg())
+        pipe = _run(_clip(POSE_KNEELING, before=SITTING_CHAIR), _cfg())
         ev = pipe.machine.events[-1]
         self.assertNotEqual(ev.verdict, NOT_DOWN)
         self.assertNotIn("A final", ev.reason)
 
     def test_switches_off_reproduce_81(self) -> None:
-        base = _run(_clip(KNEELING), Config(copy.deepcopy(TEST_CFG)))
-        off = _run(_clip(KNEELING), _cfg(False, False))
+        base = _run(_clip(POSE_KNEELING), Config(copy.deepcopy(TEST_CFG)))
+        off = _run(_clip(POSE_KNEELING), _cfg(False, False))
         key = [(e.timestamp, e.verdict, e.severity, e.reason) for e in base.machine.events]
         self.assertEqual(key, [(e.timestamp, e.verdict, e.severity, e.reason)
                                for e in off.machine.events])
         self.assertNotEqual(base.machine.events[-1].verdict, NOT_DOWN)
 
     def test_project_config(self) -> None:
-        qa = load_config(Path(__file__).resolve().parents[1] / "config.yaml").as_dict()["quantity_a"]
+        cfg = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
+        qa = cfg.as_dict()["quantity_a"]
         self.assertTrue(qa["severity_from_a"])
         self.assertTrue(qa["reach_check"])
         self.assertEqual((qa["band_floor"], qa["band_standing"], qa["floor_reached"],

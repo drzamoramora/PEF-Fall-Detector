@@ -22,143 +22,13 @@ from pef_fall_detector.audit_log import PHASE2_FIELDS, csv_column
 from pef_fall_detector.config import Config
 from pef_fall_detector.pipeline import FramePipeline
 from pef_fall_detector.pose_frontend import (
-    NOSE,
-    LEFT_ANKLE,
-    LEFT_FOOT_INDEX,
-    LEFT_HEEL,
-    LEFT_HIP,
     LEFT_SHOULDER,
-    RIGHT_ANKLE,
-    RIGHT_FOOT_INDEX,
-    RIGHT_HEEL,
-    RIGHT_HIP,
+    NOSE,
     RIGHT_SHOULDER,
     PoseFrame,
     compute_step0,
 )
-
-#: Minimal configuration mirroring config.yaml's structure.
-TEST_CFG = {
-    "pose": {
-        "model_complexity": 1,
-        "min_detection_confidence": 0.5,
-        "min_tracking_confidence": 0.5,
-        "smooth_landmarks": True,
-        "visibility_threshold": 0.5,
-    },
-    "logging": {"output_dir": "logs"},
-    "stage1": {
-        "threshold_T_deg": 45.0,
-        "threshold_V": -1.5,
-        "velocity_window_s": 5 / 30.0,
-        "ema_time_constant_s": 0.093,
-        "history_max_gap_s": 0.5,
-        "trigger_formulation": "sequential",
-        "trigger_score": 2.2,
-        "trigger_hold_s": 0.1,
-        "min_trunk_ratio": 0.15,
-        "trunk_reference_window_s": 1.0,
-        "confirm_window_s": 1.0,
-        "trigger_peak_window_s": 0.0,
-    },
-    "state_display": {
-        "transition_v_tps": 0.7,
-        "lying_T_deg": 60.0,
-        "leaning_T_deg": 15.0,
-        "standing_extension": 1.1,
-        "crouch_extension": 0.6,
-        "max_extension_ratio": 3.0,
-        "walking_vh_tps": 0.25,
-        "ratio_time_constant_s": 0.093,
-    },
-    "alerts": {"dispatch_verdicts": ["stage3_confirmed"]},
-    "stage2": {
-        "com_hip_weight": 0.65,
-        "com_eval_window_s": 0.33,
-        "com_outside_fraction": 0.5,
-        "com_min_samples": 3,
-        "min_foot_visibility": 0.5,
-        "contact_band_torso": 0.15,
-    },
-    "stage3": {
-        "epsilon": 0.05,
-        "threshold_W_seconds": 5.0,
-        "observation_window_seconds": 30.0,
-        "upright_T_deg": 30.0,
-        "recovery_hold_seconds": 1.0,
-        "severity_uses_leg_extension": True,
-        "cooldown_seconds": 3.0,
-        "persistent_still_s": 0.5,
-        "persistent_immobility_fraction": 0.0,
-    },
-    "experimental": {
-        "height_baseline_time_constant_s": 2.0,
-        "trigger_H_ratio": 0.0,
-        "trigger_H_erect": 0.0,
-        "trigger_H_sequence_window_s": 2.0,
-        "recovery_H_ratio": 0.0,
-    },
-}
-
-
-def make_pose(
-    frame_index: int,
-    timestamp: float,
-    hip_y: float = 500.0,
-    shoulder_y: float = 300.0,
-    ankle_y: float = 700.0,
-    ankle_visible: bool = True,
-    nose_visible: bool = True,
-    x: float = 640.0,
-    feet_x: float | None = None,
-    stance_px: float = 60.0,
-) -> PoseFrame:
-    """A synthetic upright skeleton with the landmarks the pipeline reads.
-
-    ``feet_x`` defaults to ``x`` (feet under the body). Passing it separately
-    shifts the support polygon away from the trunk, which is how the
-    Quantity-P tests put the COM outside the feet without contorting the
-    rest of the skeleton.
-    """
-    lms = np.zeros((33, 3))
-    # The nose is a real position, not the origin: Quantity I anchors on it
-    # while it is visible, so a test that leaves it at (0, 0) cannot tell a
-    # skipped landmark from a landmark that never moved.
-    lms[NOSE, 0], lms[NOSE, 1] = x, shoulder_y - 80.0
-    for idx, y in ((LEFT_SHOULDER, shoulder_y), (RIGHT_SHOULDER, shoulder_y),
-                   (LEFT_HIP, hip_y), (RIGHT_HIP, hip_y),
-                   (LEFT_ANKLE, ankle_y), (RIGHT_ANKLE, ankle_y)):
-        lms[idx, 0] = x
-        lms[idx, 1] = y
-    # Feet: ankles plus heels and toes, the six landmarks of §3.4's support
-    # polygon. Without them the hull would be built from unset (0, 0) points.
-    fx = x if feet_x is None else feet_x
-    for ankle, heel, toe, side in (
-        (LEFT_ANKLE, LEFT_HEEL, LEFT_FOOT_INDEX, -1.0),
-        (RIGHT_ANKLE, RIGHT_HEEL, RIGHT_FOOT_INDEX, +1.0),
-    ):
-        foot_x = fx + side * stance_px / 2.0
-        lms[ankle, 0], lms[ankle, 1] = foot_x, ankle_y
-        lms[heel, 0], lms[heel, 1] = foot_x - 10.0, ankle_y + 5.0
-        lms[toe, 0], lms[toe, 1] = foot_x + 20.0, ankle_y + 8.0
-    vis = np.ones(33)
-    if not ankle_visible:
-        vis[[LEFT_ANKLE, RIGHT_ANKLE]] = 0.1  # below the 0.5 threshold
-    if not nose_visible:
-        vis[NOSE] = 0.1                       # face buried / turned away
-    mid_hip, mid_shoulder, torso = compute_step0(lms)
-    return PoseFrame(
-        frame_index=frame_index,
-        timestamp=timestamp,
-        detected=True,
-        frame_size=(1280, 960),
-        landmarks=lms,
-        visibility=vis,
-        mid_hip=mid_hip,
-        mid_shoulder=mid_shoulder,
-        torso_length=torso,
-        core_visibility=1.0,
-    )
+from tests.support import TEST_CFG, make_pose  # noqa: E402
 
 
 def jitter(values: list[float]) -> float:
@@ -244,7 +114,7 @@ class TestExtensionRatioSmoothing(unittest.TestCase):
             )
             ratios.append(pipe.analyze(pf).quantities["extension_ratio"])
         worst = max(abs(r - 1.0) for r in ratios)
-        self.assertLess(worst, 0.01, f"el ratio se desvió {100 * worst:.1f}%")
+        self.assertLess(worst, 0.01, f"the ratio drifted {100 * worst:.1f}%")
 
     def _count_label_flips(self, tau: float, n: int = 300) -> int:
         """Label changes for a STILL subject sitting on the posture boundary."""
@@ -271,12 +141,12 @@ class TestExtensionRatioSmoothing(unittest.TestCase):
         # threshold will always cross it under noise; that would need
         # hysteresis on the label itself (catalogued, not yet implemented).
         # What it must do is reduce it by a large factor.
-        sin_filtro = self._count_label_flips(tau=0.0)    # 0 = passthrough
-        con_filtro = self._count_label_flips(tau=0.093)
-        self.assertGreater(sin_filtro, 100, "el caso de prueba no es exigente")
+        unfiltered = self._count_label_flips(tau=0.0)    # 0 = passthrough
+        filtered = self._count_label_flips(tau=0.093)
+        self.assertGreater(unfiltered, 100, "the test case is not demanding")
         self.assertLess(
-            con_filtro, sin_filtro / 5.0,
-            f"el filtro solo redujo de {sin_filtro} a {con_filtro} cambios",
+            filtered, unfiltered / 5.0,
+            f"the filter only went from {unfiltered} to {filtered} changes",
         )
 
 
@@ -316,7 +186,7 @@ class TestDiscontinuity(unittest.TestCase):
         after = pipe.analyze(make_pose(21, 21 / self.FPS))
         self.assertTrue(
             math.isnan(after.quantities["V_tps"]),
-            "la ventana de velocidad sobrevivió a una pérdida de detección",
+            "the velocity window survived a detection loss",
         )
 
     def test_skeleton_jump_after_micro_gap_yields_no_impossible_velocity(self) -> None:
@@ -335,7 +205,7 @@ class TestDiscontinuity(unittest.TestCase):
             v = r.quantities["V_tps"]
             if not math.isnan(v):
                 peak = max(peak, abs(v))
-        self.assertLess(peak, 8.0, f"velocidad implausible tras el salto: {peak:.1f}")
+        self.assertLess(peak, 8.0, f"implausible velocity after the jump: {peak:.1f}")
 
     def test_long_gap_still_resets(self) -> None:
         # The original guard must keep working: a long absence also resets.
@@ -437,12 +307,12 @@ class TestQuantityPInThePipeline(unittest.TestCase):
             pf = make_pose(i, i / 30.0, x=body_x, feet_x=640.0)
             offsets.append(pipe.analyze(pf).quantities["P_offset"])
 
-        self.assertLess(offsets[0], 0.0, "de pie equilibrado deberia dar dentro")
+        self.assertLess(offsets[0], 0.0, "balanced standing should read inside")
         self.assertGreater(offsets[-1], 0.0, "volcado deberia dar fuera")
         crossings = sum(
-            1 for a, b in zip(offsets, offsets[1:]) if (a <= 0.0) != (b <= 0.0)
+            1 for a, b in zip(offsets, offsets[1:], strict=False) if (a <= 0.0) != (b <= 0.0)
         )
-        self.assertEqual(crossings, 1, "P deberia cruzar el cero una sola vez")
+        self.assertEqual(crossings, 1, "P should cross zero only once")
 
     def test_com_is_hip_weighted_not_the_velocity_centroid(self) -> None:
         # §3.4 defines two different points: V's centroid is a 0.5/0.5
@@ -529,7 +399,7 @@ class TestAlertDispatchFromThePipeline(unittest.TestCase):
     """The seam end to end: a confirmed fall reaches a sink."""
 
     @staticmethod
-    def _toppling_pose(index: int, timestamp: float, angle_deg: float,
+    def toppling_pose(index: int, timestamp: float, angle_deg: float,
                        hip_y: float) -> PoseFrame:
         """A skeleton with the trunk rotated ``angle_deg`` from vertical.
 
@@ -552,10 +422,10 @@ class TestAlertDispatchFromThePipeline(unittest.TestCase):
         """Topple past 45 deg, then lie still past W — a confirmed severe fall."""
         frames = []
         for i in range(20):                       # 0.67 s of toppling
-            frames.append(self._toppling_pose(
+            frames.append(self.toppling_pose(
                 i, i / 30.0, angle_deg=i * 4.5, hip_y=500.0 + i * 12.0))
         for i in range(20, 300):                  # motionless on the floor
-            frames.append(self._toppling_pose(
+            frames.append(self.toppling_pose(
                 i, i / 30.0, angle_deg=90.0, hip_y=740.0))
         return frames
 
@@ -566,8 +436,8 @@ class TestAlertDispatchFromThePipeline(unittest.TestCase):
         pipe.source_name = "clip.mp4"
         for pf in self._fall_frames():
             pipe.analyze(pf)
-        self.assertEqual(len(pipe.machine.events), 1, "la Etapa 1 no disparo")
-        self.assertEqual(len(received), 1, "no se despacho la alerta")
+        self.assertEqual(len(pipe.machine.events), 1, "Stage 1 did not fire")
+        self.assertEqual(len(received), 1, "the alert was not dispatched")
         a = received[0]
         self.assertEqual(a.source, "clip.mp4")
         self.assertEqual(a.verdict, "stage3_confirmed")
@@ -600,11 +470,11 @@ class TestAlertDispatchFromThePipeline(unittest.TestCase):
             result = pipe.analyze(pf)
             if result.resolved_event is not None:
                 resolved.append((result.pose.frame_index, result.resolved_event))
-        self.assertEqual(len(resolved), 1, "el veredicto debe aparecer una sola vez")
+        self.assertEqual(len(resolved), 1, "the verdict must appear only once")
         deciding_frame, ev = resolved[0]
         self.assertNotEqual(ev.verdict, "stage1_only")
         self.assertGreater(deciding_frame, ev.frame_index,
-                           "el veredicto no puede caer en el frame del disparo")
+                           "the verdict cannot land on the trigger frame")
 
     def test_nothing_is_dispatched_when_nothing_happens(self) -> None:
         pipe = FramePipeline(Config(TEST_CFG))
@@ -644,9 +514,9 @@ class TestRowMatchesTheSchema(unittest.TestCase):
             result = pipe.analyze(make_pose(i, i / 30.0, ankle_y=700.0 + i))
         assert result is not None
         emitted = set(result.csv_extra())
-        self.assertTrue(emitted, "el frame no produjo ninguna columna")
+        self.assertTrue(emitted, "the frame produced no column")
         self.assertLessEqual(emitted, set(PHASE2_FIELDS),
-                             f"claves fuera del esquema: {emitted - set(PHASE2_FIELDS)}")
+                             f"keys outside the schema: {emitted - set(PHASE2_FIELDS)}")
 
     def test_the_experimental_quantities_actually_reach_the_row(self) -> None:
         # Guards against the mark being applied to a name nothing emits —

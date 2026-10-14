@@ -12,7 +12,7 @@ several readings, and the difference between them was 9 of 13 real falls
 against 12 of 13. Encoding each reading's behaviour as a test is what keeps
 that difference from being re-litigated from memory.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations
@@ -22,44 +22,23 @@ import unittest
 from pef_fall_detector.state_machine import (
     CONFIRMED,
     CONFIRMED_FALL,
+    INCONCLUSIVE,
     MILD,
     MODERATE,
     NULLIFIED,
-    SEVERE,
-    UNRESOLVED,
-    INCONCLUSIVE,
     REJECTED,
     SCORE,
     SEQUENTIAL,
+    SEVERE,
     SIMULTANEOUS,
+    UNRESOLVED,
     V_ONLY,
     FallStateMachine,
     Stage,
-    Stage1Trigger,
     Stage2Evaluator,
     Stage3Evaluator,
 )
-
-T_TH, V_TH = 45.0, -1.5
-DT = 1.0 / 30.0
-HOLD = 0.1                       # 3 frames at 30 fps
-
-
-def trigger(formulation: str = SEQUENTIAL, **kw) -> Stage1Trigger:
-    kw.setdefault("threshold_t_deg", T_TH)
-    kw.setdefault("threshold_v_tps", V_TH)
-    kw.setdefault("hold_s", HOLD)
-    return Stage1Trigger(formulation=formulation, **kw)
-
-
-def feed(trg: Stage1Trigger, samples, t0: float = 0.0) -> list[float]:
-    """Feed (T, V) pairs at 30 fps; return the times at which it fired."""
-    fired = []
-    for i, (t_deg, v_tps) in enumerate(samples):
-        ts = t0 + i * DT
-        if trg.update(ts, t_deg, v_tps):
-            fired.append(ts)
-    return fired
+from tests.support import DT, HOLD, T_TH, V_TH, feed, trigger
 
 
 class TestHysteresis(unittest.TestCase):
@@ -84,7 +63,7 @@ class TestHysteresis(unittest.TestCase):
             for i in range(int(1.0 * fps)):
                 if trg.update(i / fps, 90.0, -5.0):
                     fired.append(i / fps)
-            self.assertTrue(fired, f"no disparo a {fps} fps")
+            self.assertTrue(fired, f"it did not fire at {fps} fps")
             # And it fires at essentially the same moment in wall-clock time.
             self.assertLessEqual(fired[0], HOLD + 1.0 / fps + 1e-9)
 
@@ -140,7 +119,7 @@ class TestFormulations(unittest.TestCase):
         # Small oscillating velocity, upright trunk.
         walk = [(12.0, -0.4), (14.0, 0.3)] * 40
         for f in (SIMULTANEOUS, SEQUENTIAL, V_ONLY):
-            self.assertEqual(feed(trigger(f), walk), [], f"{f} disparo caminando")
+            self.assertEqual(feed(trigger(f), walk), [], f"{f} fired while walking")
 
 
 class TestScoreFormulation(unittest.TestCase):
@@ -234,7 +213,7 @@ class TestInputValidation(unittest.TestCase):
         nan = float("nan")
         for f in (SIMULTANEOUS, SEQUENTIAL, V_ONLY):
             samples = [(nan, nan)] * 30
-            self.assertEqual(feed(trigger(f), samples), [], f"{f} disparo con NaN")
+            self.assertEqual(feed(trigger(f), samples), [], f"{f} fired on NaN")
 
 
 class TestStateMachine(unittest.TestCase):
@@ -327,7 +306,7 @@ class TestStage2Evaluator(unittest.TestCase):
     def _run(self, offsets, ev=None) -> str:
         ev = ev or self._ev()
         ev.start(0.0)
-        for i, p in enumerate(offsets):
+        for p in offsets:
             ev.observe(p)
         return ev.verdict()
 
@@ -444,7 +423,7 @@ class TestStage2InTheMachine(unittest.TestCase):
         # that the 0.3 s Stage-2 window is still open.
         for i in range(6):
             ev = machine.update(i, i * DT, 90.0, -5.0, 0.4) or ev
-        self.assertIsNotNone(ev, "no disparo antes del reset")
+        self.assertIsNotNone(ev, "it did not fire before the reset")
         self.assertIs(machine.stage, Stage.CONFIRMING)
         machine.reset()
         self.assertEqual(ev.verdict, "stage1_only")

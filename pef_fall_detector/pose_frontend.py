@@ -115,7 +115,7 @@ class PoseFrame:
     mid_shoulder: np.ndarray | None = None
     torso_length: float | None = None
     core_visibility: float = 0.0
-    #: First frame after the tracker was re-seeded (fase 4): its landmarks
+    #: First frame after the tracker was re-seeded (phase 4): its landmarks
     #: come from a fresh detection, not from tracking the previous frame, so
     #: the pipeline treats it as a break in continuity.
     reacquired: bool = False
@@ -176,18 +176,17 @@ class PoseFrontend:
             min_tracking_confidence=min_tracking_confidence,
             smooth_landmarks=smooth_landmarks,
         )
-        # Re-adquisición (fase 4). MediaPipe Pose es detector + rastreador: el
-        # detector corre solo cuando el rastreo se pierde, y el rastreo se da
-        # por bueno mientras la *presencia* supere min_tracking_confidence.
-        # La presencia y la visibilidad de los landmarks son salidas
-        # distintas: en A16-S1 el rastreador quedó pegado 5.4 s a una región
-        # vieja (la del sujeto pasando pegado a la cámara) con presencia alta
-        # y visibilidad del núcleo en 0.00-0.05, mientras el cuerpo entero
-        # caía y yacía a la vista. Ninguna etapa del §3.5 puede ver una caída
-        # que el front-end no entrega. Si el núcleo sigue por debajo de
-        # visibility_threshold durante reacquire_after_s, se reinicia el
-        # grafo para que el siguiente cuadro pase otra vez por el detector.
-        # No cambia ningún landmark de un cuadro bueno; 0 lo apaga.
+        # Re-acquisition (phase 4). MediaPipe Pose is detector + tracker: the
+        # detector runs only when tracking is lost, and tracking is trusted
+        # while the *presence* score stays above min_tracking_confidence.
+        # Presence and landmark visibility are different outputs, so the
+        # tracker can stay stuck on an old region with high presence and a
+        # near-zero core visibility while the whole body falls in view, and
+        # no §3.5 stage can see a fall the front end does not deliver. If the
+        # core stays below visibility_threshold for reacquire_after_s, the
+        # graph is reset so the next frame goes through the detector again.
+        # No landmark of a good frame changes; 0 switches it off. The case
+        # that motivated it: notas/CODIGO-HISTORIA.md.
         self._visibility_threshold = float(visibility_threshold)
         self._reacquire_after_s = float(reacquire_after_s)
         self._low_since: float | None = None
@@ -203,7 +202,7 @@ class PoseFrontend:
         results = self._pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
 
         if results.pose_landmarks is None:
-            self._low_since = None      # sin rastreo: el detector ya corre solo
+            self._low_since = None      # no tracking: the detector already runs
             return PoseFrame(
                 frame_index=frame_index,
                 timestamp=timestamp,

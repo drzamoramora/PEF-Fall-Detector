@@ -1,9 +1,8 @@
-"""Fase 4: re-adquisición del rastreador de MediaPipe (pose_frontend).
+"""Phase 4: re-acquisition of MediaPipe's tracker (pose_frontend).
 
-El caso real es A16-S1: 5.4 s con el núcleo a visibilidad 0.00-0.05 mientras
-el rastreador seguía "enganchado" a una región vieja y el sujeto caía a la
-vista. Aquí se prueba la regla sin MediaPipe: un grafo falso cuenta los
-reinicios.
+The real case is A16-S1: 5.4 s with the core at visibility 0.00-0.05 while
+the tracker stayed "locked" on an old region and the subject fell in view.
+Here the rule is tested without MediaPipe: a fake graph counts the resets.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pef_fall_detector.pose_frontend import PoseFrontend  # noqa: E402
+from tests.support import TEST_CFG, make_pose, toppling_pose  # noqa: E402
 
 DT = 1.0 / 30.0
 
@@ -28,7 +28,7 @@ class _Graph:
 
 
 def _frontend(wait: float, threshold: float = 0.5) -> PoseFrontend:
-    fe = PoseFrontend.__new__(PoseFrontend)      # sin cargar MediaPipe
+    fe = PoseFrontend.__new__(PoseFrontend)      # without loading MediaPipe
     fe._pose = _Graph()
     fe._visibility_threshold = threshold
     fe._reacquire_after_s = wait
@@ -81,9 +81,10 @@ class TestReacquire(unittest.TestCase):
 class TestLostDetectionRestartsTheCount(unittest.TestCase):
 
     def test_a_frame_without_a_person_is_not_a_locked_tracker(self) -> None:
-        # Sin persona, MediaPipe ya vuelve a correr el detector por su cuenta;
-        # ese cuadro no puede sumar al tiempo "pegado".
+        # With no person, MediaPipe already runs the detector again on its own;
+        # that frame cannot add to the "locked" time.
         import types
+
         import numpy as np
         fe = _frontend(0.5)
         fe._pose.process = lambda rgb: types.SimpleNamespace(pose_landmarks=None)
@@ -95,6 +96,7 @@ class TestLostDetectionRestartsTheCount(unittest.TestCase):
 
     def test_process_watches_every_detected_frame(self) -> None:
         import types
+
         import numpy as np
         lm = [types.SimpleNamespace(x=0.5, y=0.1 + 0.02 * k, z=0.0, visibility=0.02)
               for k in range(33)]
@@ -119,9 +121,9 @@ class TestConfigWiring(unittest.TestCase):
     def test_the_pipeline_passes_it_to_the_frontend(self) -> None:
         import copy
         from unittest import mock
+
         from pef_fall_detector.config import Config
         from pef_fall_detector.pipeline import FramePipeline
-        from tests.test_pipeline import TEST_CFG
         cfg = copy.deepcopy(TEST_CFG)
         cfg["pose"]["reacquire_after_s"] = 0.7
         pipe = FramePipeline(Config(cfg))
@@ -134,20 +136,25 @@ class TestConfigWiring(unittest.TestCase):
         self.assertEqual(kw["visibility_threshold"],
                          float(cfg["pose"]["visibility_threshold"]))
 
-    def test_old_configs_without_the_key_keep_it_off(self) -> None:
+    def test_zero_keeps_it_off_and_the_key_is_required(self) -> None:
+        # Before 0.2.0.dev2 a config without the key left it off; now the key
+        # is required, and 0 is how it is switched off.
         import copy
         from unittest import mock
-        from pef_fall_detector.config import Config
+
+        from pef_fall_detector.config import Config, ConfigError
         from pef_fall_detector.pipeline import FramePipeline
-        from tests.test_pipeline import TEST_CFG
         cfg = copy.deepcopy(TEST_CFG)
-        cfg["pose"].pop("reacquire_after_s", None)
+        self.assertEqual(cfg["pose"]["reacquire_after_s"], 0.0)
         pipe = FramePipeline(Config(cfg))
         with mock.patch("pef_fall_detector.pipeline.PoseFrontend") as fake:
             fake.return_value.process.side_effect = RuntimeError("basta")
             with self.assertRaises(RuntimeError):
                 pipe.process(None, 0, 0.0)
         self.assertEqual(fake.call_args.kwargs["reacquire_after_s"], 0.0)
+        cfg["pose"].pop("reacquire_after_s")
+        with self.assertRaisesRegex(ConfigError, r"missing key 'pose\.reacquire_after_s'"):
+            Config(cfg)
 
 
 class TestDiscontinuity(unittest.TestCase):
@@ -162,9 +169,9 @@ class TestDiscontinuity(unittest.TestCase):
 
     def _pipe(self):
         import copy
+
         from pef_fall_detector.config import Config
         from pef_fall_detector.pipeline import FramePipeline
-        from tests.test_pipeline import TEST_CFG
         cfg = copy.deepcopy(TEST_CFG)
         cfg["stage1"]["trigger_formulation"] = "score"
         cfg["stage1"]["trigger_peak_window_s"] = 0.8
@@ -176,12 +183,10 @@ class TestDiscontinuity(unittest.TestCase):
         Across the break, the peak window would pair the stale T with the new
         V; nothing about the new skeleton is a fall.
         """
-        from tests.test_main_headless import _toppling_pose
-        from tests.test_pipeline import make_pose
         pipe = self._pipe()
         # A17-S3: the clip opens on a still, inverted skeleton (V 0: no fire).
         for i in range(15):
-            pipe.analyze(_toppling_pose(i, i * DT, angle_deg=170.0, hip_y=500.0))
+            pipe.analyze(toppling_pose(i, i * DT, angle_deg=170.0, hip_y=500.0))
         pipe.analyze(gap_frame(15))
         stages = []
         for i in range(16, 60):                    # 1 px/frame down: V < 0, T 0
@@ -191,14 +196,13 @@ class TestDiscontinuity(unittest.TestCase):
         return pipe, stages
 
     def test_a_reacquired_frame_is_a_discontinuity(self) -> None:
-        from tests.test_pipeline import make_pose
 
         def reacq(i):
             pf = make_pose(i, i * DT, hip_y=499.0, shoulder_y=299.0)
             pf.reacquired = True
             return pf
         pipe, stages = self._stale_peak_then(reacq)
-        self.assertEqual(set(stages), {"MONITORING"}, "disparo con un T viejo")
+        self.assertEqual(set(stages), {"MONITORING"}, "it fired with an old T")
 
 
 if __name__ == "__main__":

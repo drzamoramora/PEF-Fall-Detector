@@ -30,9 +30,12 @@ reports it rather than propagating.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 #: Verdicts that produce an alert by default. §3.5 dispatches a confirmed
 #: fall; a nullified one is by definition the alarm being called off. Events
@@ -132,9 +135,16 @@ class AlertDispatcher:
                 sink(alert)
             except Exception as exc:                      # noqa: BLE001
                 self.failures.append((repr(sink), exc))
+                # Recorded AND said: a transport that fails silently is the
+                # one nobody fixes before it is needed.
+                logger.warning("alert sink %r failed: %s", sink, exc)
         return True
 
 
 def console_sink(alert: Alert) -> None:
-    """Print the alert. The default transport until §3.6 hardware exists."""
+    """Print the alert. The default transport until §3.6 hardware exists.
+
+    ``print``, not ``logging``: on the console the alert IS the output, the
+    way a buzzer's sound is. Logging is for what goes wrong around it.
+    """
     print(f"[ALERT] {alert.message()}", flush=True)

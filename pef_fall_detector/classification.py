@@ -129,9 +129,9 @@ def class_for_event(verdict: str, severity: str,
     """
     if verdict == "stage2_rejected":
         return NO_FALL
-    # Fase 8.3: la Etapa 3 midio que el cuerpo no llego al suelo (cantidad A).
-    # Es un juicio activo, como el rechazo de la Etapa 2, no una falta de
-    # evidencia: NoFall siempre, sin importar ``unresolved_as``.
+    # Phase 8.3: Stage 3 measured that the body never reached the floor
+    # (Quantity A). An active judgement, like a Stage-2 rejection, not a lack
+    # of evidence: always NoFall, whatever ``unresolved_as`` says.
     if verdict == NOT_DOWN:
         return NO_FALL
     return _FROM_SEVERITY.get((verdict, severity), unresolved_as)
@@ -145,13 +145,13 @@ def classify_clip(events, unresolved_as: str = NO_FALL) -> tuple[str, str]:
     machine and a human annotator can be examined without re-running the clip.
     """
     if not events:
-        return NO_FALL, "sin eventos"
+        return NO_FALL, "no events"
 
     labelled = [(class_for_event(e.verdict, e.severity, unresolved_as), e)
                 for e in events]
     label, event = max(labelled, key=lambda pair: _RANK[pair[0]])
-    reason = (f"evento t={event.timestamp:.2f}s "
+    reason = (f"event t={event.timestamp:.2f}s "
               f"{event.verdict}/{event.severity or '-'}")
     if len(events) > 1:
-        reason += f" (el peor de {len(events)})"
+        reason += f" (worst of {len(events)})"
     return label, reason

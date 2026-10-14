@@ -1,0 +1,75 @@
+# PEF-FallDB partition for calibration and testing
+#
+# WHY IT EXISTS
+# Everything after Step 1 adjusts something: thresholds, band limits,
+# rejection criteria. Measuring those adjustments on the same clips that
+# produced them gives a number that cannot be published. This file fixes in
+# advance which clips are not touched.
+#
+# BY ACTOR, NOT BY CLIP
+# Each actor contributes 4 clips and has a single class. Splitting by clip
+# would put the same subject on both sides, and the system would fit that
+# person instead of the phenomenon.
+#
+# THE RULE, AND WHY IT IS A RULE
+# Within each class, sort the actors by ID and take EVERY THIRD one for
+# testing. It is arbitrary on purpose: when it was written, it was already
+# known which actors failed (A06, A09, A14, B10 with 3 of 4 each), and that
+# knowledge cannot be unseen. A partition chosen by judgement would have been
+# contaminated by it. A mechanical rule on the IDs cannot be.
+#
+# Check that it did not come out biased: the test side takes 31 % of the clips
+# and 27 % of the errors of the 27/08 run. Neither too easy nor too hard.
+#
+# PROVISIONAL
+# §3.7 asks to hold out "settings, camera placements and lighting conditions",
+# not actors. The footage has those dimensions, but they are not annotated yet
+# (see notas/CONVENCION-NOMBRES.md). This partition controls subject identity,
+# which is LESS than the paper promises, and is replaced as soon as the
+# renaming is done. Until then it must NOT be reported as the §3.7 partition.
+#
+# Read by pef_fall_detector.evaluation.load_split: only the two lists below
+# matter to the code.
+
+version: 1
+date: 2026-09-03
+rule: "every third actor of each class, sorted by ID"
+note: "A3 is A13 (typo in the file name). 32 actors, 128 clips."
+
+test:
+  # 10 actors, 40 clips (8 Recovered, 8 NotRecovered, 8 Partially, 16 NoFall)
+  - A07   # Recovered
+  - A16   # Recovered
+  - A08   # NotRecovered
+  - A17   # NotRecovered
+  - A09   # PartiallyRecovered
+  - A18   # PartiallyRecovered
+  - B03   # NoFall
+  - B06   # NoFall
+  - B09   # NoFall
+  - B12   # NoFall
+
+train:
+  # 22 actors, 88 clips
+  - A01
+  - A04
+  - A10
+  - A13
+  - A02
+  - A05
+  - A11
+  - A14
+  - A03
+  - A06
+  - A12
+  - A15
+  - B01
+  - B02
+  - B04
+  - B05
+  - B07
+  - B08
+  - B10
+  - B11
+  - B13
+  - B14

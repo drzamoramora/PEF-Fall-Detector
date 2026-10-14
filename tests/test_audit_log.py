@@ -35,7 +35,7 @@ class TestLazyCreation(unittest.TestCase):
             logger = AuditLogger(tmp, "clip")
             self.assertFalse(
                 logger.path.exists(),
-                "el archivo se creó antes de tener una sola fila",
+                "the file was created before it had a single row",
             )
             logger.close()
             self.assertFalse(logger.path.exists())
@@ -83,9 +83,9 @@ class TestExperimentalMarking(unittest.TestCase):
         for name in EXPERIMENTAL_QUANTITIES:
             column = csv_column(name)
             self.assertTrue(column.endswith(EXPERIMENTAL_SUFFIX),
-                            f"{name} es experimental pero su columna no lo dice")
+                            f"{name} is experimental but its column does not say so")
             self.assertIn(column, PHASE2_FIELDS,
-                          f"{column} no está en el esquema")
+                          f"{column} is not in the schema")
 
     def test_paper_quantities_are_not_marked(self) -> None:
         # T and V are §3.4. The centroid is too — we only smooth it, which is
@@ -105,7 +105,7 @@ class TestExperimentalMarking(unittest.TestCase):
         # in the schema, the record would carry the same quantity twice.
         for name in EXPERIMENTAL_QUANTITIES:
             self.assertNotIn(name, PHASE2_FIELDS,
-                             f"{name} quedó también sin sufijo en el esquema")
+                             f"{name} is also in the schema without the suffix")
 
 
 class TestOutputLocation(unittest.TestCase):
@@ -139,7 +139,7 @@ class TestRunMetadata(unittest.TestCase):
             logger.log({"frame_index": 0})
             logger.close()
             side = logger.path.with_suffix(".meta.json")
-            self.assertTrue(side.exists(), "no se escribió el archivo de metadatos")
+            self.assertTrue(side.exists(), "the metadata file was not written")
             meta = json.loads(side.read_text())
             self.assertEqual(meta["source_fps"], 25.0)
             self.assertEqual(meta["schema"], PHASE2_FIELDS)
@@ -197,7 +197,7 @@ class TestSurvivingAnUncleanEnd(unittest.TestCase):
             logger = AuditLogger(tmp, "clip", fields=["frame_index"])
             logger.log({"frame_index": 7})
             self.assertEqual(logger.path.read_text(), "",
-                             "el búfer ya no retiene la fila; revise la premisa")
+                             "the buffer no longer holds the row; check the premise")
             logger.close()
             self.assertIn("7", logger.path.read_text())
 
@@ -213,7 +213,7 @@ class TestSurvivingAnUncleanEnd(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 logger.log({"frame_index": 2})
             self.assertEqual(logger.path.read_text(), saved,
-                             "el registro cerrado fue alterado")
+                             "the closed record was altered")
 
     def test_closing_twice_is_harmless(self) -> None:
         # The window can reach the end of a video and then be closed by the

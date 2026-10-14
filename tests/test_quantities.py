@@ -4,7 +4,7 @@ Synthetic skeletons only: no camera, no video, no MediaPipe. Each quantity
 must be provable on hand-built geometry before it is trusted on real
 footage — the "verify every sub-part on its own" rule of this project.
 
-Run with:  python -m unittest discover tests
+Run with:  python -m unittest discover -s tests
 """
 
 from __future__ import annotations

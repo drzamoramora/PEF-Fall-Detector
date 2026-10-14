@@ -25,7 +25,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import main  # noqa: E402
-from pef_fall_detector.audit_log import EVENT_FIELDS, AuditLogger  # noqa: E402
+from pef_fall_detector.audit_log import EVENT_FIELDS  # noqa: E402
 from pef_fall_detector.config import Config, load_config  # noqa: E402
 from pef_fall_detector.pipeline import FramePipeline  # noqa: E402
 from pef_fall_detector.state_machine import (  # noqa: E402
@@ -39,9 +39,15 @@ from pef_fall_detector.state_machine import (  # noqa: E402
     Stage3Evaluator,
     TriggerEvent,
 )
-from tests.test_main_headless import _FakeSource  # noqa: E402
-from tests.test_pipeline import TEST_CFG, make_pose  # noqa: E402
-from tests.test_quantity_a import STANDING, _body, _pose, _with_world  # noqa: E402
+from tests.support import (  # noqa: E402
+    POSE_STANDING,
+    TEST_CFG,
+    FakeSource,
+    attach_world,
+    make_pose,
+    world_body,
+    world_pose,
+)
 
 DT = 1.0 / 30.0
 NAN = float("nan")
@@ -61,7 +67,8 @@ def _series(segments):
     for seconds, a0, a1, v in segments:
         n = int(round(seconds / DT))
         for i in range(n):
-            a = a0 if (isinstance(a0, float) and math.isnan(a0)) else a0 + (a1 - a0) * i / max(n - 1, 1)
+            unmeasured = isinstance(a0, float) and math.isnan(a0)
+            a = a0 if unmeasured else a0 + (a1 - a0) * i / max(n - 1, 1)
             out.append((t, a, v))
             t += DT
     return out
@@ -167,7 +174,8 @@ class TestADropCondition(unittest.TestCase):
         self.assertEqual(len(_fire_times(_trig(), four)), 1)
 
     def test_latch_rearms_only_after_the_condition_clears(self) -> None:
-        frames = _series(FALL + [(1.0, 1.0, 1.0, 0.0), (0.5, 1.0, 0.2, -2.5), (0.5, 0.2, 0.2, -2.5)])
+        frames = _series(FALL + [(1.0, 1.0, 1.0, 0.0), (0.5, 1.0, 0.2, -2.5),
+                                 (0.5, 0.2, 0.2, -2.5)])
         self.assertEqual([s for _t, s in _fire_times(_trig(), frames)], [A_FALLBACK, A_FALLBACK])
 
     def test_reset_forgets_the_readings(self) -> None:
@@ -313,7 +321,7 @@ class TestMachine(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Through the pipeline: a vertical collapse the T/V formulation cannot see.
 
-SLUMPED = _pose(ankles=((-0.1, 0.05, 0.9), (0.1, 0.05, 0.9)),
+SLUMPED = world_pose(ankles=((-0.1, 0.05, 0.9), (0.1, 0.05, 0.9)),
                 knees=((-0.1, 0.0, 0.45), (0.1, 0.0, 0.45)),
                 shoulders_y=-0.25, nose=(0, -0.35, 0))       # 0.40 m above the ankles -> 0.25
 
@@ -322,21 +330,21 @@ def _collapse(descent_frames: int):
     """Stand 1.5 s; the head drops to 0.25 in 0.3 s (3D); the trunk stays
     vertical in the image (T = 0) while the hips go down 190 px over
     ``descent_frames``; then still."""
-    w_stand, w_down = _body(STANDING), _body(SLUMPED)
+    w_stand, w_down = world_body(POSE_STANDING), world_body(SLUMPED)
     frames = []
     for i in range(160):
         k = min(max(i - 45, 0), descent_frames)
         hip = 500.0 + 190.0 * k / descent_frames
         pf = make_pose(i, i * DT, hip_y=hip, shoulder_y=hip - 150.0, ankle_y=900.0)
         s = min(max((i - 45) / 8.0, 0.0), 1.0)
-        frames.append(_with_world(pf, (1.0 - s) * w_stand + s * w_down))
+        frames.append(attach_world(pf, (1.0 - s) * w_stand + s * w_down))
     return frames
 
 
 def _cfg(on=True):
     cfg = copy.deepcopy(TEST_CFG)
-    cfg["quantity_a"] = {"trigger_from_a": on, "trigger_high": 0.7, "trigger_low": 0.3,
-                         "trigger_window_s": 1.5}
+    cfg["quantity_a"].update({"trigger_from_a": on, "trigger_high": 0.7, "trigger_low": 0.3,
+                              "trigger_window_s": 1.5})
     return Config(cfg)
 
 
@@ -363,9 +371,16 @@ class TestPipeline(unittest.TestCase):
         self.assertEqual(pipe.machine.events, [])
         self.assertEqual(pipe.machine.trigger.threshold_a_high, 0.0)
 
-    def test_without_the_section_it_is_off(self) -> None:
-        pipe, _ = _pipeline_run(_collapse(16), Config(copy.deepcopy(TEST_CFG)))
+    def test_the_test_config_has_it_off_and_the_section_is_required(self) -> None:
+        # Before 0.2.0.dev2 a config without the section left it off; now the
+        # section is required, and TEST_CFG declares it off.
+        from pef_fall_detector.config import ConfigError
+        cfg = copy.deepcopy(TEST_CFG)
+        pipe, _ = _pipeline_run(_collapse(16), Config(cfg))
         self.assertEqual(pipe.machine.events, [])
+        cfg.pop("quantity_a")
+        with self.assertRaisesRegex(ConfigError, r"missing section 'quantity_a'"):
+            Config(cfg)
 
     def test_a_slow_arrival_raises_nothing(self) -> None:
         pipe, _ = _pipeline_run(_collapse(110), _cfg())
@@ -373,14 +388,15 @@ class TestPipeline(unittest.TestCase):
 
     def test_config_values_reach_the_trigger(self) -> None:
         cfg = copy.deepcopy(TEST_CFG)
-        cfg["quantity_a"] = {"trigger_from_a": True, "trigger_high": 0.8, "trigger_low": 0.25,
-                             "trigger_window_s": 2.0}
+        cfg["quantity_a"].update({"trigger_from_a": True, "trigger_high": 0.8, "trigger_low": 0.25,
+                                  "trigger_window_s": 2.0})
         trg = FramePipeline(Config(cfg)).machine.trigger
         self.assertEqual((trg.threshold_a_high, trg.threshold_a_low, trg.a_window_s),
                          (0.8, 0.25, 2.0))
 
     def test_project_config(self) -> None:
-        qa = load_config(Path(__file__).resolve().parents[1] / "config.yaml").as_dict()["quantity_a"]
+        cfg = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
+        qa = cfg.as_dict()["quantity_a"]
         self.assertTrue(qa["trigger_from_a"])
         self.assertEqual((qa["trigger_high"], qa["trigger_low"], qa["trigger_window_s"]),
                          (0.7, 0.3, 1.5))
@@ -399,7 +415,7 @@ class TestRecords(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = copy.deepcopy(TEST_CFG)
             cfg["logging"]["output_dir"] = tmp
-            cfg["quantity_a"] = {"trigger_from_a": True}
+            cfg["quantity_a"]["trigger_from_a"] = True
 
             class _Scripted(FramePipeline):
                 def process(self, frame_bgr, frame_index, timestamp):
@@ -407,7 +423,7 @@ class TestRecords(unittest.TestCase):
 
             saved = (main.load_config, main.VideoFileSource, main.FramePipeline)
             main.load_config = lambda _path: Config(cfg)
-            main.VideoFileSource = lambda _path: _FakeSource(len(frames))
+            main.VideoFileSource = lambda _path: FakeSource(len(frames))
             main.FramePipeline = _Scripted
             try:
                 args = argparse.Namespace(video="A00-S1-Recovered.mp4", config=None,
@@ -428,12 +444,13 @@ class TestRecords(unittest.TestCase):
             self.skipTest(f"GUI not available: {exc}")
         ev = TriggerEvent(frame_index=3, timestamp=0.1, t_deg=2.0, v_tps=-2.0,
                           formulation=SCORE, trigger_source=A_FALLBACK)
+        from pef_fall_detector.records import RunRecords
         with tempfile.TemporaryDirectory() as tmp:
-            logger = AuditLogger(tmp, "clip-events", fields=EVENT_FIELDS)
-            fake = SimpleNamespace(event_logger=logger,
+            records = RunRecords(tmp, "clip", research=True)
+            fake = SimpleNamespace(records=records,
                                    pipeline=SimpleNamespace(machine=SimpleNamespace(events=[ev])))
             LabWindow._log_event(fake, ev)
-            logger.close()
+            records.close([ev])
             with next(Path(tmp).glob("clip-events*.csv")).open(newline="") as fh:
                 rows = list(csv.DictReader(fh))
         self.assertEqual(rows[0]["trigger_source"], A_FALLBACK)

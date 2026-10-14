@@ -1,0 +1,125 @@
+{
+ "columns": {
+  "motivo": "reason"
+ },
+ "patterns": {
+  "reason": [
+   [
+    "^abandonado por discontinuidad \\(deteccion perdida o salto\\); ",
+    "abandoned at a discontinuity (detection lost or jump); "
+   ],
+   [
+    "sin veredicto de etapa$",
+    "no stage verdict"
+   ],
+   [
+    "^deteccion perdida en el suelo; ",
+    "detection lost on the floor; "
+   ],
+   [
+    "^el clip termino durante la Etapa 2$",
+    "the clip ended during Stage 2"
+   ],
+   [
+    "^solo Etapa 1 \\(sin Etapa 2 configurada\\)$",
+    "Stage 1 only (no Stage 2 configured)"
+   ],
+   [
+    "Etapa 2: pies no medibles \\((\\d+) muestras de P < ",
+    "Stage 2: feet not measurable (\\1 samples of P < "
+   ],
+   [
+    "Etapa 2: COM fuera del apoyo (.*) \\((\\d+) muestras\\)$",
+    "Stage 2: COM outside the support \\1 (\\2 samples)"
+   ],
+   [
+    "^A minima (\\S+) > (\\S+) y cadera final (\\S+) > (\\S+): no llego al suelo$",
+    "minimum A \\1 > \\2 and final hip \\3 > \\4: never reached the floor"
+   ],
+   [
+    "^sin esqueleto medido en el ultimo segundo$",
+    "no skeleton measured in the last second"
+   ],
+   [
+    ", pero la cadera subio (\\S+) torsos en (\\S+) s \\(>= (\\S+)\\): se esta levantando$",
+    ", but the hip rose \\1 torsos in \\2 s (>= \\3): getting up"
+   ],
+   [
+    ": termino en el suelo$",
+    ": ended on the floor"
+   ],
+   [
+    ": de pie, se levanto$",
+    ": standing, got up"
+   ],
+   [
+    " entre (\\S+) y (\\S+): sentado o arrodillado",
+    " between \\1 and \\2: sitting or kneeling"
+   ],
+   [
+    "; quieto (\\S+)% >= (\\S+)%: la inmovilidad persistio$",
+    "; still \\1% >= \\2%: the immobility persisted"
+   ],
+   [
+    "; quieto (\\S+)% < (\\S+)%$",
+    "; still \\1% < \\2%"
+   ],
+   [
+    ": erguido; piernas sin evaluar$",
+    ": upright; legs not evaluated"
+   ],
+   [
+    " con piernas extendidas: se levanto$",
+    " with extended legs: got up"
+   ],
+   [
+    " sin piernas verificables",
+    " without verifiable legs"
+   ],
+   [
+    "^erguido sin piernas extendidas: ",
+    "upright without extended legs: "
+   ],
+   [
+    "^erguido: (.*); piernas sin evaluar$",
+    "upright: \\1; legs not evaluated"
+   ],
+   [
+    "^se levanto: (.*), piernas extendidas$",
+    "got up: \\1, legs extended"
+   ],
+   [
+    " deg sostenido ",
+    " deg held "
+   ],
+   [
+    "^quieto (\\S+) s >= W ",
+    "still \\1 s >= W "
+   ],
+   [
+    "; no tumbado \\(",
+    "; not lying ("
+   ],
+   [
+    "; tumbado \\(",
+    "; lying ("
+   ],
+   [
+    "T no medida",
+    "T not measured"
+   ],
+   [
+    "^sin eventos$",
+    "no events"
+   ],
+   [
+    "^evento t=",
+    "event t="
+   ],
+   [
+    " \\(el peor de (\\d+)\\)$",
+    " (worst of \\1)"
+   ]
+  ]
+ }
+}

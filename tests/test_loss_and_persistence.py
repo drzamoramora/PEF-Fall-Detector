@@ -1,18 +1,17 @@
-"""Fase 2 (variante B) y fase 3 del plan de caídas (23/09).
+"""Phase 2 (variant B) and phase 3 of the falls plan (23/09).
 
-Fase 2: si se pierde la detección durante la Etapa 3, el evento se cierra con
-lo último que se vio del sujeto cuando se lo vio EN EL SUELO; si se lo vio de
-pie, se abandona como antes. Caso real: A08-S3.
+Phase 2: if detection is lost during Stage 3, the event is closed with the
+last that was seen of the subject when it was seen ON THE FLOOR; if it was
+seen standing, it is abandoned as before. Real case: A08-S3.
 
-Fase 3: un final ni tumbado ni de pie (sentado, arrodillado, recostado) es
-``severe`` en vez de ``moderate`` cuando la inmovilidad persistió (§3.5).
-Caso real: A17-S2 y A17-S4, recostados contra la pared.
+Phase 3: an ending neither lying nor standing (sitting, kneeling, propped
+up) is ``severe`` instead of ``moderate`` when the immobility persisted
+(§3.5). Real cases: A17-S2 and A17-S4, propped against the wall.
 """
 
 from __future__ import annotations
 
 import copy
-import math
 import sys
 import unittest
 from dataclasses import replace
@@ -34,16 +33,14 @@ from pef_fall_detector.state_machine import (  # noqa: E402
     Stage3Evaluator,
     TriggerEvent,
 )
-from tests.test_main_headless import _toppling_pose  # noqa: E402
-from tests.test_pipeline import TEST_CFG, make_pose  # noqa: E402
-from tests.test_state_machine import trigger  # noqa: E402
+from tests.support import TEST_CFG, make_pose, toppling_pose, trigger  # noqa: E402
 
 DT = 1.0 / 30.0
 NAN = float("nan")
 
 
 # --------------------------------------------------------------------------- #
-# Fase 3 — inmovilidad persistente en finalise()
+# Phase 3 — persistent immobility in finalise()
 # --------------------------------------------------------------------------- #
 class TestPersistentImmobility(unittest.TestCase):
 
@@ -101,7 +98,7 @@ class TestPersistentImmobility(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Fase 2 — pérdida de detección durante la Etapa 3
+# Phase 2 — detection lost during Stage 3
 # --------------------------------------------------------------------------- #
 def _lost(pf):
     return replace(pf, detected=False)
@@ -109,7 +106,7 @@ def _lost(pf):
 
 def _fall_then(after):
     """Topple (0.67 s), then the frames `after` builds from index 20."""
-    frames = [_toppling_pose(i, i * DT, angle_deg=i * 4.5, hip_y=500.0 + i * 12.0)
+    frames = [toppling_pose(i, i * DT, angle_deg=i * 4.5, hip_y=500.0 + i * 12.0)
               for i in range(20)]
     return frames + after(20)
 
@@ -129,14 +126,14 @@ class TestLossOfDetectionDuringStage3(unittest.TestCase):
 
     @staticmethod
     def _down_then_lost(start):
-        down = [_toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
+        down = [toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
                 for i in range(start, start + 30)]          # 1 s on the floor
         lost = [_lost(make_pose(i, i * DT)) for i in range(start + 30, start + 90)]
         return down + lost                                   # then 2 s undetected
 
     @staticmethod
     def _up_then_lost(start):
-        down = [_toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
+        down = [toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
                 for i in range(start, start + 12)]
         up = [make_pose(i, i * DT, hip_y=500.0, shoulder_y=300.0, ankle_y=760.0,
                         feet_x=640.0) for i in range(start + 12, start + 30)]
@@ -145,10 +142,10 @@ class TestLossOfDetectionDuringStage3(unittest.TestCase):
 
     def test_seen_on_the_floor_then_lost_is_closed_as_severe(self) -> None:
         pipe, alerts, closed = self._run(_fall_then(self._down_then_lost))
-        self.assertEqual(len(pipe.machine.events), 1, "la Etapa 1 no disparo")
-        self.assertEqual(len(closed), 1, "el evento no se cerro al perderlo")
+        self.assertEqual(len(pipe.machine.events), 1, "Stage 1 did not fire")
+        self.assertEqual(len(closed), 1, "the event was not closed when the subject was lost")
         t, ev, detected = closed[0]
-        self.assertFalse(detected, "debe cerrarse durante la perdida")
+        self.assertFalse(detected, "it must close during the loss")
         self.assertEqual((ev.verdict, ev.severity), ("stage3_confirmed", "severe"))
         self.assertEqual(len(alerts), 1, "un evento cerrado asi debe alertar")
         self.assertEqual(pipe.machine.stage.value, "MONITORING")
@@ -165,7 +162,7 @@ class TestLossOfDetectionDuringStage3(unittest.TestCase):
 
     def test_seen_upright_then_lost_is_abandoned_as_before(self) -> None:
         pipe, alerts, closed = self._run(_fall_then(self._up_then_lost))
-        self.assertEqual(len(pipe.machine.events), 1, "la Etapa 1 no disparo")
+        self.assertEqual(len(pipe.machine.events), 1, "Stage 1 did not fire")
         self.assertEqual(closed, [])
         self.assertEqual(alerts, [])
         self.assertFalse(pipe.machine.events[0].verdict.startswith("stage3"))
@@ -187,7 +184,7 @@ class TestOnlyFromStage3(unittest.TestCase):
         for i in range(30):                                  # previous event:
             m.stage3.observe(i * DT, 160.0, 0.0, NAN, NAN)   # ended lying down
         m.stage3.reset()
-        self.assertTrue(m.stage3.last_seen_down(), "precondicion: cola vieja en el suelo")
+        self.assertTrue(m.stage3.last_seen_down(), "precondition: an old tail on the floor")
         m._pending = TriggerEvent(frame_index=400, timestamp=13.3, t_deg=50.0,
                                   v_tps=-2.0, formulation="score")
         m.stage = Stage.CONFIRMING

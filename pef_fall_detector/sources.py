@@ -66,7 +66,7 @@ class VideoFileSource(FrameSource):
             raise FileNotFoundError(f"Video file not found: {self.path}")
         self._cap = cv2.VideoCapture(str(self.path))
         if not self._cap.isOpened():
-            raise IOError(f"Could not open video file: {self.path}")
+            raise OSError(f"Could not open video file: {self.path}")
         self._fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.frame_count = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._next_index = 0
@@ -141,7 +141,7 @@ class CameraSource(FrameSource):
         self.index = index
         self._cap = cv2.VideoCapture(index)
         if not self._cap.isOpened():
-            raise IOError(f"Could not open camera index {index}")
+            raise OSError(f"Could not open camera index {index}")
         fps = self._cap.get(cv2.CAP_PROP_FPS)
         self._fps = fps if fps and fps > 1 else 30.0
         self._t0 = time.monotonic()

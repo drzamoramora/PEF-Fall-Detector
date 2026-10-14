@@ -132,7 +132,8 @@ def compare_tables(a: tuple[list[str], list[dict]], b: tuple[list[str], list[dic
     if len(a_rows) != len(b_rows):
         diff.rows = (len(a_rows), len(b_rows))
     common = [c for c in a_hdr if c in b_hdr and c not in ignore]
-    for ra, rb in zip(a_rows, b_rows):
+    # Row counts are compared above; the cells, over the rows both have.
+    for ra, rb in zip(a_rows, b_rows, strict=False):
         for col in common:
             va, vb = ra.get(col) or "", rb.get(col) or ""
             if va != vb:

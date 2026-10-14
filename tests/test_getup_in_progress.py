@@ -1,9 +1,9 @@
-"""Fase 6a: levantarse en curso al final de la observación (§3.5).
+"""Phase 6a: a get-up in progress at the end of the observation (§3.5).
 
-El §3.5 baja la severidad ante "torso and hip landmark recovery to upright".
-Hasta la fase 6 solo el torso (T) decidía. A06-S14: T termina en 120-150 grados
-("en el suelo") mientras la cadera sube 0.70-0.81 torsos en los últimos 2 s:
-se está levantando. Estas pruebas fijan la medida y la regla.
+§3.5 lowers the severity on "torso and hip landmark recovery to upright".
+Until phase 6 only the torso (T) decided. A06-S14: T ends at 120-150 degrees
+("on the floor") while the hip rises 0.70-0.81 torsos in the last 2 s: the
+subject is getting up. These tests pin the measure and the rule.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from pef_fall_detector.state_machine import (  # noqa: E402
     SEVERE,
     Stage3Evaluator,
 )
+from tests.support import TEST_CFG, toppling_pose  # noqa: E402
 
 DT = 1.0 / 30.0
 NAN = float("nan")
@@ -94,12 +95,12 @@ class TestRise(unittest.TestCase):
         ev.observe_hip(0.1, NAN, TORSO)
         ev.observe_hip(0.2, 500.0, 0.0)
         ev.observe_hip(0.3, 500.0, NAN)
-        self.assertEqual(ev._hip, [])
+        self.assertEqual(list(ev._hip), [])
 
     def test_start_forgets_the_previous_event(self) -> None:
         ev = _ev(rise_torsos=0.8)
         ev.start(10.0)
-        self.assertEqual(ev._hip, [])
+        self.assertEqual(list(ev._hip), [])
 
 
 class TestVerdict(unittest.TestCase):
@@ -107,13 +108,13 @@ class TestVerdict(unittest.TestCase):
     def test_down_but_getting_up_is_moderate_with_its_reason(self) -> None:
         ev = _ev(rise_torsos=0.8)
         self.assertEqual(ev.verdict(), (CONFIRMED_FALL, MODERATE))
-        self.assertIn("la cadera subio", ev.reason)
-        self.assertIn("se esta levantando", ev.reason)
+        self.assertIn("the hip rose", ev.reason)
+        self.assertIn("getting up", ev.reason)
 
     def test_down_and_still_stays_severe(self) -> None:
         ev = _ev(rise_torsos=0.1)
         self.assertEqual(ev.verdict(), (CONFIRMED_FALL, SEVERE))
-        self.assertIn("termino en el suelo", ev.reason)
+        self.assertIn("ended on the floor", ev.reason)
 
     def test_threshold_is_inclusive_and_read_from_the_rise(self) -> None:
         r = _ev(rise_torsos=0.8).getup_rise()
@@ -128,7 +129,7 @@ class TestVerdict(unittest.TestCase):
         # Mid band (sat up): already moderate by T, and the reason is T's.
         ev = _ev(rise_torsos=0.8, t_final=45.0)
         self.assertEqual(ev.verdict()[1], MODERATE)
-        self.assertIn("sentado o arrodillado", ev.reason)
+        self.assertIn("sitting or kneeling", ev.reason)
 
     def test_unmeasured_rise_leaves_it_severe(self) -> None:
         ev = Stage3Evaluator(defer_to_end=True, getup_rise_torsos=0.45)
@@ -149,28 +150,30 @@ class TestWiring(unittest.TestCase):
         st3 = FramePipeline(cfg, labelling=True).machine.stage3
         self.assertEqual((st3.getup_rise_torsos, st3.getup_window_s), (0.45, 2.0))
 
-    def test_old_configs_keep_it_off(self) -> None:
-        from pef_fall_detector.config import Config
+    def test_zero_keeps_it_off_and_the_key_is_required(self) -> None:
+        # Before 0.2.0.dev2 a config without the key left it off; now the key
+        # is required, and 0 is how it is switched off.
+        from pef_fall_detector.config import Config, ConfigError
         from pef_fall_detector.pipeline import FramePipeline
-        from tests.test_pipeline import TEST_CFG
         cfg = copy.deepcopy(TEST_CFG)
-        cfg["stage3"].pop("getup_rise_torsos", None)
+        self.assertEqual(cfg["stage3"]["getup_rise_torsos"], 0.0)
         self.assertEqual(FramePipeline(Config(cfg)).machine.stage3.getup_rise_torsos, 0.0)
+        cfg["stage3"].pop("getup_rise_torsos")
+        with self.assertRaisesRegex(ConfigError, r"missing key 'stage3\.getup_rise_torsos'"):
+            Config(cfg)
 
     def _clip(self, rise_px_per_frame: float):
         """Fall, lie with T 90; the hip climbs over the last 2 s; clip ends."""
         from pef_fall_detector.config import Config
         from pef_fall_detector.pipeline import FramePipeline
-        from tests.test_main_headless import _toppling_pose
-        from tests.test_pipeline import TEST_CFG
         cfg = copy.deepcopy(TEST_CFG)
         cfg["stage3"]["getup_rise_torsos"] = 0.45
         pipe = FramePipeline(Config(cfg), labelling=True)
-        frames = [_toppling_pose(i, i * DT, angle_deg=i * 4.5, hip_y=500.0 + i * 12.0)
+        frames = [toppling_pose(i, i * DT, angle_deg=i * 4.5, hip_y=500.0 + i * 12.0)
                   for i in range(20)]
-        frames += [_toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
+        frames += [toppling_pose(i, i * DT, angle_deg=90.0, hip_y=740.0)
                    for i in range(20, 120)]
-        frames += [_toppling_pose(i, i * DT, angle_deg=90.0,
+        frames += [toppling_pose(i, i * DT, angle_deg=90.0,
                                   hip_y=740.0 - rise_px_per_frame * (i - 119))
                    for i in range(120, 180)]
         for pf in frames:
@@ -182,7 +185,7 @@ class TestWiring(unittest.TestCase):
         # 200 px trunk; 4 px/frame over 60 frames = 240 px = 1.2 torsos.
         ev = self._clip(4.0)
         self.assertEqual(ev.severity, MODERATE)
-        self.assertIn("se esta levantando", ev.reason)
+        self.assertIn("getting up", ev.reason)
 
     def test_the_pipeline_lying_still_stays_severe(self) -> None:
         self.assertEqual(self._clip(0.0).severity, SEVERE)

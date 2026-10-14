@@ -36,6 +36,7 @@ import _records  # noqa: E402
 import compare_runs  # noqa: E402
 import metrics  # noqa: E402
 import replay  # noqa: E402
+
 from pef_fall_detector import __version__, audit_log  # noqa: E402
 from pef_fall_detector.audit_log import (  # noqa: E402
     EVENT_FIELDS,
@@ -45,20 +46,20 @@ from pef_fall_detector.audit_log import (  # noqa: E402
 )
 from pef_fall_detector.config import Config  # noqa: E402
 from pef_fall_detector.pipeline import FramePipeline  # noqa: E402
+from pef_fall_detector.records import event_row  # noqa: E402
 from pef_fall_detector.state_machine import A_FALLBACK, TriggerEvent  # noqa: E402
-from tests.test_pipeline import TEST_CFG, make_pose  # noqa: E402
-from tests.test_quantity_a import STANDING, _body, _pose  # noqa: E402
+from tests.support import POSE_STANDING, TEST_CFG, make_pose, world_body, world_pose  # noqa: E402
 
 FPS = 30.0
 STEM = "A99-S1-Recovered"
-SLUMPED = _pose(ankles=((-0.1, 0.05, 0.9), (0.1, 0.05, 0.9)),
+SLUMPED = world_pose(ankles=((-0.1, 0.05, 0.9), (0.1, 0.05, 0.9)),
                 knees=((-0.1, 0.0, 0.45), (0.1, 0.0, 0.45)),
                 shoulders_y=-0.25, nose=(0, -0.35, 0))          # head 0.40 m up -> A 0.25
 
 
 def _cfg() -> Config:
     cfg = copy.deepcopy(TEST_CFG)
-    cfg["quantity_a"] = {"trigger_from_a": True}
+    cfg["quantity_a"]["trigger_from_a"] = True
     return Config(cfg)
 
 
@@ -70,7 +71,7 @@ def _frames(n: int = 150, collapse: bool = True):
     Exact at the recorded precision: integer pixels, world coordinates with
     two decimals (camera pitch 0), timestamps ``index / fps``.
     """
-    stand, down = _body(STANDING, pitch_deg=0.0), _body(SLUMPED, pitch_deg=0.0)
+    stand, down = world_body(POSE_STANDING, pitch_deg=0.0), world_body(SLUMPED, pitch_deg=0.0)
     out = []
     for i in range(n):
         k = min(max(i - 45, 0), 19) if collapse else 0
@@ -99,7 +100,7 @@ def _write_run(folder: Path, frames, cfg: Config, stem: str = STEM) -> FramePipe
     marks.close()
     events = AuditLogger(folder, stem + "-events", fields=EVENT_FIELDS, metadata=meta)
     for i, ev in enumerate(pipe.machine.events):
-        events.log(replay.event_row(i, ev))
+        events.log(event_row(i, ev))
     events.close()
     return pipe
 
@@ -178,7 +179,7 @@ class TestReplay(unittest.TestCase):
         meta = {"source_fps_declared": FPS}
         marks = AuditLogger(folder, STEM + "-landmarks", fields=LANDMARK_FIELDS, metadata=meta)
         log = AuditLogger(folder, STEM, metadata=meta)
-        for pf, rel in zip(frames, reliable):
+        for pf, rel in zip(frames, reliable, strict=True):
             marks.log(landmark_row(pf))
             log.log_pose_frame(pf, extra={"reliable": "1" if rel else "0"})
         marks.close()
@@ -214,6 +215,22 @@ class TestReplay(unittest.TestCase):
         self.assertEqual(flagged, [21])      # low since 5 (0.167 s), 0.5 s later: 20
         self.assertEqual(stats.reacquired, 1)
 
+    def test_a_replay_reads_reacquire_after_s_from_the_config(self) -> None:
+        frames = _frames(30)
+        for pf in frames[5:25]:
+            pf.visibility[[11, 12, 23, 24]] = 0.3
+        reliable = [pf.visibility[11] >= 0.5 for pf in frames]
+        counts = []
+        for value in (0.5, 0.0):
+            cfg = copy.deepcopy(TEST_CFG)
+            cfg["pose"]["reacquire_after_s"] = value
+            with tempfile.TemporaryDirectory() as tmp:
+                rec = self._records(Path(tmp), frames, reliable)
+                pkg = replay.load_package(ROOT)
+                _, stats = replay.replay_clip(pkg, Config(cfg), rec, Path(tmp) / "out")
+            counts.append(stats.reacquired)
+        self.assertEqual(counts, [1, 0])
+
     def test_package_from_elsewhere_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(RuntimeError):
@@ -222,9 +239,10 @@ class TestReplay(unittest.TestCase):
 
     def test_event_rows_follow_the_record_schema(self) -> None:
         ev = TriggerEvent(frame_index=3, timestamp=0.1, t_deg=2.0, v_tps=-2.0,
-                          formulation="score", trigger_source=A_FALLBACK, verdict="stage3_confirmed",
+                          formulation="score", trigger_source=A_FALLBACK,
+                          verdict="stage3_confirmed",
                           severity="severe", max_immobility_s=1.234, reason="why")
-        row = replay.event_row(0, ev)
+        row = event_row(0, ev)
         self.assertEqual(list(row), EVENT_FIELDS)
         self.assertEqual((row["timestamp_s"], row["T_deg"], row["V_tps"], row["max_immobility_s"],
                           row["p_outside_fraction"], row["H_ratio_EXP"]),
@@ -293,29 +311,107 @@ class TestCompareRuns(unittest.TestCase):
         self.assertIn("only in A 1", text)
 
     def test_renames_and_translations_through_the_map(self) -> None:
+        # B renames A's "reason" column to "why" and rewrites its texts, as
+        # a later block may; the map says so and nothing else may differ.
         b = self._copy("renamed")
         rec = _records.find_runs(b)[0]["A99-S1"]
 
         def edit(header, rows):
             for row in rows:
-                row["reason"] = "EN: " + row.pop("motivo")
-            return [("reason" if h == "motivo" else h) for h in header], rows
+                row["why"] = "EN: " + row.pop("reason")
+            return [("why" if h == "reason" else h) for h in header], rows
         _rewrite(rec.events, edit)
         same, text = self._check(b)
         self.assertFalse(same)
-        self.assertIn("columns only in A: motivo", text)
-        self.assertIn("columns only in B: reason", text)
-        patterns = compare_runs.ColumnMap(columns={"motivo": "reason"},
-                                          patterns={"reason": [(compare_runs.re.compile("^"),
-                                                                "EN: ")]})
+        self.assertIn("columns only in A: reason", text)
+        self.assertIn("columns only in B: why", text)
+        patterns = compare_runs.ColumnMap(columns={"reason": "why"},
+                                          patterns={"why": [(compare_runs.re.compile("^"),
+                                                             "EN: ")]})
         same, text = self._check(b, patterns)
         self.assertTrue(same, text)
         with open(rec.events, newline="", encoding="utf-8") as fh:
-            reason = next(csv.DictReader(fh))["reason"]
-        values = compare_runs.ColumnMap(columns={"motivo": "reason"},
-                                        values={"reason": {reason[4:]: reason}})
+            why = next(csv.DictReader(fh))["why"]
+        values = compare_runs.ColumnMap(columns={"reason": "why"},
+                                        values={"why": {why[4:]: why}})
         same, text = self._check(b, values)
         self.assertTrue(same, text)
+
+    def test_the_b3_map_reads_runs_from_before_b3(self) -> None:
+        # Records written before 0.2.0.dev3 call the reason "motivo".
+        b = self._copy("old")
+        rec = _records.find_runs(b)[0]["A99-S1"]
+
+        def edit(header, rows):
+            for row in rows:
+                row["motivo"] = row.pop("reason")
+            return [("motivo" if h == "reason" else h) for h in header], rows
+        _rewrite(rec.events, edit)
+        cmap = compare_runs.ColumnMap.load(ROOT / "tools" / "maps" / "b3.json")
+        same, text = _quiet(compare_runs.compare, b, self.ref, cmap)
+        self.assertTrue(same, text)
+
+    def test_the_b5_map_translates_every_old_reason(self) -> None:
+        # One reason of each shape the 0.2.0.dev4 code could write, and the
+        # text 0.2.0.dev5 writes for the same decision.
+        pairs = [
+            ("A final 0.12 (T final 95 deg) <= 0.26: termino en el suelo",
+             "A final 0.12 (T final 95 deg) <= 0.26: ended on the floor"),
+            ("A final 0.90 (T final 118 deg) >= 0.82: de pie, se levanto",
+             "A final 0.90 (T final 118 deg) >= 0.82: standing, got up"),
+            ("A final 0.50 (T final 90 deg) entre 0.26 y 0.82: sentado o arrodillado; "
+             "quieto 20% < 50%",
+             "A final 0.50 (T final 90 deg) between 0.26 and 0.82: sitting or kneeling; "
+             "still 20% < 50%"),
+            ("T final 40 deg entre 30 y 60: sentado o arrodillado; quieto 80% >= 50%: "
+             "la inmovilidad persistio",
+             "T final 40 deg between 30 and 60: sitting or kneeling; still 80% >= 50%: "
+             "the immobility persisted"),
+            ("T final 85 deg >= 60: termino en el suelo",
+             "T final 85 deg >= 60: ended on the floor"),
+            ("T final 85 deg >= 60, pero la cadera subio 0.70 torsos en 2 s (>= 0.40): "
+             "se esta levantando",
+             "T final 85 deg >= 60, but the hip rose 0.70 torsos in 2 s (>= 0.40): getting up"),
+            ("T final 5 deg < 30: erguido; piernas sin evaluar",
+             "T final 5 deg < 30: upright; legs not evaluated"),
+            ("T final 5 deg < 30 con piernas extendidas: se levanto",
+             "T final 5 deg < 30 with extended legs: got up"),
+            ("T final 5 deg < 30 sin piernas verificables",
+             "T final 5 deg < 30 without verifiable legs"),
+            ("A minima 0.50 > 0.31 y cadera final 0.60 > 0.45: no llego al suelo",
+             "minimum A 0.50 > 0.31 and final hip 0.60 > 0.45: never reached the floor"),
+            ("sin esqueleto medido en el ultimo segundo",
+             "no skeleton measured in the last second"),
+            ("erguido: T < 30 deg sostenido 2.0 s; piernas sin evaluar",
+             "upright: T < 30 deg held 2.0 s; legs not evaluated"),
+            ("se levanto: T < 30 deg sostenido 2.0 s, piernas extendidas",
+             "got up: T < 30 deg held 2.0 s, legs extended"),
+            ("erguido sin piernas extendidas: T < 30 deg sostenido 2.0 s",
+             "upright without extended legs: T < 30 deg held 2.0 s"),
+            ("quieto 6.2 s >= W 5.0 s; tumbado (T 85 deg >= 60)",
+             "still 6.2 s >= W 5.0 s; lying (T 85 deg >= 60)"),
+            ("quieto 6.2 s >= W 5.0 s; no tumbado (T no medida, H 0.50 > 0.35)",
+             "still 6.2 s >= W 5.0 s; not lying (T not measured, H 0.50 > 0.35)"),
+            ("solo Etapa 1 (sin Etapa 2 configurada)", "Stage 1 only (no Stage 2 configured)"),
+            ("Etapa 2: COM fuera del apoyo 25% < 50% (4 muestras)",
+             "Stage 2: COM outside the support 25% < 50% (4 samples)"),
+            ("abandonado por discontinuidad (deteccion perdida o salto); "
+             "Etapa 2: pies no medibles (1 muestras de P < 3)",
+             "abandoned at a discontinuity (detection lost or jump); "
+             "Stage 2: feet not measurable (1 samples of P < 3)"),
+            ("abandonado por discontinuidad (deteccion perdida o salto); sin veredicto de etapa",
+             "abandoned at a discontinuity (detection lost or jump); no stage verdict"),
+            ("deteccion perdida en el suelo; T final 85 deg >= 60: termino en el suelo",
+             "detection lost on the floor; T final 85 deg >= 60: ended on the floor"),
+            ("el clip termino durante la Etapa 2", "the clip ended during Stage 2"),
+            ("sin eventos", "no events"),
+            ("evento t=3.20s stage3_confirmed/severe (el peor de 2)",
+             "event t=3.20s stage3_confirmed/severe (worst of 2)"),
+        ]
+        cmap = compare_runs.ColumnMap.load(ROOT / "tools" / "maps" / "b5.json")
+        header, rows = cmap.apply(["motivo"], [{"motivo": old} for old, _new in pairs])
+        self.assertEqual(header, ["reason"])
+        self.assertEqual([r["reason"] for r in rows], [new for _old, new in pairs])
 
     def test_the_map_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -372,6 +468,10 @@ class TestCompareRuns(unittest.TestCase):
 
 
 class TestMetrics(unittest.TestCase):
+
+    def test_the_default_partition_is_the_shipped_one(self) -> None:
+        from pef_fall_detector.config import PARTITION_PATH
+        self.assertEqual(metrics.DEFAULT_PARTITION.resolve(), PARTITION_PATH.resolve())
 
     def test_headline_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

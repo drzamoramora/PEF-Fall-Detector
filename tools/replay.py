@@ -69,6 +69,12 @@ def load_package(repo: str | Path) -> SimpleNamespace:
         sys.path.insert(0, str(repo))
     mods = {name: importlib.import_module(f"pef_fall_detector.{name}")
             for name in ("audit_log", "config", "pipeline", "pose_frontend")}
+    # Code before 0.2.0.dev3 has no records module: its runs are written the
+    # way main.py wrote them then (see _LegacyRecords).
+    try:
+        mods["records"] = importlib.import_module("pef_fall_detector.records")
+    except ModuleNotFoundError:
+        mods["records"] = None
     loaded = Path(mods["pipeline"].__file__).resolve().parents[1]
     if loaded != repo:
         raise RuntimeError(f"pef_fall_detector is already imported from {loaded}, not {repo}")
@@ -101,7 +107,7 @@ def rebuild_frames(pkg: SimpleNamespace, records: ClipRecords, visibility_thresh
     # whether the tracker was re-seeded (flagged on the next detected frame).
     low_since: float | None = None
     reseeded = False
-    for row, mark in zip(rows, marks):
+    for row, mark in zip(rows, marks, strict=True):     # lengths checked above
         index = int(mark["frame_index"])
         if index != int(row["frame_index"]):
             raise ValueError(f"{records.stem}: frame {index} out of step with the record")
@@ -146,25 +152,44 @@ def rebuild_frames(pkg: SimpleNamespace, records: ClipRecords, visibility_thresh
             reacquired=reacquired, world_landmarks=world, world_torso_length=world_torso)
 
 
-def event_row(index: int, ev) -> dict:
-    """One row of the events record, formatted as ``main.py`` writes it."""
+class _LegacyRecords:
+    """How runs were written before 0.2.0.dev3: frames, then every event at the end."""
+
+    def __init__(self, pkg: SimpleNamespace, out: Path, stem: str, metadata: dict) -> None:
+        self._audit = pkg.audit_log
+        self._frames = pkg.audit_log.AuditLogger(out, stem, metadata=metadata)
+        self._events = pkg.audit_log.AuditLogger(
+            out, stem + "-events", fields=pkg.audit_log.EVENT_FIELDS,
+            metadata={**metadata, "record_kind": "stage1_events"})
+
+    def frame(self, result) -> None:
+        self._frames.log_pose_frame(result.pose, extra=result.csv_extra())
+
+    def event_settled(self, events, ev) -> None:
+        pass
+
+    def close(self, events) -> None:
+        self._frames.close()
+        fields = self._audit.EVENT_FIELDS
+        try:
+            for i, ev in enumerate(events):
+                row = _legacy_event_row(i, ev)
+                self._events.log({k: v for k, v in row.items() if k in fields})
+        finally:
+            self._events.close()
+
+
+def _legacy_event_row(index: int, ev) -> dict:
     def fmt(value: float, spec: str) -> str:
         return "" if math.isnan(value) else format(value, spec)
     return {
-        "event_index": index,
-        "frame_index": ev.frame_index,
-        "timestamp_s": f"{ev.timestamp:.3f}",
-        "T_deg": f"{ev.t_deg:.2f}",
-        "V_tps": f"{ev.v_tps:.3f}",
-        "formulation": ev.formulation,
-        "trigger_source": getattr(ev, "trigger_source", ""),
-        "verdict": ev.verdict,
-        "severity": ev.severity,
-        "max_immobility_s": fmt(ev.max_immobility_s, ".2f"),
-        "p_outside_fraction": fmt(ev.p_outside_fraction, ".3f"),
-        "p_samples": ev.p_samples,
-        "H_ratio_EXP": fmt(ev.h_ratio, ".3f"),
-        "motivo": ev.reason,
+        "event_index": index, "frame_index": ev.frame_index,
+        "timestamp_s": f"{ev.timestamp:.3f}", "T_deg": f"{ev.t_deg:.2f}",
+        "V_tps": f"{ev.v_tps:.3f}", "formulation": ev.formulation,
+        "trigger_source": getattr(ev, "trigger_source", ""), "verdict": ev.verdict,
+        "severity": ev.severity, "max_immobility_s": fmt(ev.max_immobility_s, ".2f"),
+        "p_outside_fraction": fmt(ev.p_outside_fraction, ".3f"), "p_samples": ev.p_samples,
+        "H_ratio_EXP": fmt(ev.h_ratio, ".3f"), "motivo": ev.reason,
     }
 
 
@@ -177,24 +202,22 @@ def replay_clip(pkg: SimpleNamespace, cfg, records: ClipRecords, out: Path) -> t
                 "replay_of": str(records.frames.resolve()),
                 "source_fps_declared": recorded["source_fps_declared"],
                 "config": cfg.as_dict()}
-    frames_log = pkg.audit_log.AuditLogger(out, records.stem, metadata=metadata)
+    run = (pkg.records.RunRecords(out, records.stem, metadata=metadata, research=True)
+           if pkg.records is not None else _LegacyRecords(pkg, out, records.stem, metadata))
     frames = rebuild_frames(pkg, records, float(cfg.pose.visibility_threshold),
-                            float(cfg.pose.as_dict().get("reacquire_after_s", 0.0)), stats)
+                            float(cfg.pose.reacquire_after_s), stats)
     last = None
-    for pf in frames:
-        result = pipeline.analyze(pf)
-        frames_log.log_pose_frame(result.pose, extra=result.csv_extra())
-        last = pf.timestamp
-    if last is not None:
-        pipeline.finalise(last)
-    frames_log.close()
-    fields = pkg.audit_log.EVENT_FIELDS
-    events_log = pkg.audit_log.AuditLogger(
-        out, records.stem + "-events", fields=fields,
-        metadata={**metadata, "record_kind": "stage1_events"})
-    for i, ev in enumerate(pipeline.machine.events):
-        events_log.log({k: v for k, v in event_row(i, ev).items() if k in fields})
-    events_log.close()
+    try:
+        for pf in frames:
+            result = pipeline.analyze(pf)
+            run.frame(result)
+            if result.resolved_event is not None:
+                run.event_settled(pipeline.machine.events, result.resolved_event)
+            last = pf.timestamp
+        if last is not None:
+            pipeline.finalise(last)
+    finally:
+        run.close(pipeline.machine.events)      # a record left open loses its rows
     return pipeline.machine.events, stats
 
 
